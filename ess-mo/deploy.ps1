@@ -106,6 +106,46 @@ function Write-Success ($msg) { Write-Host "    $msg"   -ForegroundColor Green; 
 function Write-Err     ($msg) { Write-Host "    $msg"   -ForegroundColor Red;     Write-Log "ERROR: $msg"; $script:hasErrors = $true }
 function Write-Warn    ($msg) { Write-Host "    $msg"   -ForegroundColor DarkYellow; Write-Log "WARN: $msg" }
 
+# ===========================================================
+# SPINNER - rotating stick animation during long operations
+# ===========================================================
+function Start-Spinner {
+    param([string]$Message)
+    if ($script:headless -or $script:dryRun) { return }
+
+    # Use a runspace so the spinner runs in a separate thread
+    $script:spinnerPS = [PowerShell]::Create()
+    $null = $script:spinnerPS.AddScript({
+        param($msg)
+        $chars = @('|', '/', '-', '\')
+        $i = 0
+        try {
+            while ($true) {
+                [System.Console]::Write("`r $($chars[$i % 4]) $msg ")
+                Start-Sleep -Milliseconds 200
+                $i++
+            }
+        } catch {
+            # Expected when the spinner is stopped
+        }
+    }).AddArgument($Message)
+
+    $script:spinnerAsync = $script:spinnerPS.BeginInvoke()
+}
+
+function Stop-Spinner {
+    if ($null -eq $script:spinnerPS) { return }
+    try {
+        $script:spinnerPS.Stop()
+        Start-Sleep -Milliseconds 150  # Let the thread settle
+        $script:spinnerPS.Dispose()
+    } catch {}
+    # Clear the spinner line
+    [System.Console]::Write("`r" + " " * 70 + "`r")
+    $script:spinnerPS = $null
+    $script:spinnerAsync = $null
+}
+
 # Y/n confirmation prompt. Pressing Enter alone accepts the default.
 function Confirm-Step {
     param([string]$Message, [bool]$DefaultYes = $true)
@@ -203,7 +243,7 @@ function Select-InstallDrive {
                 continue
             }
         }
-        $choice = $choice.ToUpper().TrimEnd(':').TrimEnd('\')
+        $choice = $choice.ToUpper().TrimEnd('\').TrimEnd(':')
 
         if ($choice -notin $availDrives) {
             Write-Err "Only available drives: $($availDrives -join ', ')"
@@ -1010,31 +1050,71 @@ function Invoke-FullDeploy {
 
     if ($targetComponents -contains "frontend") {
         if (Confirm-Step "Install Frontend?") {
-            if (-not (Install-Frontend -Config $Config)) { $allSucceeded = $false }
+            Start-Spinner "Installing Frontend ..."
+            $frontendOk = Install-Frontend -Config $Config
+            Stop-Spinner
+            if ($frontendOk) {
+                Write-Success "Frontend installed successfully on port $($Config.FrontendPort)"
+                Write-Log "Frontend installed successfully on port $($Config.FrontendPort)"
+            } else {
+                Write-Err "Frontend installation FAILED - check logs for details"
+                $allSucceeded = $false
+            }
         } else { Write-Warn "Skipped Frontend." }
+        if (-not $script:headless) { Read-Host "`nPress Enter to continue" | Out-Null }
     }
 
     if ($targetComponents -contains "backend") {
         if (Confirm-Step "Install Backend?") {
             $secrets = Get-OrCreateSecrets
-            if (-not (Install-Backend -Config $Config -Secrets $secrets)) { $allSucceeded = $false }
+            Start-Spinner "Installing Backend ..."
+            $backendOk = Install-Backend -Config $Config -Secrets $secrets
+            Stop-Spinner
+            if ($backendOk) {
+                Write-Success "Backend installed successfully on port $($Config.BackendPort)"
+                Write-Log "Backend installed successfully on port $($Config.BackendPort)"
+            } else {
+                Write-Err "Backend installation FAILED - check logs for details"
+                $allSucceeded = $false
+            }
         } else { Write-Warn "Skipped Backend." }
+        if (-not $script:headless) { Read-Host "`nPress Enter to continue" | Out-Null }
     }
 
     if ($targetComponents -contains "caddy") {
         if (Confirm-Step "Install Caddy reverse proxy?") {
             # Prompt for Caddy port right before installing
             Select-CaddyPort -Config $Config | Out-Null
-            if (-not (Install-Caddy -Config $Config)) { $allSucceeded = $false }
+            Start-Spinner "Installing Caddy ..."
+            $caddyOk = Install-Caddy -Config $Config
+            Stop-Spinner
+            if ($caddyOk) {
+                Write-Success "Caddy installed successfully on port $($Config.CaddyPort)"
+                Write-Log "Caddy installed successfully on port $($Config.CaddyPort)"
+            } else {
+                Write-Err "Caddy installation FAILED - check logs for details"
+                $allSucceeded = $false
+            }
         } else { Write-Warn "Skipped Caddy." }
+        if (-not $script:headless) { Read-Host "`nPress Enter to continue" | Out-Null }
     }
 
     if ($targetComponents -contains "cloudflare") {
         if (Confirm-Step "Expose this app publicly via a Cloudflare quick tunnel?" -DefaultYes:$false) {
             # Prompt for public URL before setting up tunnel
             Select-PublicUrl -Config $Config | Out-Null
-            if (-not (Install-Cloudflare -Config $Config)) { $allSucceeded = $false }
+            Start-Spinner "Installing Cloudflare tunnel ..."
+            $cfOk = Install-Cloudflare -Config $Config
+            Stop-Spinner
+            if ($cfOk) {
+                Write-Success "Cloudflare tunnel installed successfully."
+                Write-Log "Cloudflare tunnel installed successfully"
+            } else {
+                Write-Err "Cloudflare tunnel installation FAILED - check logs for details"
+                $allSucceeded = $false
+            }
         } else { Write-Warn "Skipped Cloudflare tunnel." }
+        if (-not $script:headless) { Read-Host "`nPress Enter to continue" | Out-Null }
     }
 
     # Roll back on failure (only in non-dry-run mode)
