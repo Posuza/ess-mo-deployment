@@ -36,7 +36,8 @@ $ErrorActionPreference = "Continue"
 # If run via -ExecutionPolicy Bypass it returns Bypass, so we won't loop infinitely.
 $effectivePolicy = Get-ExecutionPolicy -ErrorAction SilentlyContinue
 if ($effectivePolicy -in @('Restricted', 'AllSigned')) {
-    Write-Warning "Execution policy is '$effectivePolicy' - re-launching with Bypass..."
+    Write-Host "    [!] Windows restricts running unsigned scripts here." -ForegroundColor Yellow
+    Write-Host "    [!] Automatically re-launching with -ExecutionPolicy Bypass ..." -ForegroundColor Yellow
     $self = $MyInvocation.MyCommand.Path
     $bypassArgs = @("-ExecutionPolicy", "Bypass", "-File", $self) + $args
     & powershell.exe $bypassArgs
@@ -59,6 +60,8 @@ $DefaultConfig = @{
     PublicUrl    = "http://localhost:8089"
     ApiPrefix    = "/api/v1"
     InstallRoot  = $null
+    TunnelTarget = "caddy"     # what the Cloudflare tunnel exposes: caddy | frontend | backend | custom
+    TunnelUrl    = $null       # resolved URL, auto-set from TunnelTarget + port
 }
 
 # ---------- GLOBAL STATE ----------
@@ -162,15 +165,16 @@ function Confirm-Step {
 function Get-DeployConfig {
     if (Test-Path $ConfigPath) {
         $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-        # Ensure InstallRoot exists (may be missing from older config files)
-        if (-not ($cfg | Get-Member -Name 'InstallRoot' -ErrorAction SilentlyContinue)) {
-            Add-Member -InputObject $cfg -NotePropertyName 'InstallRoot' -NotePropertyValue $null
+        # Ensure all fields exist (may be missing from older config files)
+        @('InstallRoot', 'TunnelTarget', 'TunnelUrl') | ForEach-Object {
+            if (-not ($cfg | Get-Member -Name $_ -ErrorAction SilentlyContinue)) {
+                Add-Member -InputObject $cfg -NotePropertyName $_ -NotePropertyValue $DefaultConfig[$_]
+            }
         }
         return $cfg
     }
     Write-Warn "Config file not found, creating default at $ConfigPath"
     $cfg = [PSCustomObject]$DefaultConfig
-    Add-Member -InputObject $cfg -NotePropertyName 'InstallRoot' -NotePropertyValue $null
     $cfg | ConvertTo-Json | Set-Content $ConfigPath
     return $cfg
 }
@@ -323,33 +327,88 @@ function Select-PublicUrl {
 
     if ($script:headless) {
         if ([string]::IsNullOrWhiteSpace($Config.PublicUrl)) {
-            $Config.PublicUrl = "http://localhost:$($Config.CaddyPort)"
+            $Config.PublicUrl = Resolve-TunnelUrl -Config $Config
         }
         return $Config.PublicUrl
     }
 
+    # Try to read current Cloudflare tunnel URL
+    $cfTunnelUrl = $null
+    # First try dedicated tunnel URL file (written by Start-AllServices), then parse log
+    $urlFile = Join-Path $Config.InstallRoot "cloudflare\current_tunnel_url.txt"
+    if (Test-Path $urlFile) {
+        $cfTunnelUrl = Get-Content $urlFile -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if (-not $cfTunnelUrl) {
+        $cfLog = Join-Path $Config.InstallRoot "cloudflare\cloudflare.log"
+        if (Test-Path $cfLog) {
+            $cfTunnelUrl = Get-Content $cfLog -ErrorAction SilentlyContinue |
+                Select-String -Pattern "https://[a-zA-Z0-9-]+\.trycloudflare\.com" |
+                ForEach-Object { $_.Matches.Value } | Select-Object -Last 1
+        }
+    }
+
     $hasCurrent = -not [string]::IsNullOrWhiteSpace($Config.PublicUrl)
-    $defaultUrl = if ($hasCurrent) { $Config.PublicUrl } else { "http://localhost:$($Config.CaddyPort)" }
 
     Write-Host ""
     Write-Host "============================================" -ForegroundColor Cyan
     Write-Host " Public URL" -ForegroundColor Cyan
     Write-Host "============================================" -ForegroundColor Cyan
     Write-Host " The public URL where users access the app." -ForegroundColor Gray
-    Write-Host " Change this to your real domain, Cloudflare tunnel," -ForegroundColor Gray
-    Write-Host " or server IP when deploying for real use." -ForegroundColor Gray
     if ($hasCurrent) {
-        Write-Host " Current: $($Config.PublicUrl)" -ForegroundColor Gray
+        Write-Host " Current config : $($Config.PublicUrl)" -ForegroundColor Gray
+    }
+    if ($cfTunnelUrl) {
+        Write-Host " Cloudflare tunnel: $cfTunnelUrl" -ForegroundColor Green
+    }
+    Write-Host ""
+    Write-Host " 1) Keep current" -ForegroundColor Gray
+    if ($cfTunnelUrl) {
+        Write-Host " 2) Use Cloudflare tunnel URL (auto-refreshed on each restart)" -ForegroundColor Gray
+        Write-Host " 3) Enter custom URL / domain (won't be overwritten)" -ForegroundColor Gray
+    } else {
+        Write-Host " 2) Enter custom URL / domain" -ForegroundColor Gray
     }
     Write-Host ""
 
-    $prompt = "Public URL [$defaultUrl]"
-    $choice = Read-Host $prompt
-    if ([string]::IsNullOrWhiteSpace($choice)) {
-        $choice = $defaultUrl
-    }
+    $choice = $null
+    $maxOpt = if ($cfTunnelUrl) { 3 } else { 2 }
+    do {
+        $opt = Read-Host "Select option [1]"
+        if ([string]::IsNullOrWhiteSpace($opt)) { $opt = "1" }
+        switch ($opt) {
+            "1" {
+                if ($hasCurrent) { $choice = $Config.PublicUrl }
+                else { Write-Err "No current URL set. Pick another option." }
+            }
+            "2" {
+                if ($cfTunnelUrl) {
+                    $choice = $cfTunnelUrl
+                    # Also update backend .env immediately
+                    $envPath = Join-Path $Config.InstallRoot "backend\.env"
+                    if (Test-Path $envPath) {
+                        (Get-Content $envPath) -replace '^FRONTEND_URL=.*', "FRONTEND_URL=$cfTunnelUrl" | Set-Content $envPath
+                        Write-Success "Backend .env FRONTEND_URL updated"
+                    }
+                }
+                else {
+                    $custom = Read-Host "Enter public URL (e.g. https://yourdomain.com)"
+                    if ($custom -match '^https?://') { $choice = $custom }
+                    else { Write-Err "Enter a URL starting with http:// or https://" }
+                }
+            }
+            "3" {
+                if ($cfTunnelUrl) {
+                    $custom = Read-Host "Enter public URL (e.g. https://yourdomain.com)"
+                    if ($custom -match '^https?://') { $choice = $custom }
+                    else { Write-Err "Enter a URL starting with http:// or https://" }
+                } else { Write-Err "Invalid option." }
+            }
+            default { Write-Err "Select 1-$maxOpt" }
+        }
+    } while ($null -eq $choice)
 
-    if (-not $hasCurrent -or $choice -ne $Config.PublicUrl) {
+    if ($choice -ne $Config.PublicUrl) {
         $Config.PublicUrl = $choice
         Save-DeployConfig -Config $Config
         Write-Success "Public URL set to: $choice"
@@ -357,6 +416,93 @@ function Select-PublicUrl {
     }
 
     return $Config.PublicUrl
+}
+
+function Resolve-TunnelUrl {
+    param($Config)
+    switch ($Config.TunnelTarget) {
+        "caddy"    { return "http://127.0.0.1:$($Config.CaddyPort)" }
+        "frontend" { return "http://127.0.0.1:$($Config.FrontendPort)" }
+        "backend"  { return "http://127.0.0.1:$($Config.BackendPort)" }
+        "custom"   {
+            if ([string]::IsNullOrWhiteSpace($Config.TunnelUrl)) {
+                return "http://127.0.0.1:$($Config.CaddyPort)"
+            }
+            return $Config.TunnelUrl
+        }
+        default { return "http://127.0.0.1:$($Config.CaddyPort)" }
+    }
+}
+
+function Select-TunnelTarget {
+    param($Config)
+
+    if ($script:headless) {
+        $Config.TunnelUrl = Resolve-TunnelUrl -Config $Config
+        return $Config.TunnelUrl
+    }
+
+    $currentUrl = Resolve-TunnelUrl -Config $Config
+
+    Write-Host ""
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host " Cloudflare Tunnel Target" -ForegroundColor Cyan
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host " What should the Cloudflare tunnel expose?" -ForegroundColor Gray
+    Write-Host " Current: $currentUrl" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host " 1) Caddy reverse proxy  (port $($Config.CaddyPort))" -ForegroundColor Gray
+    Write-Host " 2) Frontend directly     (port $($Config.FrontendPort))" -ForegroundColor Gray
+    Write-Host " 3) Backend directly      (port $($Config.BackendPort))" -ForegroundColor Gray
+    Write-Host " 4) Custom URL / port" -ForegroundColor Gray
+    Write-Host ""
+
+    $valid = $false
+    do {
+        $choice = Read-Host "Select target [current: $($Config.TunnelTarget)]"
+        if ([string]::IsNullOrWhiteSpace($choice)) {
+            $choice = switch ($Config.TunnelTarget) {
+                "caddy"    { "1" }
+                "frontend" { "2" }
+                "backend"  { "3" }
+                "custom"   { "4" }
+                default    { "1" }
+            }
+        }
+        switch ($choice) {
+            "1" {
+                $Config.TunnelTarget = "caddy"
+                $Config.TunnelUrl = "http://127.0.0.1:$($Config.CaddyPort)"
+                $valid = $true
+            }
+            "2" {
+                $Config.TunnelTarget = "frontend"
+                $Config.TunnelUrl = "http://127.0.0.1:$($Config.FrontendPort)"
+                $valid = $true
+            }
+            "3" {
+                $Config.TunnelTarget = "backend"
+                $Config.TunnelUrl = "http://127.0.0.1:$($Config.BackendPort)"
+                $valid = $true
+            }
+            "4" {
+                $customUrl = Read-Host "Enter custom URL (e.g. http://127.0.0.1:3009)"
+                if ($customUrl -match '^https?://') {
+                    $Config.TunnelTarget = "custom"
+                    $Config.TunnelUrl = $customUrl
+                    $valid = $true
+                } else {
+                    Write-Err "Enter a valid URL starting with http:// or https://"
+                }
+            }
+            default { Write-Err "Select 1-4" }
+        }
+    } while (-not $valid)
+
+    Save-DeployConfig -Config $Config
+    Write-Success "Tunnel target set to: $($Config.TunnelUrl)"
+    Write-Log "Tunnel target changed to: $($Config.TunnelTarget) -> $($Config.TunnelUrl)"
+    return $Config.TunnelUrl
 }
 
 function Initialize-InstallRoot {
@@ -402,17 +548,17 @@ function Get-OrCreateSecrets {
         exit 1
     }
 
-    # Ask user: use existing file or manual input
+    # Ask user: load from file or enter credentials manually
     do {
-        $useFile = Read-Host "Use deploy.secrets.json file or manual input? (Y/n)"
+        $useFile = Read-Host "Load DB/SMTP credentials from deploy.secrets.json? (Y/n)  n = enter manually"
         if ($useFile -eq '' -or $useFile -match '^[Yy]') {
             if (Test-Path $SecretsPath) {
                 Write-Success "Secrets loaded from $SecretsPath"
                 Write-Log "Secrets loaded from $SecretsPath"
                 return Get-Content $SecretsPath -Raw | ConvertFrom-Json
             } else {
-                Write-Warn "File not found or not valid at: $SecretsPath"
-                Write-Host "  Place your deploy.secrets.json file there first, or choose manual input." -ForegroundColor Gray
+                Write-Warn "File not found: $SecretsPath"
+                Write-Host "  Place deploy.secrets.json next to this script, or type 'n' to enter credentials manually." -ForegroundColor Gray
                 # Loop back and ask again
             }
         } else {
@@ -464,102 +610,97 @@ function Get-OrCreateSecrets {
 # ===========================================================
 # PREREQUISITES
 # ===========================================================
-function Install-MissingPrerequisite {
-    param([string]$Name, [string]$CmdName, [string]$WingetId, [string]$Url)
-
-    if ($script:headless) {
-        # Headless mode - can't prompt, just report
-        Write-Err "$Name is required but not installed. Install manually: $Url"
-        Write-Log "Prerequisite missing (headless): $Name" -Level "ERROR"
-        return $false
-    }
-
-    # Ask user if they want to install
-    $resp = Read-Host "$Name is not installed. Install now? (Y/n/B=Back to menu)"
-
-    # B = back to menu immediately
-    if ($resp -match '^[Bb]$') {
-        Write-Warn "Returning to menu. $Name must be installed before deployment."
-        return "BACK"
-    }
-
-    # Y/Enter = try to install
-    if ($resp -eq '' -or $resp -match '^[Yy]') {
-        # Try winget first
-        if ($WingetId -and (Get-Command winget -ErrorAction SilentlyContinue)) {
-            Write-Host "    Installing $Name via winget..." -ForegroundColor Gray
-            Write-Log "Installing $Name via winget ($WingetId)"
-            winget install $WingetId --accept-package-agreements --silent 2>&1 | Out-Null
-            # Refresh PATH so the command is found
-            $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
-            if (Get-Command $CmdName -ErrorAction SilentlyContinue) {
-                Write-Success "$Name installed successfully."
-                Write-Log "$Name installed via winget"
-                return $true
-            }
-        }
-        # Winget didn't work - tell user to install manually
-        Write-Warn "Could not auto-install $Name."
-        Write-Host "    Install manually from: $Url" -ForegroundColor Gray
-        Write-Log "$Name auto-install failed" -Level "WARN"
-
-        # After failed install, ask again
-        $resp2 = Read-Host "Go back to menu? (Y/n)"
-        if ($resp2 -eq '' -or $resp2 -match '^[Yy]') {
-            return "BACK"
-        }
-        return $false
-    }
-
-    # n = skip, then ask if they want to go back
-    $resp3 = Read-Host "Go back to menu? (Y/n)"
-    if ($resp3 -eq '' -or $resp3 -match '^[Yy]') {
-        return "BACK"
-    }
-    Write-Warn "Skipping $Name - deployment may fail later."
-    Write-Log "Prerequisite skipped: $Name" -Level "WARN"
-    return $false
-}
-
+# ===========================================================
+# PREREQUISITES
+# ===========================================================
 function Test-Prerequisites {
     Write-Step "Checking prerequisites"
     $ok = $true
+    $missing = @()
+    $installed = @()
 
-    foreach ($tool in @(
+    $tools = @(
         @{ Cmd = "git";    Name = "Git";          WingetId = "Git.Git";           Url = "https://git-scm.com" },
         @{ Cmd = "node";   Name = "Node.js 22+";  WingetId = "OpenJS.NodeJS.LTS"; Url = "https://nodejs.org" },
         @{ Cmd = "python"; Name = "Python 3.13+"; WingetId = "Python.Python.3.13"; Url = "https://python.org" }
-    )) {
+    )
+
+    # Pass 1: check everything and report
+    Write-Host ""
+    foreach ($tool in $tools) {
         if (Get-Command $tool.Cmd -ErrorAction SilentlyContinue) {
-            Write-Success "$($tool.Name): OK"
-            Write-Log "Prerequisite OK: $($tool.Name)"
+            Write-Host "    $($tool.Name): OK" -ForegroundColor Green
+            $installed += $tool
         } else {
-            Write-Err "$($tool.Name): missing"
-            $result = Install-MissingPrerequisite -Name $tool.Name -CmdName $tool.Cmd -WingetId $tool.WingetId -Url $tool.Url
-            if ("BACK" -eq $result) { return "BACK" }
-            if (-not $result) { $ok = $false }
+            Write-Host "    $($tool.Name): MISSING" -ForegroundColor Red
+            $missing += $tool
         }
     }
 
-    # Servy - auto-install via winget, or manual URL
+    # Servy check
     if (Get-Command servy-cli -ErrorAction SilentlyContinue) {
-        Write-Success "Servy: OK"
-        Write-Log "Prerequisite OK: Servy"
-    } elseif (Get-Command winget -ErrorAction SilentlyContinue) {
-        Write-Warn "Servy not found, installing via winget..."
-        Write-Log "Installing Servy via winget"
-        winget install servy --accept-package-agreements --silent 2>&1 | Out-Null
-        $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
-        if (Get-Command servy-cli -ErrorAction SilentlyContinue) {
-            Write-Success "Servy: installed"
-            Write-Log "Servy installed successfully"
+        Write-Host "    Servy: OK" -ForegroundColor Green
+    } else {
+        Write-Host "    Servy: MISSING" -ForegroundColor Red
+        $missing += @{ Cmd = "servy-cli"; Name = "Servy CLI"; WingetId = "servy"; Url = "https://github.com/servy-community/servy" }
+    }
+
+    Write-Host ""
+
+    # Pass 2: install all missing at once
+    if ($missing.Count -gt 0) {
+        $missingNames = ($missing | ForEach-Object { $_.Name }) -join ', '
+        if ($script:headless) {
+            Write-Err "Missing prerequisites (headless mode): $missingNames"
+            Write-Log "Missing prerequisites (headless): $missingNames" -Level "ERROR"
+            return $false
+        }
+        if (Confirm-Step "Install missing prerequisites: $missingNames?" -DefaultYes:$true) {
+            $allSucceeded = $true
+            foreach ($tool in $missing) {
+                Write-Host "    Installing $($tool.Name)..." -ForegroundColor Gray
+                Write-Log "Installing $($tool.Name) via winget ($($tool.WingetId))"
+                if ($tool.WingetId -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+                    winget install $tool.WingetId --accept-package-agreements --silent 2>&1 | Out-Null
+                }
+                # Try downloading for servy if winget didn't work
+                if (-not (Get-Command $tool.Cmd -ErrorAction SilentlyContinue)) {
+                    # Refresh PATH
+                    $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+                    if (-not (Get-Command $tool.Cmd -ErrorAction SilentlyContinue)) {
+                        Write-Err "    $($tool.Name) install may have failed."
+                        Write-Host "    Install manually: $($tool.Url)" -ForegroundColor Gray
+                        $allSucceeded = $false
+                    } else {
+                        Write-Success "    $($tool.Name): installed"
+                    }
+                } else {
+                    Write-Success "    $($tool.Name): installed"
+                }
+            }
+            # Refresh PATH once more after all installs
+            $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+            if ($allSucceeded) { Write-Success "All prerequisites installed." }
         } else {
-            Write-Err "Servy installed but not on PATH yet - restart PowerShell and re-run."
+            Write-Warn "Skipping installation. Deployment may fail."
             $ok = $false
         }
     } else {
-        Write-Err "Servy CLI missing and winget unavailable - install manually: https://github.com/servy-community/servy"
-        $ok = $false
+        Write-Success "All prerequisites are already installed."
+    }
+
+    # Pass 3: offer to update existing tools
+    if ($installed.Count -gt 0 -and -not $script:headless) {
+        if (Confirm-Step "Update existing tools to latest versions?" -DefaultYes:$false) {
+            foreach ($tool in $installed) {
+                if ($tool.WingetId -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+                    Write-Host "    Updating $($tool.Name)..." -ForegroundColor Gray
+                    Write-Log "Updating $($tool.Name) via winget"
+                    winget upgrade $tool.WingetId --accept-package-agreements --silent 2>&1 | Out-Null
+                }
+            }
+            Write-Success "Updates applied."
+        }
     }
 
     if (-not $ok) { return $false }
@@ -799,7 +940,7 @@ function Install-Cloudflare {
     Write-Step "Installing Cloudflare Tunnel"
 
     if ($script:dryRun) {
-        Write-Warn "[DRY-RUN] Would install Cloudflare tunnel for http://127.0.0.1:$($Config.CaddyPort)"
+        Write-Warn "[DRY-RUN] Would install Cloudflare tunnel for $($Config.TunnelUrl)"
         return $true
     }
 
@@ -813,7 +954,7 @@ function Install-Cloudflare {
             }
         }
         if (-not (Get-Command cloudflared -ErrorAction SilentlyContinue)) {
-            Write-Warn "cloudflared not available. Install manually: winget install Cloudflare.cloudflared"
+            Write-Warn "cloudflared not available. Install it: winget install Cloudflare.cloudflared"
             return $false
         }
 
@@ -822,15 +963,21 @@ function Install-Cloudflare {
         $cfPath  = (Get-Command cloudflared).Source
         $logPath = Join-Path $cfDir "cloudflare.log"
 
+        # Resolve tunnel URL (fallback if config is from old version)
+        if ([string]::IsNullOrWhiteSpace($Config.TunnelUrl)) {
+            $Config.TunnelUrl = Resolve-TunnelUrl -Config $Config
+        }
+
         servy-cli uninstall --name="ess-mo-cloudflare" --silent 2>&1 | Out-Null
-        servy-cli install --name="ess-mo-cloudflare" --path="$cfPath" --params="tunnel --url http://127.0.0.1:$($Config.CaddyPort) --logfile $logPath"
+        servy-cli install --name="ess-mo-cloudflare" --path="$cfPath" --params="tunnel --url $($Config.TunnelUrl) --logfile $logPath"
 
         if (-not (Get-Service -Name ess-mo-cloudflare -ErrorAction SilentlyContinue)) {
             throw "Service 'ess-mo-cloudflare' was not created by servy-cli"
         }
         Write-Success "Cloudflare service installed."
+        Write-Success "Tunnel exposes: $($Config.TunnelUrl)"
         $script:installedComponents += "cloudflare"
-        Write-Log "Cloudflare tunnel installed"
+        Write-Log "Cloudflare tunnel installed, target: $($Config.TunnelUrl)"
         return $true
     } catch {
         Write-Err "Cloudflare setup failed: $_"
@@ -877,7 +1024,7 @@ function Invoke-ComponentInstall {
         "frontend"   { $result = Install-Frontend -Config $Config }
         "backend"    { $secrets = Get-OrCreateSecrets; $result = Install-Backend -Config $Config -Secrets $secrets }
         "caddy"      { $result = Install-Caddy -Config $Config }
-        "cloudflare" { $result = Install-Cloudflare -Config $Config }
+        "cloudflare" { Select-TunnelTarget -Config $Config | Out-Null; $result = Install-Cloudflare -Config $Config }
     }
     if (-not $result -and -not $script:dryRun) {
         Write-Err "Component '$Key' failed to install."
@@ -897,7 +1044,7 @@ function Remove-Component {
         Start-Sleep -Milliseconds 500
 
         if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
-            Write-Warn "$svcName is still registered - you may need to restart Windows and re-run uninstall."
+            Write-Warn "$svcName is still registered - restart your computer and re-run uninstall."
         } else {
             Write-Success "$svcName service removed."
         }
@@ -925,6 +1072,7 @@ function Start-AllServices {
         Write-Warn "[DRY-RUN] Would start all installed services"
         return
     }
+    $hasCloudflare = $false
     foreach ($c in Get-Components) {
         if (-not (Get-Service -Name $c.Service -ErrorAction SilentlyContinue)) {
             Write-Host "    Skipping $($c.Display) (not installed)" -ForegroundColor Gray
@@ -934,9 +1082,40 @@ function Start-AllServices {
             Start-Service -Name $c.Service -ErrorAction Stop
             Write-Success "Started $($c.Display)"
             Write-Log "Service started: $($c.Service)"
+            if ($c.Key -eq "cloudflare") { $hasCloudflare = $true }
         } catch {
             Write-Err "Failed to start $($c.Display): $_"
             Write-Log "Failed to start $($c.Service): $_" -Level "ERROR"
+        }
+    }
+
+    # After starting Cloudflare tunnel, auto-capture its URL to a file
+    if ($hasCloudflare) {
+        Write-Host "    Waiting for Cloudflare tunnel URL..." -ForegroundColor Gray
+        Start-Sleep -Seconds 4
+        $cfLog = Join-Path $Config.InstallRoot "cloudflare\cloudflare.log"
+        if (Test-Path $cfLog) {
+            $tunnelUrl = Get-Content $cfLog -ErrorAction SilentlyContinue |
+                Select-String -Pattern "https://[a-zA-Z0-9-]+\.trycloudflare\.com" |
+                ForEach-Object { $_.Matches.Value } | Select-Object -Last 1
+            if ($tunnelUrl) {
+                Write-Success "Cloudflare tunnel: $tunnelUrl"
+                # Save to a dedicated file (source of truth for other functions)
+                $urlFile = Join-Path $Config.InstallRoot "cloudflare\current_tunnel_url.txt"
+                Set-Content -Path $urlFile -Value $tunnelUrl -Force
+                # Refresh backend .env if it currently has a tunnel URL (not a custom domain)
+                $envPath = Join-Path $Config.InstallRoot "backend\.env"
+                if (Test-Path $envPath) {
+                    $currentFrontendUrl = Select-String -Path $envPath -Pattern '^FRONTEND_URL=(.*)$' | ForEach-Object { $_.Matches.Groups[1].Value }
+                    if ($currentFrontendUrl -match '\.trycloudflare\.com') {
+                        (Get-Content $envPath) -replace '^FRONTEND_URL=.*', "FRONTEND_URL=$tunnelUrl" | Set-Content $envPath
+                        Write-Success "Backend .env FRONTEND_URL refreshed"
+                        Write-Log "Refreshed backend .env FRONTEND_URL to tunnel: $tunnelUrl"
+                    }
+                }
+            } else {
+                Write-Host "    Tunnel URL not yet available - check later via option 8" -ForegroundColor DarkYellow
+            }
         }
     }
 }
@@ -1018,24 +1197,18 @@ function Invoke-FullDeploy {
     }
 
     # 3. Check prerequisites
-    Write-Host "    [DEBUG] Before Test-Prerequisites" -ForegroundColor Magenta
     $prereqResult = Test-Prerequisites
-    Write-Host "    [DEBUG] Test-Prerequisites returned: $prereqResult" -ForegroundColor Magenta
     if ("BACK" -eq $prereqResult -or -not $prereqResult) {
         if ("BACK" -eq $prereqResult) {
             Write-Warn "Returning to menu."
         } else {
             Write-Err "Resolve missing prerequisites first."
         }
-        Write-Host "    [DEBUG] Returning early from Invoke-FullDeploy (prereq)" -ForegroundColor Magenta
         return
     }
-    Write-Host "    [DEBUG] Before Get-OrCreateSecrets" -ForegroundColor Magenta
     if (-not $script:headless -or $Components.Count -eq 0 -or ($Components -contains "backend")) {
         $secrets = Get-OrCreateSecrets
-        Write-Host "    [DEBUG] secrets loaded: $($null -ne $secrets)" -ForegroundColor Magenta
     }
-    Write-Host "    [DEBUG] After Get-OrCreateSecrets, before targetComponents" -ForegroundColor Magenta
 
     # Determine which components to deploy
     $targetComponents = if ($script:headless -and $Components.Count -gt 0) {
@@ -1043,13 +1216,10 @@ function Invoke-FullDeploy {
     } else {
         @("frontend", "backend", "caddy", "cloudflare")
     }
-    Write-Host "    [DEBUG] targetComponents: $($targetComponents -join ', ')" -ForegroundColor Magenta
-    Write-Host "    [DEBUG] headless=$script:headless Components.Count=$($Components.Count)" -ForegroundColor Magenta
-
     $allSucceeded = $true
 
     if ($targetComponents -contains "frontend") {
-        if (Confirm-Step "Install Frontend?") {
+        if (Confirm-Step "Install Frontend (port $($Config.FrontendPort))?") {
             Start-Spinner "Installing Frontend ..."
             $frontendOk = Install-Frontend -Config $Config
             Stop-Spinner
@@ -1065,7 +1235,7 @@ function Invoke-FullDeploy {
     }
 
     if ($targetComponents -contains "backend") {
-        if (Confirm-Step "Install Backend?") {
+        if (Confirm-Step "Install Backend (port $($Config.BackendPort))?") {
             $secrets = Get-OrCreateSecrets
             Start-Spinner "Installing Backend ..."
             $backendOk = Install-Backend -Config $Config -Secrets $secrets
@@ -1082,7 +1252,7 @@ function Invoke-FullDeploy {
     }
 
     if ($targetComponents -contains "caddy") {
-        if (Confirm-Step "Install Caddy reverse proxy?") {
+        if (Confirm-Step "Install Caddy reverse proxy (port $($Config.CaddyPort))?") {
             # Prompt for Caddy port right before installing
             Select-CaddyPort -Config $Config | Out-Null
             Start-Spinner "Installing Caddy ..."
@@ -1101,8 +1271,8 @@ function Invoke-FullDeploy {
 
     if ($targetComponents -contains "cloudflare") {
         if (Confirm-Step "Expose this app publicly via a Cloudflare quick tunnel?" -DefaultYes:$false) {
-            # Prompt for public URL before setting up tunnel
-            Select-PublicUrl -Config $Config | Out-Null
+            # Prompt: what should the tunnel expose? (Caddy / Frontend / Backend / custom)
+            Select-TunnelTarget -Config $Config | Out-Null
             Start-Spinner "Installing Cloudflare tunnel ..."
             $cfOk = Install-Cloudflare -Config $Config
             Stop-Spinner
@@ -1190,29 +1360,98 @@ function Show-MainMenu {
     Write-Host "============================================" -ForegroundColor Cyan
     Write-Host " Servy Full-Stack Deployment Manager" -ForegroundColor Cyan
     Write-Host "============================================" -ForegroundColor Cyan
-    Write-Host " Install path: $($Config.InstallRoot)" -ForegroundColor Gray
+    if ([string]::IsNullOrWhiteSpace($Config.InstallRoot)) {
+        Write-Host " [!] Install path: NOT SET - set it in option 9" -ForegroundColor Red
+    } else {
+        Write-Host " Install path: $($Config.InstallRoot)" -ForegroundColor Gray
+    }
     Write-Host ""
-    Write-Host " 1) Full deployment (install everything)"
-    Write-Host " 2) Install a component"
-    Write-Host " 3) Uninstall a component"
-    Write-Host " 4) Uninstall everything"
-    Write-Host " 5) Start services"
-    Write-Host " 6) Stop services"
-    Write-Host " 7) Restart services"
-    Write-Host " 8) Status / health check"
-    Write-Host " 9) Check prerequisites"
-    Write-Host "10) Change install path"
-    Write-Host "11) Open logs folder"
-    Write-Host " Q) Quit"
+    Write-Host "  1) Check prerequisites" -ForegroundColor White
+    Write-Host "  2) Install components" -ForegroundColor White
+    Write-Host "  3) Uninstall components" -ForegroundColor White
+    Write-Host "  4) Service status / health check" -ForegroundColor White
+    Write-Host "  5) Start services" -ForegroundColor White
+    Write-Host "  6) Stop services" -ForegroundColor White
+    Write-Host "  7) Caddy network config" -ForegroundColor White
+    Write-Host "  8) Public network config (Cloudflare / URL)" -ForegroundColor White
+    Write-Host "  9) Open logs folder" -ForegroundColor White
+    Write-Host "  Q) Quit" -ForegroundColor White
     Write-Host ""
+}
+
+function Show-NetworkConfig {
+    param($Config)
+    do {
+        Write-Host ""
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host " Network & Port Configuration" -ForegroundColor Cyan
+        Write-Host "============================================" -ForegroundColor Cyan
+        $tunnelUrl = Resolve-TunnelUrl -Config $Config
+        # Read current Cloudflare tunnel URL if available
+        $cfTunnelUrl = $null
+        $urlFile = Join-Path $Config.InstallRoot "cloudflare\current_tunnel_url.txt"
+        if (Test-Path $urlFile) {
+            $cfTunnelUrl = Get-Content $urlFile -ErrorAction SilentlyContinue | Select-Object -First 1
+        }
+        Write-Host ""
+        Write-Host " Traffic flow:" -ForegroundColor White
+        Write-Host "   Browser → Public URL → Caddy(:$($Config.CaddyPort)) → Frontend(:$($Config.FrontendPort))" -ForegroundColor Gray
+        Write-Host "                                                      → Backend(:$($Config.BackendPort))" -ForegroundColor Gray
+        if ($cfTunnelUrl) {
+            Write-Host "   Cloudflare tunnel → Caddy(:$($Config.CaddyPort))" -ForegroundColor Gray
+        }
+        Write-Host ""
+        Write-Host " Current settings:" -ForegroundColor White
+        Write-Host "   Public URL    : $($Config.PublicUrl)" -ForegroundColor Gray
+        Write-Host "   Caddy port    : $($Config.CaddyPort)" -ForegroundColor Gray
+        Write-Host "   Frontend port : $($Config.FrontendPort)" -ForegroundColor Gray
+        Write-Host "   Backend port  : $($Config.BackendPort)" -ForegroundColor Gray
+        Write-Host "   API prefix    : $($Config.ApiPrefix)" -ForegroundColor Gray
+        Write-Host "   Tunnel target : $($Config.TunnelTarget) → $tunnelUrl" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host " 1) Change Caddy port" -ForegroundColor Gray
+        Write-Host " 2) Change Public URL" -ForegroundColor Gray
+        Write-Host " 3) Change tunnel target (what Cloudflare exposes)" -ForegroundColor Gray
+        Write-Host " 4) Change install path" -ForegroundColor Gray
+        Write-Host " B) Back to main menu" -ForegroundColor Gray
+        Write-Host ""
+        $sub = Read-Host "Select option"
+        switch ($sub) {
+            "1" { Select-CaddyPort -Config $Config | Out-Null }
+            "2" { Select-PublicUrl -Config $Config | Out-Null }
+            "3" { Select-TunnelTarget -Config $Config | Out-Null }
+            "4" {
+                $newPath = Read-Host "New install path [$($Config.InstallRoot)]"
+                if ($newPath) {
+                    $Config.InstallRoot = $newPath
+                    Save-DeployConfig -Config $Config
+                    Write-Success "Install path updated."
+                }
+            }
+            "[Bb]" { break }
+            default { Write-Warn "Unknown option." }
+        }
+    } while ($sub -notmatch '^[Bb]$')
 }
 
 function Select-Component {
     param([string]$ActionLabel)
     $components = Get-Components
     Write-Host ""
-    foreach ($c in $components) { Write-Host " $($c.Num)) $($c.Display)" }
-    Write-Host " B) Back"
+    foreach ($c in $components) {
+        $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq 'Running') {
+            Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Green -NoNewline
+            Write-Host "  [RUNNING]" -ForegroundColor Green
+        } elseif ($svc) {
+            Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Gray -NoNewline
+            Write-Host "  [STOPPED]" -ForegroundColor DarkYellow
+        } else {
+            Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor DarkGray -NoNewline
+            Write-Host "  [NOT INSTALLED]" -ForegroundColor DarkGray
+        }
+    }
+    Write-Host " B) Back" -ForegroundColor Gray
     $sel = Read-Host "`nSelect a component to $ActionLabel"
     if ($sel -match '^[Bb]$') { return $null }
     return $components | Where-Object { "$($_.Num)" -eq $sel } | Select-Object -First 1
@@ -1244,45 +1483,272 @@ do {
 
     switch -Regex ($choice) {
         "^1$" {
-            Invoke-FullDeploy -Config $Config
+            # Check prerequisites
+            Test-Prerequisites | Out-Null
         }
         "^2$" {
-            $c = Select-Component -ActionLabel "install"
-            if ($c -and (Confirm-Step "Install $($c.Display)?")) {
-                Initialize-Logger -Config $Config
-                Invoke-ComponentInstall -Key $c.Key -Config $Config | Out-Null
+            # Install components - sub-prompt
+            $components = Get-Components
+            Write-Host ""
+            Write-Host " A) Install everything (full deployment)" -ForegroundColor White
+            foreach ($c in $components) {
+                $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
+                if ($svc -and $svc.Status -eq 'Running') {
+                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Green -NoNewline
+                    Write-Host "  [RUNNING]" -ForegroundColor Green
+                } elseif ($svc) {
+                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Gray -NoNewline
+                    Write-Host "  [STOPPED]" -ForegroundColor DarkYellow
+                } else {
+                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor DarkGray
+                }
             }
-        }
-        "^3$" {
-            $c = Select-Component -ActionLabel "uninstall"
-            if ($c -and (Confirm-Step "Uninstall $($c.Display)?" -DefaultYes:$false)) {
-                $del = Read-Host "Also delete its files? (y/N)"
-                Remove-Component -Key $c.Key -Config $Config -DeleteFiles:($del -match '^[Yy]')
-            }
-        }
-        "^4$" {
-            $confirm = Read-Host "This removes ALL services. Type YES to confirm"
-            if ($confirm -eq "YES") {
-                $del = Read-Host "Also delete all installed files? (y/N)"
-                foreach ($c in Get-Components) {
-                    Remove-Component -Key $c.Key -Config $Config -DeleteFiles:($del -match '^[Yy]')
+            Write-Host " B) Back" -ForegroundColor Gray
+            $sub = Read-Host "`nSelect to install"
+            if ($sub -match '^[Aa]$') {
+                Invoke-FullDeploy -Config $Config
+            } elseif ($sub -match '^\d+$') {
+                $c = $components | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
+                if ($c -and (Confirm-Step "Install $($c.Display)?")) {
+                    Initialize-Logger -Config $Config
+                    Invoke-ComponentInstall -Key $c.Key -Config $Config | Out-Null
                 }
             }
         }
-        "^5$"  { Start-AllServices -Config $Config }
-        "^6$"  { Stop-AllServices -Config $Config }
-        "^7$"  { Stop-AllServices -Config $Config; Start-Sleep -Seconds 2; Start-AllServices -Config $Config }
-        "^8$"  { Show-Status -Config $Config }
-        "^9$"  { Test-Prerequisites | Out-Null }
-        "^10$" {
-            $newPath = Read-Host "New install path [$($Config.InstallRoot)]"
-            if ($newPath) {
-                $Config.InstallRoot = $newPath
-                Save-DeployConfig -Config $Config
-                Write-Success "Install path updated. Re-run install for components to use it."
+        "^3$" {
+            # Uninstall components - sub-prompt
+            $components = Get-Components
+            Write-Host ""
+            Write-Host " A) Uninstall everything" -ForegroundColor White
+            foreach ($c in $components) {
+                $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
+                if ($svc -and $svc.Status -eq 'Running') {
+                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Green -NoNewline
+                    Write-Host "  [RUNNING]" -ForegroundColor Green
+                } elseif ($svc) {
+                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Gray -NoNewline
+                    Write-Host "  [STOPPED]" -ForegroundColor DarkYellow
+                } else {
+                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor DarkGray -NoNewline
+                    Write-Host "  [NOT INSTALLED]" -ForegroundColor DarkGray
+                }
+            }
+            Write-Host " B) Back" -ForegroundColor Gray
+            $sub = Read-Host "`nSelect to uninstall"
+            if ($sub -match '^[Aa]$') {
+                # Uninstall all
+                Write-Step "Currently installed services"
+                $anyInstalled = $false
+                foreach ($c in $components) {
+                    $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
+                    if ($svc) { $anyInstalled = $true }
+                }
+                if (-not $anyInstalled) {
+                    Write-Warn "No services are currently installed. Nothing to uninstall."
+                } else {
+                    $confirm = Read-Host "`nThis will remove ALL installed services. Type YES to confirm"
+                    if ($confirm -eq "YES") {
+                        # Remove all component services and their folders first
+                        $delFiles = (Read-Host "Delete component files (frontend/, backend/, caddy/, cloudflare/)? (y/N)") -match '^[Yy]'
+                        foreach ($c in $components) {
+                            Remove-Component -Key $c.Key -Config $Config -DeleteFiles:$delFiles
+                        }
+                        # Then ask about logs and root folder
+                        if ($delFiles -and (Confirm-Step "Delete logs/ folder and Ess_Mo root folder too?" -DefaultYes:$false)) {
+                            $logsPath = Join-Path $Config.InstallRoot "logs"
+                            if (Test-Path $logsPath) {
+                                Remove-Item $logsPath -Recurse -Force -ErrorAction SilentlyContinue
+                                Write-Success "Deleted logs/ folder"
+                            }
+                            if (Test-Path $Config.InstallRoot -and $Config.InstallRoot -match '\\[^\\]+$') {
+                                # Only delete root if it's empty (after removing component + logs folders)
+                                $remaining = Get-ChildItem $Config.InstallRoot -ErrorAction SilentlyContinue
+                                if (-not $remaining) {
+                                    Remove-Item $Config.InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+                                    Write-Success "Deleted root folder: $($Config.InstallRoot)"
+                                } else {
+                                    Write-Warn "Root folder not empty, skipping: $($Config.InstallRoot)"
+                                    Write-Host "    Remaining items: $($remaining.Name -join ', ')" -ForegroundColor Gray
+                                }
+                            }
+                        }
+                    }
+                }
+            } elseif ($sub -match '^\d+$') {
+                $c = $components | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
+                if ($c -and (Confirm-Step "Uninstall $($c.Display)?" -DefaultYes:$false)) {
+                    $compPath = Join-Path $Config.InstallRoot $c.Key
+                    $del = (Read-Host "Also delete its files`? ($compPath) (y/N)") -match '^[Yy]'
+                    Remove-Component -Key $c.Key -Config $Config -DeleteFiles:$del
+                }
             }
         }
-        "^11$" {
+        "^4$" {
+            # Service status / health check
+            Show-Status -Config $Config
+        }
+        "^5$" {
+            # Start services - sub-prompt
+            Write-Host ""
+            Write-Host " A) Start all services" -ForegroundColor White
+            foreach ($c in Get-Components) {
+                $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
+                if ($svc -and $svc.Status -eq 'Running') {
+                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Green -NoNewline
+                    Write-Host "  [ALREADY RUNNING]" -ForegroundColor Green
+                } elseif ($svc) {
+                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor DarkYellow -NoNewline
+                    Write-Host "  [STOPPED]" -ForegroundColor DarkYellow
+                } else {
+                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor DarkGray -NoNewline
+                    Write-Host "  [NOT INSTALLED]" -ForegroundColor DarkGray
+                }
+            }
+            Write-Host " B) Back" -ForegroundColor Gray
+            $sub = Read-Host "`nSelect to start"
+            if ($sub -match '^[Aa]$') {
+                Start-AllServices -Config $Config
+            } elseif ($sub -match '^\d+$') {
+                $c = Get-Components | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
+                if ($c) {
+                    $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
+                    if (-not $svc) {
+                        Write-Warn "$($c.Display) is not installed."
+                    } elseif ($svc.Status -eq 'Running') {
+                        Write-Warn "$($c.Display) is already running."
+                    } else {
+                        Start-Service -Name $c.Service -ErrorAction Stop
+                        Write-Success "Started $($c.Display)"
+                    }
+                }
+            }
+        }
+        "^6$" {
+            # Stop services - sub-prompt
+            Write-Host ""
+            Write-Host " A) Stop all services" -ForegroundColor White
+            foreach ($c in Get-Components) {
+                $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
+                if ($svc -and $svc.Status -eq 'Running') {
+                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Green -NoNewline
+                    Write-Host "  [RUNNING]" -ForegroundColor Green
+                } elseif ($svc) {
+                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor DarkYellow -NoNewline
+                    Write-Host "  [STOPPED]" -ForegroundColor DarkYellow
+                } else {
+                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor DarkGray -NoNewline
+                    Write-Host "  [NOT INSTALLED]" -ForegroundColor DarkGray
+                }
+            }
+            Write-Host " B) Back" -ForegroundColor Gray
+            $sub = Read-Host "`nSelect to stop"
+            if ($sub -match '^[Aa]$') {
+                Stop-AllServices -Config $Config
+            } elseif ($sub -match '^\d+$') {
+                $c = Get-Components | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
+                if ($c) {
+                    $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
+                    if (-not $svc) {
+                        Write-Warn "$($c.Display) is not installed."
+                    } elseif ($svc.Status -ne 'Running') {
+                        Write-Warn "$($c.Display) is already stopped."
+                    } else {
+                        Stop-Service -Name $c.Service -ErrorAction Stop
+                        Write-Success "Stopped $($c.Display)"
+                    }
+                }
+            }
+        }
+        "^7$" {
+            # Caddy network config - ports and routing
+            do {
+                Write-Host ""
+                Write-Host "============================================" -ForegroundColor Cyan
+                Write-Host " Caddy Reverse Proxy Configuration" -ForegroundColor Cyan
+                Write-Host "============================================" -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host " Caddy listens on port $($Config.CaddyPort) and routes:" -ForegroundColor White
+                Write-Host "   $($Config.ApiPrefix)/*  →  Backend (127.0.0.1:$($Config.BackendPort))" -ForegroundColor Gray
+                Write-Host "   /*              →  Frontend (127.0.0.1:$($Config.FrontendPort))" -ForegroundColor Gray
+                Write-Host ""
+                Write-Host " 1) Change Caddy listening port  [$($Config.CaddyPort)]" -ForegroundColor Gray
+                Write-Host " 2) Change Frontend target port  [$($Config.FrontendPort)]" -ForegroundColor Gray
+                Write-Host " 3) Change Backend target port   [$($Config.BackendPort)]" -ForegroundColor Gray
+                Write-Host " 4) Change API prefix            [$($Config.ApiPrefix)]" -ForegroundColor Gray
+                Write-Host " B) Back to main menu" -ForegroundColor Gray
+                Write-Host ""
+                $sub = Read-Host "Select option"
+                $changed = $false
+                switch ($sub) {
+                    "1" {
+                        Select-CaddyPort -Config $Config | Out-Null
+                        $changed = $true
+                    }
+                    "2" {
+                        $newPort = Read-Host "Frontend target port [$($Config.FrontendPort)]"
+                        if ($newPort -match '^\d+$' -and [int]$newPort -gt 0 -and [int]$newPort -le 65535) {
+                            $Config.FrontendPort = [int]$newPort
+                            $changed = $true
+                            Save-DeployConfig -Config $Config
+                            Write-Success "Frontend target port updated"
+                        } elseif ($newPort) { Write-Err "Invalid port." }
+                    }
+                    "3" {
+                        $newPort = Read-Host "Backend target port [$($Config.BackendPort)]"
+                        if ($newPort -match '^\d+$' -and [int]$newPort -gt 0 -and [int]$newPort -le 65535) {
+                            $Config.BackendPort = [int]$newPort
+                            $changed = $true
+                            Save-DeployConfig -Config $Config
+                            Write-Success "Backend target port updated"
+                        } elseif ($newPort) { Write-Err "Invalid port." }
+                    }
+                    "4" {
+                        $newPrefix = Read-Host "API prefix [$($Config.ApiPrefix)]"
+                        if ($newPrefix) {
+                            if ($newPrefix -match '^/') {
+                                $Config.ApiPrefix = $newPrefix
+                                $changed = $true
+                                Save-DeployConfig -Config $Config
+                                Write-Success "API prefix updated"
+                            } else { Write-Err "Prefix must start with / (e.g. /api/v1)" }
+                        }
+                    }
+                    "[Bb]" { break }
+                    default { Write-Warn "Unknown option." }
+                }
+                # If Caddy is installed, regenerate Caddyfile and restart service
+                if ($changed -and (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue)) {
+                    if (Confirm-Step "Regenerate Caddyfile and restart Caddy?" -DefaultYes:$true) {
+                        $caddyDir = Join-Path $Config.InstallRoot "caddy"
+                        $caddyfilePath = Join-Path $caddyDir "Caddyfile"
+                        $caddyfileContent = @"
+:$($Config.CaddyPort) {
+    handle $($Config.ApiPrefix)/* {
+        reverse_proxy 127.0.0.1:$($Config.BackendPort)
+    }
+    handle /* {
+        reverse_proxy 127.0.0.1:$($Config.FrontendPort)
+    }
+    header {
+        X-Frame-Options "SAMEORIGIN"
+        X-Content-Type-Options "nosniff"
+        X-XSS-Protection "1; mode=block"
+    }
+}
+"@
+                        Set-Content -Path $caddyfilePath -Value $caddyfileContent -Force
+                        Restart-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue
+                        Write-Success "Caddy restarted with new config"
+                    }
+                }
+            } while ($sub -notmatch '^[Bb]$')
+        }
+        "^8$" {
+            # Public network config (Cloudflare / URL / ports)
+            Show-NetworkConfig -Config $Config
+        }
+        "^9$" {
+            # Open logs folder
             $logsPath = Join-Path $Config.InstallRoot "logs"
             if (Test-Path $logsPath) { Invoke-Item $logsPath } else { Write-Warn "No logs folder yet." }
         }
