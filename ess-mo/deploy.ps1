@@ -58,6 +58,7 @@ $DefaultConfig = @{
     BackendPort  = 8009
     CaddyPort    = 8089
     PublicUrl    = "http://localhost:8089"
+    LocalUrl     = "http://localhost:8089"
     ApiPrefix    = "/api/v1"
     InstallRoot  = $null
     TunnelTarget = "caddy"     # what the Cloudflare tunnel exposes: caddy | frontend | backend | custom
@@ -166,7 +167,7 @@ function Get-DeployConfig {
     if (Test-Path $ConfigPath) {
         $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
         # Ensure all fields exist (may be missing from older config files)
-        @('InstallRoot', 'TunnelTarget', 'TunnelUrl') | ForEach-Object {
+        @('InstallRoot', 'TunnelTarget', 'TunnelUrl', 'LocalUrl') | ForEach-Object {
             if (-not ($cfg | Get-Member -Name $_ -ErrorAction SilentlyContinue)) {
                 Add-Member -InputObject $cfg -NotePropertyName $_ -NotePropertyValue $DefaultConfig[$_]
             }
@@ -181,7 +182,7 @@ function Get-DeployConfig {
 
 function Save-DeployConfig {
     param($Config)
-    $Config | ConvertTo-Json | Set-Content $ConfigPath
+    $Config | ConvertTo-Json -Depth 5 | Set-Content $ConfigPath
     Write-Log "Config saved to $ConfigPath"
 }
 
@@ -1379,54 +1380,305 @@ function Show-MainMenu {
     Write-Host ""
 }
 
+function Show-CaddyConfig {
+    param($Config)
+    do {
+        $changed = $false
+
+        # Available targets (services that Caddy can proxy to)
+        $targets = @(
+            [PSCustomObject]@{ Name = "Frontend (Node / Vite)"; Target = "127.0.0.1:$($Config.FrontendPort)"; DefaultPath = "/*" }
+            [PSCustomObject]@{ Name = "Backend (FastAPI)";      Target = "127.0.0.1:$($Config.BackendPort)"; DefaultPath = "$($Config.ApiPrefix)/*" }
+        )
+
+        # Current Caddy routes from config (or defaults)
+        $routes = @()
+        if ($Config.CaddyRoutes -and @($Config.CaddyRoutes).Count -gt 0) {
+            $routes = @($Config.CaddyRoutes)
+        } else {
+            $routes = @(
+                [PSCustomObject]@{ Path = "/*";                    Target = "127.0.0.1:$($Config.FrontendPort)"; Label = "Frontend" }
+                [PSCustomObject]@{ Path = "$($Config.ApiPrefix)/*"; Target = "127.0.0.1:$($Config.BackendPort)";  Label = "Backend" }
+            )
+        }
+
+        # Determine which targets are NOT yet registered as routes
+        $routedTargets = @($routes | ForEach-Object { $_.Target })
+        $availableTargets = @($targets | Where-Object { $_.Target -notin $routedTargets })
+
+        Write-Host ""
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host " Caddy Reverse Proxy Configuration" -ForegroundColor Cyan
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host " Caddy listener : 127.0.0.1:$($Config.CaddyPort)" -ForegroundColor White
+        Write-Host ""
+        Write-Host " Available targets:" -ForegroundColor White
+        if ($availableTargets.Count -gt 0) {
+            $i = 1
+            foreach ($t in $availableTargets) {
+                Write-Host "   $i) $($t.Name) → $($t.Target)" -ForegroundColor Gray
+                $i++
+            }
+        } else {
+            Write-Host "   (all targets already registered)" -ForegroundColor DarkGray
+        }
+        Write-Host ""
+        Write-Host " Caddy routes:" -ForegroundColor White
+        for ($i = 0; $i -lt $routes.Count; $i++) {
+            Write-Host "   $($i+1)) $($routes[$i].Path) → $($routes[$i].Target)  [$($routes[$i].Label)]" -ForegroundColor Gray
+        }
+        Write-Host ""
+        Write-Host " 1) Add route to Caddy" -ForegroundColor Gray
+        Write-Host " 2) Remove route from Caddy" -ForegroundColor Gray
+        Write-Host " 3) Change Caddy listening port  [$($Config.CaddyPort)]" -ForegroundColor Gray
+        Write-Host " B) Back to main menu" -ForegroundColor Gray
+        Write-Host ""
+        $sub = Read-Host "Select option"
+
+        switch ($sub) {
+            "1" {
+                # --- Add route ---
+                $addOptions = @()
+                $optNum = 1
+                foreach ($t in $availableTargets) {
+                    $addOptions += [PSCustomObject]@{ OptNum = $optNum; Name = $t.Name; Target = $t.Target; DefaultPath = $t.DefaultPath }
+                    $optNum++
+                }
+                $addOptions += [PSCustomObject]@{ OptNum = $optNum; Name = "Custom target (enter your own)"; Target = $null; DefaultPath = "" }
+
+                Write-Host ""
+                Write-Host "--- Add Route ---" -ForegroundColor Cyan
+                foreach ($o in $addOptions) {
+                    if ($o.Target) {
+                        Write-Host " $($o.OptNum)) $($o.Name)  →  $($o.Target)" -ForegroundColor Gray
+                    } else {
+                        Write-Host " $($o.OptNum)) $($o.Name)" -ForegroundColor Gray
+                    }
+                }
+                Write-Host " B) Back" -ForegroundColor Gray
+                $pick = Read-Host "`nSelect target"
+                if ($pick -match '^[Bb]$') { break }
+
+                $targetAddr = $null
+                $defaultPath = $null
+                $label = $null
+
+                if ($pick -match '^\d+$') {
+                    $selected = $addOptions | Where-Object { $_.OptNum -eq [int]$pick } | Select-Object -First 1
+                    if ($selected) {
+                        if (-not $selected.Target) {
+                            # Custom target
+                            $targetAddr = Read-Host "Enter target address (e.g. 127.0.0.1:9090)"
+                            if (-not $targetAddr) { break }
+                            $label = Read-Host "Enter label/name for this route"
+                            if (-not $label) { $label = "Custom" }
+                        } else {
+                            $targetAddr = $selected.Target
+                            $defaultPath = $selected.DefaultPath
+                            $label = $selected.Name
+                        }
+                    }
+                }
+
+                if ($targetAddr) {
+                    $path = Read-Host "Path prefix (e.g. /custom/*) [$defaultPath]"
+                    if (-not $path) { $path = $defaultPath }
+                    if ($path -and $path.StartsWith('/')) {
+                        $routes += [PSCustomObject]@{ Path = $path; Target = $targetAddr; Label = $label }
+                        $Config | Add-Member -NotePropertyName 'CaddyRoutes' -NotePropertyValue $routes -Force
+                        Save-DeployConfig -Config $Config
+                        $changed = $true
+                        Write-Success "Route added: $path → $targetAddr"
+                    } else {
+                        Write-Err "Path must start with /"
+                    }
+                }
+            }
+            "2" {
+                # --- Remove route ---
+                if ($routes.Count -eq 0) {
+                    Write-Warn "No routes to remove."
+                    break
+                }
+                Write-Host ""
+                Write-Host "--- Remove Route ---" -ForegroundColor Cyan
+                for ($i = 0; $i -lt $routes.Count; $i++) {
+                    Write-Host " $($i+1)) $($routes[$i].Path) → $($routes[$i].Target)  [$($routes[$i].Label)]" -ForegroundColor Gray
+                }
+                Write-Host " B) Back" -ForegroundColor Gray
+                $pick = Read-Host "`nSelect route to remove"
+                if ($pick -match '^[Bb]$') { break }
+                if ($pick -match '^\d+$') {
+                    $idx = [int]$pick - 1
+                    if ($idx -ge 0 -and $idx -lt $routes.Count) {
+                        if (Confirm-Step "Remove route '$($routes[$idx].Path) → $($routes[$idx].Target)'?" -DefaultYes:$false) {
+                            $routes = @($routes | Where-Object { $_ -ne $routes[$idx] })
+                            if ($routes.Count -gt 0) {
+                                $Config | Add-Member -NotePropertyName 'CaddyRoutes' -NotePropertyValue $routes -Force
+                            } else {
+                                $Config.PSObject.Properties.Remove('CaddyRoutes')
+                            }
+                            Save-DeployConfig -Config $Config
+                            $changed = $true
+                            Write-Success "Route removed."
+                        }
+                    } else {
+                        Write-Err "Invalid route number."
+                    }
+                }
+            }
+            "3" {
+                Select-CaddyPort -Config $Config | Out-Null
+                $changed = $true
+            }
+            "[Bb]" { break }
+            default { Write-Warn "Unknown option." }
+        }
+
+        # If Caddy is installed and something changed, regenerate Caddyfile and restart
+        if ($changed -and (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue)) {
+            if (Confirm-Step "Regenerate Caddyfile and restart Caddy?" -DefaultYes:$true) {
+                $caddyDir = Join-Path $Config.InstallRoot "caddy"
+                $caddyfilePath = Join-Path $caddyDir "Caddyfile"
+
+                # Get final routes for Caddyfile
+                $finalRoutes = @()
+                if ($Config.CaddyRoutes -and @($Config.CaddyRoutes).Count -gt 0) {
+                    $finalRoutes = @($Config.CaddyRoutes)
+                } else {
+                    $finalRoutes = @(
+                        [PSCustomObject]@{ Path = "$($Config.ApiPrefix)/*"; Target = "127.0.0.1:$($Config.BackendPort)" }
+                        [PSCustomObject]@{ Path = "/*";                    Target = "127.0.0.1:$($Config.FrontendPort)" }
+                    )
+                }
+
+                $caddyfileLines = @()
+                $caddyfileLines += ":$($Config.CaddyPort) {"
+                foreach ($r in $finalRoutes) {
+                    $caddyfileLines += "    handle $($r.Path) {"
+                    $caddyfileLines += "        reverse_proxy $($r.Target)"
+                    $caddyfileLines += "    }"
+                }
+                $caddyfileLines += "    header {"
+                $caddyfileLines += '        X-Frame-Options "SAMEORIGIN"'
+                $caddyfileLines += '        X-Content-Type-Options "nosniff"'
+                $caddyfileLines += '        X-XSS-Protection "1; mode=block"'
+                $caddyfileLines += "    }"
+                $caddyfileLines += "}"
+                $caddyfileContent = $caddyfileLines -join "`n"
+
+                Set-Content -Path $caddyfilePath -Value $caddyfileContent -Force
+                Restart-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue
+                Write-Success "Caddy restarted with new config"
+            }
+        }
+    } while ($sub -notmatch '^[Bb]$')
+}
+
 function Show-NetworkConfig {
     param($Config)
     do {
-        Write-Host ""
-        Write-Host "============================================" -ForegroundColor Cyan
-        Write-Host " Network & Port Configuration" -ForegroundColor Cyan
-        Write-Host "============================================" -ForegroundColor Cyan
-        $tunnelUrl = Resolve-TunnelUrl -Config $Config
         # Read current Cloudflare tunnel URL if available
         $cfTunnelUrl = $null
         $urlFile = Join-Path $Config.InstallRoot "cloudflare\current_tunnel_url.txt"
         if (Test-Path $urlFile) {
             $cfTunnelUrl = Get-Content $urlFile -ErrorAction SilentlyContinue | Select-Object -First 1
         }
+        # Static Cloudflare tunnel URL from cloudflare.log if not found in the dedicated file
+        if (-not $cfTunnelUrl) {
+            $cfLog = Join-Path $Config.InstallRoot "cloudflare\cloudflare.log"
+            if (Test-Path $cfLog) {
+                $cfTunnelUrl = Get-Content $cfLog -ErrorAction SilentlyContinue |
+                    Select-String -Pattern "https://[a-zA-Z0-9-]+\.trycloudflare\.com" |
+                    ForEach-Object { $_.Matches.Value } | Select-Object -Last 1
+            }
+        }
+        # Ensure LocalUrl default if never set
+        $localUrl = $Config.LocalUrl
+        if ([string]::IsNullOrWhiteSpace($localUrl)) {
+            $localUrl = "http://localhost:$($Config.CaddyPort)"
+        }
+
         Write-Host ""
-        Write-Host " Traffic flow:" -ForegroundColor White
-        Write-Host "   Browser → Public URL → Caddy(:$($Config.CaddyPort)) → Frontend(:$($Config.FrontendPort))" -ForegroundColor Gray
-        Write-Host "                                                      → Backend(:$($Config.BackendPort))" -ForegroundColor Gray
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host " Network & Port Configuration" -ForegroundColor Cyan
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host " Current URLs:" -ForegroundColor White
+        Write-Host "   Public URL    : $($Config.PublicUrl)" -ForegroundColor Gray
+        Write-Host "   Local URL     : $localUrl" -ForegroundColor Gray
         if ($cfTunnelUrl) {
-            Write-Host "   Cloudflare tunnel → Caddy(:$($Config.CaddyPort))" -ForegroundColor Gray
+            Write-Host "   Cloudflare    : $cfTunnelUrl" -ForegroundColor Green
+        } else {
+            Write-Host "   Cloudflare    : (not started)" -ForegroundColor DarkGray
         }
         Write-Host ""
-        Write-Host " Current settings:" -ForegroundColor White
-        Write-Host "   Public URL    : $($Config.PublicUrl)" -ForegroundColor Gray
-        Write-Host "   Caddy port    : $($Config.CaddyPort)" -ForegroundColor Gray
-        Write-Host "   Frontend port : $($Config.FrontendPort)" -ForegroundColor Gray
-        Write-Host "   Backend port  : $($Config.BackendPort)" -ForegroundColor Gray
-        Write-Host "   API prefix    : $($Config.ApiPrefix)" -ForegroundColor Gray
-        Write-Host "   Tunnel target : $($Config.TunnelTarget) → $tunnelUrl" -ForegroundColor Gray
-        Write-Host ""
-        Write-Host " 1) Change Caddy port" -ForegroundColor Gray
-        Write-Host " 2) Change Public URL" -ForegroundColor Gray
-        Write-Host " 3) Change tunnel target (what Cloudflare exposes)" -ForegroundColor Gray
-        Write-Host " 4) Change install path" -ForegroundColor Gray
+        Write-Host " 1) Public URL" -ForegroundColor Gray
+        Write-Host " 2) Local URL" -ForegroundColor Gray
+        Write-Host " 3) Cloudflare tunnel" -ForegroundColor Gray
         Write-Host " B) Back to main menu" -ForegroundColor Gray
         Write-Host ""
         $sub = Read-Host "Select option"
         switch ($sub) {
-            "1" { Select-CaddyPort -Config $Config | Out-Null }
-            "2" { Select-PublicUrl -Config $Config | Out-Null }
-            "3" { Select-TunnelTarget -Config $Config | Out-Null }
-            "4" {
-                $newPath = Read-Host "New install path [$($Config.InstallRoot)]"
-                if ($newPath) {
-                    $Config.InstallRoot = $newPath
-                    Save-DeployConfig -Config $Config
-                    Write-Success "Install path updated."
+            "1" {
+                # Public URL submenu - delegate to existing function
+                Select-PublicUrl -Config $Config | Out-Null
+            }
+            "2" {
+                # Local URL submenu
+                do {
+                    Write-Host ""
+                    Write-Host "============================================" -ForegroundColor Cyan
+                    Write-Host " Local URL" -ForegroundColor Cyan
+                    Write-Host "============================================" -ForegroundColor Cyan
+                    Write-Host " The URL used for local network access." -ForegroundColor Gray
+                    Write-Host " Current: $localUrl" -ForegroundColor Gray
+                    Write-Host ""
+                    Write-Host " 1) Change URL" -ForegroundColor Gray
+                    Write-Host " 2) Exit" -ForegroundColor Gray
+                    Write-Host ""
+                    $opt = Read-Host "Select option"
+                    switch ($opt) {
+                        "1" {
+                            $newUrl = Read-Host "Enter local URL (e.g. http://192.168.1.100:$($Config.CaddyPort))"
+                            if ($newUrl) {
+                                if ($newUrl -match '^https?://') {
+                                    $Config.LocalUrl = $newUrl
+                                    $localUrl = $newUrl
+                                    Save-DeployConfig -Config $Config
+                                    Write-Success "Local URL updated to: $newUrl"
+                                } else {
+                                    Write-Err "Enter a URL starting with http:// or https://"
+                                }
+                            }
+                        }
+                        "2" { break }
+                        default { Write-Warn "Unknown option." }
+                    }
+                } while ($opt -ne "2")
+            }
+            "3" {
+                # Cloudflare tunnel - display only
+                Write-Host ""
+                Write-Host "============================================" -ForegroundColor Cyan
+                Write-Host " Cloudflare Tunnel URL" -ForegroundColor Cyan
+                Write-Host "============================================" -ForegroundColor Cyan
+                if ($cfTunnelUrl) {
+                    Write-Host ""
+                    Write-Host " Your Cloudflare tunnel is active at:" -ForegroundColor White
+                    Write-Host "   $cfTunnelUrl" -ForegroundColor Green
+                    Write-Host ""
+                    Write-Host " This URL is auto-generated by Cloudflare and may change" -ForegroundColor Gray
+                    Write-Host " each time the tunnel restarts." -ForegroundColor Gray
+                } else {
+                    Write-Host ""
+                    Write-Host " No Cloudflare tunnel URL detected." -ForegroundColor Yellow
+                    Write-Host " Start the Cloudflare service first (option 5 from main menu)." -ForegroundColor Gray
+                    Write-Host " The URL will appear here automatically once the tunnel is running." -ForegroundColor Gray
                 }
+                Write-Host ""
+                Read-Host "Press Enter to continue" | Out-Null
             }
             "[Bb]" { break }
             default { Write-Warn "Unknown option." }
@@ -1436,9 +1688,9 @@ function Show-NetworkConfig {
 
 function Select-Component {
     param([string]$ActionLabel)
-    $components = Get-Components
+    $compList = Get-Components
     Write-Host ""
-    foreach ($c in $components) {
+    foreach ($c in $compList) {
         $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
         if ($svc -and $svc.Status -eq 'Running') {
             Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Green -NoNewline
@@ -1454,7 +1706,7 @@ function Select-Component {
     Write-Host " B) Back" -ForegroundColor Gray
     $sel = Read-Host "`nSelect a component to $ActionLabel"
     if ($sel -match '^[Bb]$') { return $null }
-    return $components | Where-Object { "$($_.Num)" -eq $sel } | Select-Object -First 1
+    return $compList | Where-Object { "$($_.Num)" -eq $sel } | Select-Object -First 1
 }
 
 # ===========================================================
@@ -1488,10 +1740,10 @@ do {
         }
         "^2$" {
             # Install components - sub-prompt
-            $components = Get-Components
+            $compList = Get-Components
             Write-Host ""
             Write-Host " A) Install everything (full deployment)" -ForegroundColor White
-            foreach ($c in $components) {
+            foreach ($c in $compList) {
                 $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
                 if ($svc -and $svc.Status -eq 'Running') {
                     Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Green -NoNewline
@@ -1508,7 +1760,7 @@ do {
             if ($sub -match '^[Aa]$') {
                 Invoke-FullDeploy -Config $Config
             } elseif ($sub -match '^\d+$') {
-                $c = $components | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
+                $c = $compList | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
                 if ($c -and (Confirm-Step "Install $($c.Display)?")) {
                     Initialize-Logger -Config $Config
                     Invoke-ComponentInstall -Key $c.Key -Config $Config | Out-Null
@@ -1517,10 +1769,10 @@ do {
         }
         "^3$" {
             # Uninstall components - sub-prompt
-            $components = Get-Components
+            $compList = Get-Components
             Write-Host ""
             Write-Host " A) Uninstall everything" -ForegroundColor White
-            foreach ($c in $components) {
+            foreach ($c in $compList) {
                 $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
                 if ($svc -and $svc.Status -eq 'Running') {
                     Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Green -NoNewline
@@ -1539,7 +1791,7 @@ do {
                 # Uninstall all
                 Write-Step "Currently installed services"
                 $anyInstalled = $false
-                foreach ($c in $components) {
+                foreach ($c in $compList) {
                     $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
                     if ($svc) { $anyInstalled = $true }
                 }
@@ -1550,7 +1802,7 @@ do {
                     if ($confirm -eq "YES") {
                         # Remove all component services and their folders first
                         $delFiles = (Read-Host "Delete component files (frontend/, backend/, caddy/, cloudflare/)? (y/N)") -match '^[Yy]'
-                        foreach ($c in $components) {
+                        foreach ($c in $compList) {
                             Remove-Component -Key $c.Key -Config $Config -DeleteFiles:$delFiles
                         }
                         # Then ask about logs and root folder
@@ -1575,7 +1827,7 @@ do {
                     }
                 }
             } elseif ($sub -match '^\d+$') {
-                $c = $components | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
+                $c = $compList | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
                 if ($c -and (Confirm-Step "Uninstall $($c.Display)?" -DefaultYes:$false)) {
                     $compPath = Join-Path $Config.InstallRoot $c.Key
                     $del = (Read-Host "Also delete its files`? ($compPath) (y/N)") -match '^[Yy]'
@@ -1659,90 +1911,7 @@ do {
                 }
             }
         }
-        "^7$" {
-            # Caddy network config - ports and routing
-            do {
-                Write-Host ""
-                Write-Host "============================================" -ForegroundColor Cyan
-                Write-Host " Caddy Reverse Proxy Configuration" -ForegroundColor Cyan
-                Write-Host "============================================" -ForegroundColor Cyan
-                Write-Host ""
-                Write-Host " Caddy listens on port $($Config.CaddyPort) and routes:" -ForegroundColor White
-                Write-Host "   $($Config.ApiPrefix)/*  →  Backend (127.0.0.1:$($Config.BackendPort))" -ForegroundColor Gray
-                Write-Host "   /*              →  Frontend (127.0.0.1:$($Config.FrontendPort))" -ForegroundColor Gray
-                Write-Host ""
-                Write-Host " 1) Change Caddy listening port  [$($Config.CaddyPort)]" -ForegroundColor Gray
-                Write-Host " 2) Change Frontend target port  [$($Config.FrontendPort)]" -ForegroundColor Gray
-                Write-Host " 3) Change Backend target port   [$($Config.BackendPort)]" -ForegroundColor Gray
-                Write-Host " 4) Change API prefix            [$($Config.ApiPrefix)]" -ForegroundColor Gray
-                Write-Host " B) Back to main menu" -ForegroundColor Gray
-                Write-Host ""
-                $sub = Read-Host "Select option"
-                $changed = $false
-                switch ($sub) {
-                    "1" {
-                        Select-CaddyPort -Config $Config | Out-Null
-                        $changed = $true
-                    }
-                    "2" {
-                        $newPort = Read-Host "Frontend target port [$($Config.FrontendPort)]"
-                        if ($newPort -match '^\d+$' -and [int]$newPort -gt 0 -and [int]$newPort -le 65535) {
-                            $Config.FrontendPort = [int]$newPort
-                            $changed = $true
-                            Save-DeployConfig -Config $Config
-                            Write-Success "Frontend target port updated"
-                        } elseif ($newPort) { Write-Err "Invalid port." }
-                    }
-                    "3" {
-                        $newPort = Read-Host "Backend target port [$($Config.BackendPort)]"
-                        if ($newPort -match '^\d+$' -and [int]$newPort -gt 0 -and [int]$newPort -le 65535) {
-                            $Config.BackendPort = [int]$newPort
-                            $changed = $true
-                            Save-DeployConfig -Config $Config
-                            Write-Success "Backend target port updated"
-                        } elseif ($newPort) { Write-Err "Invalid port." }
-                    }
-                    "4" {
-                        $newPrefix = Read-Host "API prefix [$($Config.ApiPrefix)]"
-                        if ($newPrefix) {
-                            if ($newPrefix -match '^/') {
-                                $Config.ApiPrefix = $newPrefix
-                                $changed = $true
-                                Save-DeployConfig -Config $Config
-                                Write-Success "API prefix updated"
-                            } else { Write-Err "Prefix must start with / (e.g. /api/v1)" }
-                        }
-                    }
-                    "[Bb]" { break }
-                    default { Write-Warn "Unknown option." }
-                }
-                # If Caddy is installed, regenerate Caddyfile and restart service
-                if ($changed -and (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue)) {
-                    if (Confirm-Step "Regenerate Caddyfile and restart Caddy?" -DefaultYes:$true) {
-                        $caddyDir = Join-Path $Config.InstallRoot "caddy"
-                        $caddyfilePath = Join-Path $caddyDir "Caddyfile"
-                        $caddyfileContent = @"
-:$($Config.CaddyPort) {
-    handle $($Config.ApiPrefix)/* {
-        reverse_proxy 127.0.0.1:$($Config.BackendPort)
-    }
-    handle /* {
-        reverse_proxy 127.0.0.1:$($Config.FrontendPort)
-    }
-    header {
-        X-Frame-Options "SAMEORIGIN"
-        X-Content-Type-Options "nosniff"
-        X-XSS-Protection "1; mode=block"
-    }
-}
-"@
-                        Set-Content -Path $caddyfilePath -Value $caddyfileContent -Force
-                        Restart-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue
-                        Write-Success "Caddy restarted with new config"
-                    }
-                }
-            } while ($sub -notmatch '^[Bb]$')
-        }
+        "^7$" { Show-CaddyConfig -Config $Config }
         "^8$" {
             # Public network config (Cloudflare / URL / ports)
             Show-NetworkConfig -Config $Config
