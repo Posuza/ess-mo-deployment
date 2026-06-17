@@ -352,25 +352,33 @@ function ConvertFrom-SecureToPlain {
 }
 
 function Get-OrCreateSecrets {
-    if (Test-Path $SecretsPath) {
-        Write-Log "Secrets loaded from $SecretsPath"
-        return Get-Content $SecretsPath -Raw | ConvertFrom-Json
-    }
-
-    # Check if example file exists and suggest copying
-    if (Test-Path $SecretsExamplePath) {
-        Write-Host "`nNo secrets file found." -ForegroundColor Yellow
-        Write-Host "Tip: Copy deploy.secrets.example.json to deploy.secrets.json and fill in your real values." -ForegroundColor Gray
-        Write-Host "Or enter them interactively below.`n" -ForegroundColor Gray
-    } else {
-        Write-Host "`nNo secrets file found at $SecretsPath - let's create one." -ForegroundColor Yellow
-    }
-
     if ($script:headless) {
+        if (Test-Path $SecretsPath) {
+            Write-Log "Secrets loaded from $SecretsPath"
+            return Get-Content $SecretsPath -Raw | ConvertFrom-Json
+        }
         Write-Err "No secrets file found and running in headless mode. Create deploy.secrets.json first."
         Write-Host "  Template: $SecretsExamplePath" -ForegroundColor Gray
         exit 1
     }
+
+    # Ask user: use existing file or manual input
+    do {
+        $useFile = Read-Host "Use deploy.secrets.json file or manual input? (Y/n)"
+        if ($useFile -eq '' -or $useFile -match '^[Yy]') {
+            if (Test-Path $SecretsPath) {
+                Write-Success "Secrets loaded from $SecretsPath"
+                Write-Log "Secrets loaded from $SecretsPath"
+                return Get-Content $SecretsPath -Raw | ConvertFrom-Json
+            } else {
+                Write-Warn "File not found or not valid at: $SecretsPath"
+                Write-Host "  Place your deploy.secrets.json file there first, or choose manual input." -ForegroundColor Gray
+                # Loop back and ask again
+            }
+        } else {
+            break
+        }
+    } while ($true)
 
     Write-Host "These are saved locally only and used to generate the backend's .env file.`n" -ForegroundColor Gray
 
@@ -488,7 +496,7 @@ function Test-Prerequisites {
         } else {
             Write-Err "$($tool.Name): missing"
             $result = Install-MissingPrerequisite -Name $tool.Name -CmdName $tool.Cmd -WingetId $tool.WingetId -Url $tool.Url
-            if ($result -eq "BACK") { return "BACK" }
+            if ("BACK" -eq $result) { return "BACK" }
             if (-not $result) { $ok = $false }
         }
     }
@@ -970,19 +978,24 @@ function Invoke-FullDeploy {
     }
 
     # 3. Check prerequisites
+    Write-Host "    [DEBUG] Before Test-Prerequisites" -ForegroundColor Magenta
     $prereqResult = Test-Prerequisites
-    if ($prereqResult -eq "BACK" -or -not $prereqResult) {
-        if ($prereqResult -eq "BACK") {
+    Write-Host "    [DEBUG] Test-Prerequisites returned: $prereqResult" -ForegroundColor Magenta
+    if ("BACK" -eq $prereqResult -or -not $prereqResult) {
+        if ("BACK" -eq $prereqResult) {
             Write-Warn "Returning to menu."
         } else {
             Write-Err "Resolve missing prerequisites first."
         }
+        Write-Host "    [DEBUG] Returning early from Invoke-FullDeploy (prereq)" -ForegroundColor Magenta
         return
     }
-
+    Write-Host "    [DEBUG] Before Get-OrCreateSecrets" -ForegroundColor Magenta
     if (-not $script:headless -or $Components.Count -eq 0 -or ($Components -contains "backend")) {
         $secrets = Get-OrCreateSecrets
+        Write-Host "    [DEBUG] secrets loaded: $($null -ne $secrets)" -ForegroundColor Magenta
     }
+    Write-Host "    [DEBUG] After Get-OrCreateSecrets, before targetComponents" -ForegroundColor Magenta
 
     # Determine which components to deploy
     $targetComponents = if ($script:headless -and $Components.Count -gt 0) {
@@ -990,6 +1003,8 @@ function Invoke-FullDeploy {
     } else {
         @("frontend", "backend", "caddy", "cloudflare")
     }
+    Write-Host "    [DEBUG] targetComponents: $($targetComponents -join ', ')" -ForegroundColor Magenta
+    Write-Host "    [DEBUG] headless=$script:headless Components.Count=$($Components.Count)" -ForegroundColor Magenta
 
     $allSucceeded = $true
 
@@ -1008,12 +1023,16 @@ function Invoke-FullDeploy {
 
     if ($targetComponents -contains "caddy") {
         if (Confirm-Step "Install Caddy reverse proxy?") {
+            # Prompt for Caddy port right before installing
+            Select-CaddyPort -Config $Config | Out-Null
             if (-not (Install-Caddy -Config $Config)) { $allSucceeded = $false }
         } else { Write-Warn "Skipped Caddy." }
     }
 
     if ($targetComponents -contains "cloudflare") {
         if (Confirm-Step "Expose this app publicly via a Cloudflare quick tunnel?" -DefaultYes:$false) {
+            # Prompt for public URL before setting up tunnel
+            Select-PublicUrl -Config $Config | Out-Null
             if (-not (Install-Cloudflare -Config $Config)) { $allSucceeded = $false }
         } else { Write-Warn "Skipped Cloudflare tunnel." }
     }
@@ -1031,13 +1050,27 @@ function Invoke-FullDeploy {
     if ($targetComponents -contains "caddy") {
         if ($Config.CaddyPort -eq 80) {
             Write-Host "    [!] Port 80 is used by IIS (Windows web server)." -ForegroundColor Yellow
-            if (Confirm-Step "Stop IIS to free port 80?") {
+            if ($script:headless) {
+                Write-Warn "[HEADLESS] Port 80 conflicts with IIS. Set CaddyPort in config to a different value."
+                Write-Log "Port 80 conflict with IIS in headless mode" -Level "WARN"
+            } elseif (Confirm-Step "Stop IIS to free port 80?") {
                 if ($script:dryRun) {
                     Write-Warn "[DRY-RUN] Would stop IIS (W3SVC) and set startup to Disabled"
                 } else {
                     Stop-Service -Name W3SVC -ErrorAction SilentlyContinue
                     Set-Service  -Name W3SVC -StartupType Disabled -ErrorAction SilentlyContinue
                     Write-Log "IIS (W3SVC) stopped and disabled"
+                }
+            } else {
+                # User declined to stop IIS - offer alternative port
+                $newPort = Read-Host "Enter a different port for Caddy (e.g. 8080, 443, 8443)"
+                if ($newPort -match '^\d+$') {
+                    $Config.CaddyPort = [int]$newPort
+                    Write-Success "Caddy port changed to $($Config.CaddyPort)"
+                    Write-Log "Caddy port changed to $($Config.CaddyPort) to avoid IIS conflict"
+                } else {
+                    Write-Warn "Invalid port. Caddy will attempt port 80 anyway - may conflict with IIS."
+                    Write-Log "Invalid port entered for Caddy - keeping port 80" -Level "WARN"
                 }
             }
         } else {
@@ -1111,15 +1144,10 @@ function Select-Component {
 $Config = Get-DeployConfig
 
 if ($script:headless) {
-    # Non-interactive mode - validate drive + port then run
+    # Non-interactive mode - validate drive then run
     $installRoot = Select-InstallDrive -Config $Config
     if (-not $installRoot) { exit 1 }
     $Config.InstallRoot = $installRoot
-    $caddyPort = Select-CaddyPort -Config $Config
-    if (-not $caddyPort) { exit 1 }
-    $Config.CaddyPort = $caddyPort
-    $publicUrl = Select-PublicUrl -Config $Config
-    if ($publicUrl) { $Config.PublicUrl = $publicUrl }
     Invoke-FullDeploy -Config $Config
     if ($script:hasErrors) {
         exit 1
@@ -1127,13 +1155,9 @@ if ($script:headless) {
     exit 0
 }
 
-# Interactive menu mode - prompt for install drive + Caddy port + public URL at start
+# Interactive menu mode - prompt for install drive at start
 $installRoot = Select-InstallDrive -Config $Config
 if ($installRoot) { $Config.InstallRoot = $installRoot }
-$caddyPort = Select-CaddyPort -Config $Config
-if ($caddyPort) { $Config.CaddyPort = $caddyPort }
-$publicUrl = Select-PublicUrl -Config $Config
-if ($publicUrl) { $Config.PublicUrl = $publicUrl }
 do {
     Show-MainMenu -Config $Config
     $choice = Read-Host "Select an option"
