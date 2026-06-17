@@ -1832,7 +1832,7 @@ do {
                                 Remove-Item $logsPath -Recurse -Force -ErrorAction SilentlyContinue
                                 Write-Success "Deleted logs/ folder"
                             }
-                            if (Test-Path $Config.InstallRoot -and $Config.InstallRoot -match '\\[^\\]+$') {
+                            if ((Test-Path $Config.InstallRoot) -and ($Config.InstallRoot -match '\\[^\\]+$')) {
                                 # Only delete root if it's empty (after removing component + logs folders)
                                 $remaining = Get-ChildItem $Config.InstallRoot -ErrorAction SilentlyContinue
                                 if (-not $remaining) {
