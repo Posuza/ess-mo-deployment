@@ -900,22 +900,32 @@ function Install-Caddy {
             Write-Host "    Caddy already downloaded, skipping." -ForegroundColor Gray
         }
 
+        # Use custom routes from config if available, otherwise defaults
+        $caddyRoutes = @()
+        if ($Config.CaddyRoutes -and @($Config.CaddyRoutes).Count -gt 0) {
+            $caddyRoutes = @($Config.CaddyRoutes)
+        } else {
+            $caddyRoutes = @(
+                [PSCustomObject]@{ Path = "$($Config.ApiPrefix)/*"; Target = "127.0.0.1:$($Config.BackendPort)" }
+                [PSCustomObject]@{ Path = "/*";                    Target = "127.0.0.1:$($Config.FrontendPort)" }
+            )
+        }
+
         $caddyfilePath = Join-Path $caddyDir "Caddyfile"
-        $caddyfileContent = @"
-:$($Config.CaddyPort) {
-    handle $($Config.ApiPrefix)/* {
-        reverse_proxy 127.0.0.1:$($Config.BackendPort)
-    }
-    handle /* {
-        reverse_proxy 127.0.0.1:$($Config.FrontendPort)
-    }
-    header {
-        X-Frame-Options "SAMEORIGIN"
-        X-Content-Type-Options "nosniff"
-        X-XSS-Protection "1; mode=block"
-    }
-}
-"@
+        $caddyfileLines = @()
+        $caddyfileLines += ":$($Config.CaddyPort) {"
+        foreach ($r in $caddyRoutes) {
+            $caddyfileLines += "    handle $($r.Path) {"
+            $caddyfileLines += "        reverse_proxy $($r.Target)"
+            $caddyfileLines += "    }"
+        }
+        $caddyfileLines += "    header {"
+        $caddyfileLines += '        X-Frame-Options "SAMEORIGIN"'
+        $caddyfileLines += '        X-Content-Type-Options "nosniff"'
+        $caddyfileLines += '        X-XSS-Protection "1; mode=block"'
+        $caddyfileLines += "    }"
+        $caddyfileLines += "}"
+        $caddyfileContent = $caddyfileLines -join "`n"
         Set-Content -Path $caddyfilePath -Value $caddyfileContent -Force
 
         servy-cli uninstall --name="ess-mo-caddy" --silent 2>&1 | Out-Null
@@ -1362,7 +1372,7 @@ function Show-MainMenu {
     Write-Host " Servy Full-Stack Deployment Manager" -ForegroundColor Cyan
     Write-Host "============================================" -ForegroundColor Cyan
     if ([string]::IsNullOrWhiteSpace($Config.InstallRoot)) {
-        Write-Host " [!] Install path: NOT SET - set it in option 9" -ForegroundColor Red
+        Write-Host " [!] Install path: NOT SET - restart the script to set it" -ForegroundColor Red
     } else {
         Write-Host " Install path: $($Config.InstallRoot)" -ForegroundColor Gray
     }
