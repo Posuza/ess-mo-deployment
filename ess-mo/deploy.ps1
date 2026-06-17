@@ -190,9 +190,9 @@ function Select-InstallDrive {
     $valid = $false
     do {
         if ($hasCurrent) {
-            $prompt = "Select install drive ($driveList, or press Enter for current)"
+            $prompt = "Select install drive: $driveList (or press Enter for current)"
         } else {
-            $prompt = "Select install drive ($driveList)"
+            $prompt = "Select install drive: $driveList"
         }
         $choice = Read-Host $prompt
         if ([string]::IsNullOrWhiteSpace($choice)) {
