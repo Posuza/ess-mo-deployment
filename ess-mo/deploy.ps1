@@ -1,4 +1,4 @@
-# ===========================================================
+﻿# ===========================================================
 # Servy Full-Stack Deployment Manager
 # Interactive CLI menu: install / uninstall / start / stop /
 # status-check components, change install path, check prereqs.
@@ -28,7 +28,7 @@ param(
 $ErrorActionPreference = "Continue"
 
 # ===========================================================
-# EXECUTION POLICY — auto-bypass if policy blocks unsigned scripts
+# EXECUTION POLICY - auto-bypass if policy blocks unsigned scripts
 # This lets users run .\deploy.ps1 without manually setting
 # Set-ExecutionPolicy or using the -ExecutionPolicy flag.
 # ===========================================================
@@ -36,7 +36,7 @@ $ErrorActionPreference = "Continue"
 # If run via -ExecutionPolicy Bypass it returns Bypass, so we won't loop infinitely.
 $effectivePolicy = Get-ExecutionPolicy -ErrorAction SilentlyContinue
 if ($effectivePolicy -in @('Restricted', 'AllSigned')) {
-    Write-Warning "Execution policy is '$effectivePolicy' — re-launching with Bypass..."
+    Write-Warning "Execution policy is '$effectivePolicy' - re-launching with Bypass..."
     $self = $MyInvocation.MyCommand.Path
     $bypassArgs = @("-ExecutionPolicy", "Bypass", "-File", $self) + $args
     & powershell.exe $bypassArgs
@@ -420,7 +420,7 @@ function Install-MissingPrerequisite {
     param([string]$Name, [string]$CmdName, [string]$WingetId, [string]$Url)
 
     if ($script:headless) {
-        # Headless mode — can't prompt, just report
+        # Headless mode - can't prompt, just report
         Write-Err "$Name is required but not installed. Install manually: $Url"
         Write-Log "Prerequisite missing (headless): $Name" -Level "ERROR"
         return $false
@@ -450,7 +450,7 @@ function Install-MissingPrerequisite {
                 return $true
             }
         }
-        # Winget didn't work — tell user to install manually
+        # Winget didn't work - tell user to install manually
         Write-Warn "Could not auto-install $Name."
         Write-Host "    Install manually from: $Url" -ForegroundColor Gray
         Write-Log "$Name auto-install failed" -Level "WARN"
@@ -468,7 +468,7 @@ function Install-MissingPrerequisite {
     if ($resp3 -eq '' -or $resp3 -match '^[Yy]') {
         return "BACK"
     }
-    Write-Warn "Skipping $Name — deployment may fail later."
+    Write-Warn "Skipping $Name - deployment may fail later."
     Write-Log "Prerequisite skipped: $Name" -Level "WARN"
     return $false
 }
@@ -493,7 +493,7 @@ function Test-Prerequisites {
         }
     }
 
-    # Servy — auto-install via winget, or manual URL
+    # Servy - auto-install via winget, or manual URL
     if (Get-Command servy-cli -ErrorAction SilentlyContinue) {
         Write-Success "Servy: OK"
         Write-Log "Prerequisite OK: Servy"
@@ -506,11 +506,11 @@ function Test-Prerequisites {
             Write-Success "Servy: installed"
             Write-Log "Servy installed successfully"
         } else {
-            Write-Err "Servy installed but not on PATH yet — restart PowerShell and re-run."
+            Write-Err "Servy installed but not on PATH yet - restart PowerShell and re-run."
             $ok = $false
         }
     } else {
-        Write-Err "Servy CLI missing and winget unavailable — install manually: https://github.com/servy-community/servy"
+        Write-Err "Servy CLI missing and winget unavailable - install manually: https://github.com/servy-community/servy"
         $ok = $false
     }
 
@@ -959,7 +959,7 @@ function Invoke-FullDeploy {
         Write-Success "Internet: OK"
         Write-Log "Internet connectivity verified"
     } catch {
-        Write-Warn "Internet: unreachable — git clone, npm install, and pip install will fail."
+        Write-Warn "Internet: unreachable - git clone, npm install, and pip install will fail."
         Write-Log "Internet check failed" -Level "WARN"
         if (-not $script:headless) {
             if (-not (Confirm-Step "Continue without internet?" -DefaultYes:$false)) {
@@ -1027,10 +1027,10 @@ function Invoke-FullDeploy {
         }
     }
 
-    # IIS warning — port 80 conflicts with Windows web server
+    # IIS warning - port 80 conflicts with Windows web server
     if ($targetComponents -contains "caddy") {
         if ($Config.CaddyPort -eq 80) {
-            Write-Host "    ⚠ Port 80 is used by IIS (Windows web server)." -ForegroundColor Yellow
+            Write-Host "    [!] Port 80 is used by IIS (Windows web server)." -ForegroundColor Yellow
             if (Confirm-Step "Stop IIS to free port 80?") {
                 if ($script:dryRun) {
                     Write-Warn "[DRY-RUN] Would stop IIS (W3SVC) and set startup to Disabled"
@@ -1041,8 +1041,8 @@ function Invoke-FullDeploy {
                 }
             }
         } else {
-            Write-Host "    [i] Caddy uses port $($Config.CaddyPort) — no IIS conflict." -ForegroundColor Gray
-            Write-Log "Caddy port $($Config.CaddyPort) — IIS not affected"
+            Write-Host "    [i] Caddy uses port $($Config.CaddyPort) - no IIS conflict." -ForegroundColor Gray
+            Write-Log "Caddy port $($Config.CaddyPort) - IIS not affected"
         }
     }
 
@@ -1111,7 +1111,7 @@ function Select-Component {
 $Config = Get-DeployConfig
 
 if ($script:headless) {
-    # Non-interactive mode — validate drive + port then run
+    # Non-interactive mode - validate drive + port then run
     $installRoot = Select-InstallDrive -Config $Config
     if (-not $installRoot) { exit 1 }
     $Config.InstallRoot = $installRoot
@@ -1127,7 +1127,7 @@ if ($script:headless) {
     exit 0
 }
 
-# Interactive menu mode — prompt for install drive + Caddy port + public URL at start
+# Interactive menu mode - prompt for install drive + Caddy port + public URL at start
 $installRoot = Select-InstallDrive -Config $Config
 if ($installRoot) { $Config.InstallRoot = $installRoot }
 $caddyPort = Select-CaddyPort -Config $Config
