@@ -282,7 +282,6 @@ function Select-CaddyPort {
     }
 
     $hasCurrent = ($Config.CaddyPort -and $Config.CaddyPort -ne 0)
-    $defaultPort = if ($hasCurrent) { $Config.CaddyPort } else { 8089 }
 
     Write-Host ""
     Write-Host "============================================" -ForegroundColor Cyan
@@ -294,9 +293,18 @@ function Select-CaddyPort {
     }
     Write-Host ""
 
+    if ($hasCurrent) {
+        $confirm = Read-Host "Change port? (y/N)"
+        if ($confirm -notmatch '^[Yy]') {
+            Write-Success "Caddy port kept at $($Config.CaddyPort)"
+            return $Config.CaddyPort
+        }
+    }
+
+    $defaultPort = if ($hasCurrent) { $Config.CaddyPort } else { 8089 }
     $valid = $false
     do {
-        $prompt = "Enter Caddy port [$defaultPort]"
+        $prompt = "Enter new Caddy port [$defaultPort]"
         $choice = Read-Host $prompt
         if ([string]::IsNullOrWhiteSpace($choice)) {
             $choice = $defaultPort
@@ -313,11 +321,13 @@ function Select-CaddyPort {
 
     $newPort = [int]$choice
 
-    if (-not $hasCurrent -or $newPort -ne $Config.CaddyPort) {
+    if ($newPort -ne $Config.CaddyPort) {
         $Config.CaddyPort = $newPort
         Save-DeployConfig -Config $Config
-        Write-Success "Caddy port set to: $newPort"
+        Write-Success "Caddy port changed to: $newPort"
         Write-Log "Caddy port changed to: $newPort"
+    } else {
+        Write-Success "Caddy port kept at $($Config.CaddyPort)"
     }
 
     return $Config.CaddyPort

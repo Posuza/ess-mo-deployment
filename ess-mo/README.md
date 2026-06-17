@@ -59,7 +59,7 @@ cd C:\path\to\ess-mo
 If execution policy blocks it:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "C:\path\to\ess-mo\deploy.ps1"
+powershell -ExecutionPolicy Bypass -File "filepath\deploy.ps1"
 ```
 
 ### 2. Set install location (first run only)
