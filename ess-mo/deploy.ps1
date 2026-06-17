@@ -58,6 +58,7 @@ $DefaultConfig = @{
     CaddyPort    = 8089
     PublicUrl    = "http://localhost:8089"
     ApiPrefix    = "/api/v1"
+    InstallRoot  = $null
 }
 
 # ---------- GLOBAL STATE ----------
@@ -120,10 +121,16 @@ function Confirm-Step {
 # ===========================================================
 function Get-DeployConfig {
     if (Test-Path $ConfigPath) {
-        return Get-Content $ConfigPath -Raw | ConvertFrom-Json
+        $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+        # Ensure InstallRoot exists (may be missing from older config files)
+        if (-not ($cfg | Get-Member -Name 'InstallRoot' -ErrorAction SilentlyContinue)) {
+            Add-Member -InputObject $cfg -NotePropertyName 'InstallRoot' -NotePropertyValue $null
+        }
+        return $cfg
     }
     Write-Warn "Config file not found, creating default at $ConfigPath"
     $cfg = [PSCustomObject]$DefaultConfig
+    Add-Member -InputObject $cfg -NotePropertyName 'InstallRoot' -NotePropertyValue $null
     $cfg | ConvertTo-Json | Set-Content $ConfigPath
     return $cfg
 }
