@@ -352,13 +352,6 @@ function Protect-SecretsFile {
     }
 }
 
-function ConvertFrom-SecureToPlain {
-    param($SecureString)
-    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
-    try { return [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr) }
-    finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
-}
-
 function Get-OrCreateSecrets {
     if ($script:headless) {
         if (Test-Path $SecretsPath) {
@@ -400,12 +393,12 @@ function Get-OrCreateSecrets {
     if ([string]::IsNullOrWhiteSpace($dbName)) { $dbName = "ess" }
     $dbUser     = Read-Host "DB User (default: root)"
     if ([string]::IsNullOrWhiteSpace($dbUser)) { $dbUser = "root" }
-    $dbPassSec  = Read-Host "DB Password"
+    $dbPass     = Read-Host "DB Password"
 
     # SMTP settings — host/port are fixed Gmail defaults; 'from' is the same as user
     Write-Host "-- SMTP --" -ForegroundColor Cyan
     $smtpUser    = Read-Host "SMTP Email address"
-    $smtpPassSec = Read-Host "SMTP App Password" -AsSecureString
+    $smtpPass    = Read-Host "SMTP App Password"
 
     $secrets = [PSCustomObject]@{
         db = [PSCustomObject]@{
@@ -413,13 +406,13 @@ function Get-OrCreateSecrets {
             port     = $dbPort
             name     = $dbName
             user     = $dbUser
-            password = (ConvertFrom-SecureToPlain $dbPassSec)
+            password = $dbPass
         }
         smtp = [PSCustomObject]@{
             host = "smtp.gmail.com"
             port = 587
             user = $smtpUser
-            pass = (ConvertFrom-SecureToPlain $smtpPassSec)
+            pass = $smtpPass
             from = $smtpUser
         }
     }
@@ -650,7 +643,7 @@ function Install-Frontend {
 }
 
 function Install-Backend {
-    param($Config, $Secrets)
+    param($Config)
     Initialize-InstallRoot -Config $Config
     Write-Step "Installing Backend"
 
@@ -695,75 +688,116 @@ function Install-Backend {
             Tee-Object -FilePath $installLog -Append
         $envContent = @"
 DB_ENGINE=mysql
-DB_HOST=$($Secrets.db.host)
-DB_PORT=$($Secrets.db.port)
-DB_USER="$($Secrets.db.user)"
-DB_PASSWORD="$($Secrets.db.password)"
-DB_NAME=$($Secrets.db.name)
+DB_HOST=192.168.1.172
+DB_PORT=3306
+DB_USER="root"
+DB_PASSWORD="your_db_password"
+DB_NAME=ess
 
 SECRET_KEY=$generatedKey
 ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=30
 
-SMTP_HOST=$($Secrets.smtp.host)
-SMTP_PORT=$($Secrets.smtp.port)
-SMTP_USER="$($Secrets.smtp.user)"
-SMTP_PASS="$($Secrets.smtp.pass)"
-EMAIL_FROM="$($Secrets.smtp.from)"
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER="your_email@gmail.com"
+SMTP_PASS="your_app_password"
+EMAIL_FROM="your_email@gmail.com"
 "@
 
-        # ---- Interactive .env inline editor ----
+        # ---- .env visual editor (arrow-key driven) ----
         $envFilePath = Join-Path $destDir ".env"
-        $originalLines = $envContent -split "`r?`n"
-        $editLines = @() + $originalLines
         $saveConfirmed = $false
 
-        function Show-EnvContent {
-            param([string[]]$Lines, [string[]]$OriginalLines)
-            Write-Host ""
+        # Write defaults first
+        Set-Content -Path $envFilePath -Value $envContent -Force
+
+        function Show-EnvFile {
+            param([string[]]$Lines, [string[]]$OriginalLines, [int]$Selected)
             Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
             for ($i = 0; $i -lt $Lines.Count; $i++) {
                 $num = ($i + 1).ToString().PadLeft(2)
-                $isDiff = $i -lt $OriginalLines.Count -and $Lines[$i] -ne $OriginalLines[$i]
+                $isDiff = $i -lt $OriginalLines.Count -and $OriginalLines[$i] -and $Lines[$i] -ne $OriginalLines[$i]
+                $isNew = $i -ge $OriginalLines.Count
+                $cursor = if ($i -eq $Selected) { ">" } else { " " }
                 if ($isDiff) {
-                    Write-Host "  $num  $($Lines[$i])" -ForegroundColor Yellow
+                    $color = "Yellow"
+                } elseif ($isNew) {
+                    $color = "Green"
                 } else {
-                    Write-Host "  $num  $($Lines[$i])" -ForegroundColor Gray
+                    $color = "Gray"
+                }
+                if ($i -eq $Selected) {
+                    Write-Host " $cursor$num  $($Lines[$i])" -ForegroundColor Black -BackgroundColor Cyan
+                } else {
+                    Write-Host " $cursor$num  $($Lines[$i])" -ForegroundColor $color
                 }
             }
             Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
         }
 
-        function Test-EnvValid {
-            param([string[]]$Lines)
+        function Test-EnvFileValid {
+            param([string]$Path)
+            $content = Get-Content -Path $Path -Raw
             $missing = @()
             foreach ($key in @("DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME", "SECRET_KEY")) {
-                $found = $false
-                foreach ($line in $Lines) {
-                    if ($line -match "^$key=.+") { $found = $true; break }
-                }
-                if (-not $found) { $missing += $key }
+                if ($content -notmatch "(?m)^$key=.+") { $missing += $key }
             }
             return $missing
         }
 
+        function Edit-Line {
+            param([string[]]$Lines, [int]$Idx)
+            $currentLine = $Lines[$Idx]
+            # Pre-fill the ENTIRE line so user can freely edit any part with arrow keys
+            try {
+                [Microsoft.PowerShell.PSConsoleReadLine]::SetBufferAndFocus($currentLine)
+            } catch {}
+            Write-Host "  " -NoNewline
+            $newLine = Read-Host ""
+            if (-not [string]::IsNullOrWhiteSpace($newLine)) {
+                $Lines[$Idx] = $newLine
+                Set-Content -Path $envFilePath -Value ($Lines -join "`r`n") -Force
+            }
+            return $Lines
+        }
+
+        $originalDefaults = ($envContent -split "`r?`n") | Where-Object { $_ -ne "" }
+        $lines = Get-Content -Path $envFilePath
+        $sel = 0
+
+        # Save terminal state
+        $startTop = [Console]::CursorTop
+
         do {
-            Show-EnvContent -Lines $editLines -OriginalLines $originalLines
-
-            $input = Read-Host "  Line to edit (1-$($editLines.Count)), D=diff, S=save, C=cancel, E=exit"
-
-            if ($input -eq "E" -or $input -eq "e") {
-                throw "User exited .env editor — backend install aborted"
+            # Redraw from saved position
+            [Console]::SetCursorPosition(0, $startTop)
+            $rowsToClear = $lines.Count + 8
+            for ($r = 0; $r -lt $rowsToClear; $r++) {
+                [Console]::SetCursorPosition(0, $startTop + $r)
+                Write-Host (" " * [Console]::WindowWidth) -NoNewline
             }
+            [Console]::SetCursorPosition(0, $startTop)
 
-            if ($input -eq "C" -or $input -eq "c") {
-                Write-Warn "Cancelled. Using default .env values."
-                $saveConfirmed = $false
-                break
-            }
+            Write-Host ""
+            Show-EnvFile -Lines $lines -OriginalLines $originalDefaults -Selected $sel
+            Write-Host "  ", ([char]0x2191), "/", ([char]0x2193), " navigate  Enter edit  S save  C defaults  X abort" -ForegroundColor Gray
 
-            if ($input -eq "S" -or $input -eq "s") {
-                $missing = Test-EnvValid -Lines $editLines
+            $keyInfo = [Console]::ReadKey($true)
+            $key = $keyInfo.Key
+            $char = $keyInfo.KeyChar
+
+            if ($key -eq 'UpArrow' -and $sel -gt 0) {
+                $sel--
+            } elseif ($key -eq 'DownArrow' -and $sel -lt $lines.Count - 1) {
+                $sel++
+            } elseif ($key -eq 'Enter') {
+                $lines = Edit-Line -Lines $lines -Idx $sel
+                $lines = Get-Content -Path $envFilePath
+                # Recalc position in case Read-Host scrolled the terminal
+                $startTop = [Math]::Max(0, [Console]::CursorTop - $lines.Count - 6)
+            } elseif ($char -eq 'S' -or $char -eq 's') {
+                $missing = Test-EnvFileValid -Path $envFilePath
                 if ($missing.Count -gt 0) {
                     Write-Warn "Missing required fields: $($missing -join ', ')"
                     if (-not (Confirm-Step "Save anyway?" -DefaultYes:$false)) {
@@ -772,73 +806,20 @@ EMAIL_FROM="$($Secrets.smtp.from)"
                 }
                 $saveConfirmed = $true
                 break
+            } elseif ($char -eq 'C' -or $char -eq 'c') {
+                Write-Warn "Using default .env values."
+                Set-Content -Path $envFilePath -Value $envContent -Force
+                $lines = Get-Content -Path $envFilePath
+                $sel = 0
+                $saveConfirmed = $true
+                break
+            } elseif ($char -eq 'X' -or $char -eq 'x') {
+                throw "User aborted .env editing — backend install cancelled"
             }
+        } while (-not $saveConfirmed)
 
-            if ($input -eq "D" -or $input -eq "d") {
-                $changes = 0
-                for ($i = 0; $i -lt [Math]::Max($originalLines.Count, $editLines.Count); $i++) {
-                    $o = if ($i -lt $originalLines.Count) { $originalLines[$i] } else { "" }
-                    $e = if ($i -lt $editLines.Count) { $editLines[$i] } else { "" }
-                    $oT = $o.Trim(); $eT = $e.Trim()
-                    if ($oT -eq $eT) { continue }
-                    if ($oT -eq "" -and $eT -eq "") { continue }
-                    if ($changes -eq 0) { Write-Host "  Changes:" -ForegroundColor Cyan }
-                    Write-Host "    - $o" -ForegroundColor Red
-                    Write-Host "    + $e" -ForegroundColor Green
-                    $changes++
-                }
-                if ($changes -eq 0) { Write-Host "    (no changes)" -ForegroundColor Gray }
-                continue
-            }
-
-            # Try parsing as line number
-            $lineNum = 0
-            if ($input -match '^\d+$') { $lineNum = [int]$input }
-            if ($lineNum -lt 1 -or $lineNum -gt $editLines.Count) {
-                Write-Warn "Invalid line number. Enter 1-$($editLines.Count), D, S, or C."
-                continue
-            }
-
-            $idx = $lineNum - 1
-            $currentLine = $editLines[$idx]
-
-            # Parse key and current value
-            $eqPos = $currentLine.IndexOf('=')
-            if ($eqPos -ge 0) {
-                $key = $currentLine.Substring(0, $eqPos)
-                $currentVal = $currentLine.Substring($eqPos + 1)
-                # Strip surrounding quotes for display
-                $displayVal = $currentVal -replace '^"(.*)"$', '$1'
-                $newVal = Read-Host "  $key [$displayVal]"
-                if ([string]::IsNullOrWhiteSpace($newVal)) {
-                    # Keep current value — no change
-                    Write-Host "    (unchanged)" -ForegroundColor Gray
-                } else {
-                    # Preserve quotes if the original had them
-                    if ($currentVal -match '^".*"$') {
-                        $editLines[$idx] = "$key=`"$newVal`""
-                    } else {
-                        $editLines[$idx] = "$key=$newVal"
-                    }
-                }
-            } else {
-                # Blank or comment line — replace whole thing
-                $newVal = Read-Host "  Line $lineNum"
-                if (-not [string]::IsNullOrWhiteSpace($newVal)) {
-                    $editLines[$idx] = $newVal
-                }
-            }
-        } while ($true)
-
-        $finalContent = $editLines -join "`r`n"
-        if ($saveConfirmed) {
-            Set-Content -Path $envFilePath -Value $finalContent -Force
-            Write-Success ".env file written to $envFilePath"
-        } else {
-            Set-Content -Path $envFilePath -Value $envContent -Force
-            Write-Host "    .env written with default values." -ForegroundColor Gray
-        }
-        # ---- End .env inline editor ----
+        Write-Success ".env file ready at $envFilePath"
+        # ---- End .env visual editor ----
 
         $pythonExe = Join-Path $destDir "venv\Scripts\python.exe"
 
@@ -927,69 +908,71 @@ function Install-Caddy {
         $editCaddyLines = @() + $originalCaddyLines
         $caddySaved = $false
 
-        # ---- Interactive Caddyfile inline editor ----
+        # ---- Caddyfile visual editor (arrow-key driven) ----
+        $sel = 0
+
+        # Save terminal state
+        $caddyStartTop = [Console]::CursorTop
+
         do {
+            # Redraw from saved position
+            [Console]::SetCursorPosition(0, $caddyStartTop)
+            $rowsToClear = $editCaddyLines.Count + 6
+            for ($r = 0; $r -lt $rowsToClear; $r++) {
+                [Console]::SetCursorPosition(0, $caddyStartTop + $r)
+                Write-Host (" " * [Console]::WindowWidth) -NoNewline
+            }
+            [Console]::SetCursorPosition(0, $caddyStartTop)
+
             Write-Host ""
             Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
             for ($i = 0; $i -lt $editCaddyLines.Count; $i++) {
                 $num = ($i + 1).ToString().PadLeft(2)
                 $isDiff = $i -lt $originalCaddyLines.Count -and $editCaddyLines[$i] -ne $originalCaddyLines[$i]
-                if ($isDiff) {
-                    Write-Host "  $num  $($editCaddyLines[$i])" -ForegroundColor Yellow
+                $cursor = if ($i -eq $sel) { ">" } else { " " }
+                if ($i -eq $sel) {
+                    Write-Host " $cursor$num  $($editCaddyLines[$i])" -ForegroundColor Black -BackgroundColor Cyan
+                } elseif ($isDiff) {
+                    Write-Host " $cursor$num  $($editCaddyLines[$i])" -ForegroundColor Yellow
                 } else {
-                    Write-Host "  $num  $($editCaddyLines[$i])" -ForegroundColor Gray
+                    Write-Host " $cursor$num  $($editCaddyLines[$i])" -ForegroundColor Gray
                 }
             }
             Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
+            Write-Host "  ", ([char]0x2191), "/", ([char]0x2193), " navigate  Enter edit  S save  C defaults  X abort" -ForegroundColor Gray
 
-            $input = Read-Host "  Line to edit (1-$($editCaddyLines.Count)), D=diff, S=save, C=cancel, E=exit"
+            $keyInfo = [Console]::ReadKey($true)
+            $key = $keyInfo.Key
+            $char = $keyInfo.KeyChar
 
-            if ($input -eq "E" -or $input -eq "e") {
-                throw "User exited Caddyfile editor — Caddy install aborted"
-            }
-
-            if ($input -eq "C" -or $input -eq "c") {
+            if ($key -eq 'UpArrow' -and $sel -gt 0) {
+                $sel--
+            } elseif ($key -eq 'DownArrow' -and $sel -lt $editCaddyLines.Count - 1) {
+                $sel++
+            } elseif ($key -eq 'Enter') {
+                $currentLine = $editCaddyLines[$sel]
+                try {
+                    [Microsoft.PowerShell.PSConsoleReadLine]::SetBufferAndFocus($currentLine)
+                } catch {}
+                Write-Host "  " -NoNewline
+                $newLine = Read-Host ""
+                if (-not [string]::IsNullOrWhiteSpace($newLine)) {
+                    $editCaddyLines[$sel] = $newLine
+                }
+                # Recalc position in case Read-Host scrolled the terminal
+                $caddyStartTop = [Math]::Max(0, [Console]::CursorTop - $editCaddyLines.Count - 6)
+            } elseif ($char -eq 'S' -or $char -eq 's') {
+                $caddySaved = $true
+                break
+            } elseif ($char -eq 'C' -or $char -eq 'c') {
                 Write-Warn "Using default Caddyfile."
                 $caddySaved = $false
                 break
-            }
-
-            if ($input -eq "S" -or $input -eq "s") {
-                $caddySaved = $true
-                break
-            }
-
-            if ($input -eq "D" -or $input -eq "d") {
-                $changes = 0
-                for ($i = 0; $i -lt [Math]::Max($originalCaddyLines.Count, $editCaddyLines.Count); $i++) {
-                    $o = if ($i -lt $originalCaddyLines.Count) { $originalCaddyLines[$i] } else { "" }
-                    $e = if ($i -lt $editCaddyLines.Count) { $editCaddyLines[$i] } else { "" }
-                    $oT = $o.Trim(); $eT = $e.Trim()
-                    if ($oT -eq $eT) { continue }
-                    if ($oT -eq "" -and $eT -eq "") { continue }
-                    if ($changes -eq 0) { Write-Host "  Changes:" -ForegroundColor Cyan }
-                    Write-Host "    - $o" -ForegroundColor Red
-                    Write-Host "    + $e" -ForegroundColor Green
-                    $changes++
-                }
-                if ($changes -eq 0) { Write-Host "    (no changes)" -ForegroundColor Gray }
-                continue
-            }
-
-            $lineNum = 0
-            if ($input -match '^\d+$') { $lineNum = [int]$input }
-            if ($lineNum -lt 1 -or $lineNum -gt $editCaddyLines.Count) {
-                Write-Warn "Invalid. Enter 1-$($editCaddyLines.Count), D, S, or C."
-                continue
-            }
-
-            $idx = $lineNum - 1
-            $newVal = Read-Host "  Line $lineNum [$($editCaddyLines[$idx])]"
-            if (-not [string]::IsNullOrWhiteSpace($newVal)) {
-                $editCaddyLines[$idx] = $newVal
+            } elseif ($char -eq 'X' -or $char -eq 'x') {
+                throw "User exited Caddyfile editor — Caddy install aborted"
             }
         } while ($true)
-        # ---- End Caddyfile inline editor ----
+        # ---- End Caddyfile visual editor ----
 
         $finalCaddyfile = $editCaddyLines -join "`n"
         if ($caddySaved) {
@@ -1060,7 +1043,7 @@ function Invoke-ComponentInstall {
     $result = $false
     switch ($Key) {
         "frontend"   { $result = Install-Frontend -Config $Config }
-        "backend"    { $secrets = Get-OrCreateSecrets; $result = Install-Backend -Config $Config -Secrets $secrets }
+        "backend"    { $result = Install-Backend -Config $Config }
         "caddy"      { $result = Install-Caddy -Config $Config }
     }
     if (-not $result -and -not $script:dryRun) {
@@ -1236,9 +1219,8 @@ function Invoke-FullDeploy {
 
     if ($targetComponents -contains "backend") {
         if (Confirm-Step "Install Backend (port $($Config.BackendPort))?") {
-            $secrets = Get-OrCreateSecrets
             Start-Spinner "Installing Backend ..."
-            $backendOk = Install-Backend -Config $Config -Secrets $secrets
+            $backendOk = Install-Backend -Config $Config
             Stop-Spinner
             if ($backendOk) {
                 Write-Success "Backend installed successfully on port $($Config.BackendPort)"
@@ -1639,7 +1621,8 @@ do {
                     Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Gray -NoNewline
                     Write-Host "  [STOPPED]" -ForegroundColor DarkYellow
                 } else {
-                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor DarkGray
+                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor DarkGray -NoNewline
+                    Write-Host "  [NOT INSTALLED]" -ForegroundColor DarkGray
                 }
             }
             Write-Host " B) Back" -ForegroundColor Gray
