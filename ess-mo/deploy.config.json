@@ -4,6 +4,5 @@
   "FrontendPort": 3009,
   "BackendPort": 8009,
   "CaddyPort": 8089,
-  "PublicUrl": "http://localhost:8089",
   "ApiPrefix": "/api/v1"
 }

@@ -21,7 +21,7 @@
 param(
     [switch]$DryRun,
     [switch]$Force,
-    [ValidateSet("frontend", "backend", "caddy", "cloudflare")]
+    [ValidateSet("frontend", "backend", "caddy")]
     [string[]]$Components = @()
 )
 
@@ -57,12 +57,8 @@ $DefaultConfig = @{
     FrontendPort = 3009
     BackendPort  = 8009
     CaddyPort    = 8089
-    PublicUrl    = "http://localhost:8089"
-    LocalUrl     = "http://localhost:8089"
     ApiPrefix    = "/api/v1"
     InstallRoot  = $null
-    TunnelTarget = "caddy"     # what the Cloudflare tunnel exposes: caddy | frontend | backend | custom
-    TunnelUrl    = $null       # resolved URL, auto-set from TunnelTarget + port
 }
 
 # ---------- GLOBAL STATE ----------
@@ -166,11 +162,9 @@ function Confirm-Step {
 function Get-DeployConfig {
     if (Test-Path $ConfigPath) {
         $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-        # Ensure all fields exist (may be missing from older config files)
-        @('InstallRoot', 'TunnelTarget', 'TunnelUrl', 'LocalUrl') | ForEach-Object {
-            if (-not ($cfg | Get-Member -Name $_ -ErrorAction SilentlyContinue)) {
-                Add-Member -InputObject $cfg -NotePropertyName $_ -NotePropertyValue $DefaultConfig[$_]
-            }
+        # Ensure InstallRoot exists (may be missing from older config files)
+        if (-not ($cfg | Get-Member -Name 'InstallRoot' -ErrorAction SilentlyContinue)) {
+            Add-Member -InputObject $cfg -NotePropertyName 'InstallRoot' -NotePropertyValue $null
         }
         return $cfg
     }
@@ -333,189 +327,6 @@ function Select-CaddyPort {
     return $Config.CaddyPort
 }
 
-function Select-PublicUrl {
-    param($Config)
-
-    if ($script:headless) {
-        if ([string]::IsNullOrWhiteSpace($Config.PublicUrl)) {
-            $Config.PublicUrl = Resolve-TunnelUrl -Config $Config
-        }
-        return $Config.PublicUrl
-    }
-
-    # Try to read current Cloudflare tunnel URL
-    $cfTunnelUrl = $null
-    # First try dedicated tunnel URL file (written by Start-AllServices), then parse log
-    $urlFile = Join-Path $Config.InstallRoot "cloudflare\current_tunnel_url.txt"
-    if (Test-Path $urlFile) {
-        $cfTunnelUrl = Get-Content $urlFile -ErrorAction SilentlyContinue | Select-Object -First 1
-    }
-    if (-not $cfTunnelUrl) {
-        $cfLog = Join-Path $Config.InstallRoot "logs\cloudflare_service.log"
-        if (Test-Path $cfLog) {
-            $cfTunnelUrl = Get-Content $cfLog -ErrorAction SilentlyContinue |
-                Select-String -Pattern "https://[a-zA-Z0-9-]+\.trycloudflare\.com" |
-                ForEach-Object { $_.Matches.Value } | Select-Object -Last 1
-        }
-    }
-
-    $hasCurrent = -not [string]::IsNullOrWhiteSpace($Config.PublicUrl)
-
-    Write-Host ""
-    Write-Host "============================================" -ForegroundColor Cyan
-    Write-Host " Public URL" -ForegroundColor Cyan
-    Write-Host "============================================" -ForegroundColor Cyan
-    Write-Host " The public URL where users access the app." -ForegroundColor Gray
-    if ($hasCurrent) {
-        Write-Host " Current config : $($Config.PublicUrl)" -ForegroundColor Gray
-    }
-    if ($cfTunnelUrl) {
-        Write-Host " Cloudflare tunnel: $cfTunnelUrl" -ForegroundColor Green
-    }
-    Write-Host ""
-    Write-Host " 1) Keep current" -ForegroundColor Gray
-    if ($cfTunnelUrl) {
-        Write-Host " 2) Use Cloudflare tunnel URL (auto-refreshed on each restart)" -ForegroundColor Gray
-        Write-Host " 3) Enter custom URL / domain (won't be overwritten)" -ForegroundColor Gray
-    } else {
-        Write-Host " 2) Enter custom URL / domain" -ForegroundColor Gray
-    }
-    Write-Host ""
-
-    $choice = $null
-    $maxOpt = if ($cfTunnelUrl) { 3 } else { 2 }
-    do {
-        $opt = Read-Host "Select option [1]"
-        if ([string]::IsNullOrWhiteSpace($opt)) { $opt = "1" }
-        switch ($opt) {
-            "1" {
-                if ($hasCurrent) { $choice = $Config.PublicUrl }
-                else { Write-Err "No current URL set. Pick another option." }
-            }
-            "2" {
-                if ($cfTunnelUrl) {
-                    $choice = $cfTunnelUrl
-                    # Also update backend .env immediately
-                    $envPath = Join-Path $Config.InstallRoot "backend\.env"
-                    if (Test-Path $envPath) {
-                        (Get-Content $envPath) -replace '^FRONTEND_URL=.*', "FRONTEND_URL=$cfTunnelUrl" | Set-Content $envPath
-                        Write-Success "Backend .env FRONTEND_URL updated"
-                    }
-                }
-                else {
-                    $custom = Read-Host "Enter public URL (e.g. https://yourdomain.com)"
-                    if ($custom -match '^https?://') { $choice = $custom }
-                    else { Write-Err "Enter a URL starting with http:// or https://" }
-                }
-            }
-            "3" {
-                if ($cfTunnelUrl) {
-                    $custom = Read-Host "Enter public URL (e.g. https://yourdomain.com)"
-                    if ($custom -match '^https?://') { $choice = $custom }
-                    else { Write-Err "Enter a URL starting with http:// or https://" }
-                } else { Write-Err "Invalid option." }
-            }
-            default { Write-Err "Select 1-$maxOpt" }
-        }
-    } while ($null -eq $choice)
-
-    if ($choice -ne $Config.PublicUrl) {
-        $Config.PublicUrl = $choice
-        Save-DeployConfig -Config $Config
-        Write-Success "Public URL set to: $choice"
-        Write-Log "Public URL changed to: $choice"
-    }
-
-    return $Config.PublicUrl
-}
-
-function Resolve-TunnelUrl {
-    param($Config)
-    switch ($Config.TunnelTarget) {
-        "caddy"    { return "http://127.0.0.1:$($Config.CaddyPort)" }
-        "frontend" { return "http://127.0.0.1:$($Config.FrontendPort)" }
-        "backend"  { return "http://127.0.0.1:$($Config.BackendPort)" }
-        "custom"   {
-            if ([string]::IsNullOrWhiteSpace($Config.TunnelUrl)) {
-                return "http://127.0.0.1:$($Config.CaddyPort)"
-            }
-            return $Config.TunnelUrl
-        }
-        default { return "http://127.0.0.1:$($Config.CaddyPort)" }
-    }
-}
-
-function Select-TunnelTarget {
-    param($Config)
-
-    if ($script:headless) {
-        $Config.TunnelUrl = Resolve-TunnelUrl -Config $Config
-        return $Config.TunnelUrl
-    }
-
-    $currentUrl = Resolve-TunnelUrl -Config $Config
-
-    Write-Host ""
-    Write-Host "============================================" -ForegroundColor Cyan
-    Write-Host " Cloudflare Tunnel Target" -ForegroundColor Cyan
-    Write-Host "============================================" -ForegroundColor Cyan
-    Write-Host " What should the Cloudflare tunnel expose?" -ForegroundColor Gray
-    Write-Host " Current: $currentUrl" -ForegroundColor Gray
-    Write-Host ""
-    Write-Host " 1) Caddy reverse proxy  (port $($Config.CaddyPort))" -ForegroundColor Gray
-    Write-Host " 2) Frontend directly     (port $($Config.FrontendPort))" -ForegroundColor Gray
-    Write-Host " 3) Backend directly      (port $($Config.BackendPort))" -ForegroundColor Gray
-    Write-Host " 4) Custom URL / port" -ForegroundColor Gray
-    Write-Host ""
-
-    $valid = $false
-    do {
-        $choice = Read-Host "Select target [current: $($Config.TunnelTarget)]"
-        if ([string]::IsNullOrWhiteSpace($choice)) {
-            $choice = switch ($Config.TunnelTarget) {
-                "caddy"    { "1" }
-                "frontend" { "2" }
-                "backend"  { "3" }
-                "custom"   { "4" }
-                default    { "1" }
-            }
-        }
-        switch ($choice) {
-            "1" {
-                $Config.TunnelTarget = "caddy"
-                $Config.TunnelUrl = "http://127.0.0.1:$($Config.CaddyPort)"
-                $valid = $true
-            }
-            "2" {
-                $Config.TunnelTarget = "frontend"
-                $Config.TunnelUrl = "http://127.0.0.1:$($Config.FrontendPort)"
-                $valid = $true
-            }
-            "3" {
-                $Config.TunnelTarget = "backend"
-                $Config.TunnelUrl = "http://127.0.0.1:$($Config.BackendPort)"
-                $valid = $true
-            }
-            "4" {
-                $customUrl = Read-Host "Enter custom URL (e.g. http://127.0.0.1:3009)"
-                if ($customUrl -match '^https?://') {
-                    $Config.TunnelTarget = "custom"
-                    $Config.TunnelUrl = $customUrl
-                    $valid = $true
-                } else {
-                    Write-Err "Enter a valid URL starting with http:// or https://"
-                }
-            }
-            default { Write-Err "Select 1-4" }
-        }
-    } while (-not $valid)
-
-    Save-DeployConfig -Config $Config
-    Write-Success "Tunnel target set to: $($Config.TunnelUrl)"
-    Write-Log "Tunnel target changed to: $($Config.TunnelTarget) -> $($Config.TunnelUrl)"
-    return $Config.TunnelUrl
-}
-
 function Initialize-InstallRoot {
     param($Config)
     if ($script:dryRun) { Write-Warn "[DRY-RUN] Would create: $($Config.InstallRoot)"; return }
@@ -579,36 +390,29 @@ function Get-OrCreateSecrets {
 
     Write-Host "These are saved locally only and used to generate the backend's .env file.`n" -ForegroundColor Gray
 
-    # Database settings
+    # Database settings — only password differs per install; host/port/name/user use defaults
     Write-Host "-- Database --" -ForegroundColor Cyan
-    $dbHostIn = Read-Host "DB Host [192.168.1.140]";  if (-not $dbHostIn) { $dbHostIn = "192.168.1.140" }
-    $dbPort   = Read-Host "DB Port [3306]";            if (-not $dbPort)   { $dbPort   = "3306" }
-    $dbUser   = Read-Host "DB User [root]";            if (-not $dbUser)   { $dbUser   = "root" }
-    $dbName   = Read-Host "DB Name [ess]";             if (-not $dbName)   { $dbName   = "ess" }
-    $dbPassSec   = Read-Host "DB Password" -AsSecureString
+    $dbPassSec = Read-Host "DB Password" -AsSecureString
 
-    # SMTP settings
+    # SMTP settings — host/port are fixed Gmail defaults; 'from' is the same as user
     Write-Host "-- SMTP --" -ForegroundColor Cyan
-    $smtpHostIn  = Read-Host "SMTP Host [smtp.gmail.com]"; if (-not $smtpHostIn) { $smtpHostIn = "smtp.gmail.com" }
-    $smtpPort    = Read-Host "SMTP Port [587]";        if (-not $smtpPort) { $smtpPort = "587" }
-    $smtpUser    = Read-Host "SMTP User (email address)"
+    $smtpUser    = Read-Host "SMTP Email address"
     $smtpPassSec = Read-Host "SMTP App Password" -AsSecureString
-    $emailFrom   = Read-Host "Email 'From' address [$smtpUser]"; if (-not $emailFrom) { $emailFrom = $smtpUser }
 
     $secrets = [PSCustomObject]@{
         db = [PSCustomObject]@{
-            host     = $dbHostIn
-            port     = $dbPort
-            name     = $dbName
-            user     = $dbUser
+            host     = "192.168.1.172"
+            port     = 3306
+            name     = "ess"
+            user     = "root"
             password = (ConvertFrom-SecureToPlain $dbPassSec)
         }
         smtp = [PSCustomObject]@{
-            host = $smtpHostIn
-            port = $smtpPort
+            host = "smtp.gmail.com"
+            port = 587
             user = $smtpUser
             pass = (ConvertFrom-SecureToPlain $smtpPassSec)
-            from = $emailFrom
+            from = $smtpUser
         }
     }
     $secrets | ConvertTo-Json | Set-Content $SecretsPath
@@ -871,7 +675,7 @@ SMTP_PORT=$($Secrets.smtp.port)
 SMTP_USER="$($Secrets.smtp.user)"
 SMTP_PASS="$($Secrets.smtp.pass)"
 EMAIL_FROM="$($Secrets.smtp.from)"
-FRONTEND_URL=$($Config.PublicUrl)
+FRONTEND_URL=http://localhost:$($Config.CaddyPort)
 "@
         Set-Content -Path (Join-Path $destDir ".env") -Value $envContent -Force
 
@@ -983,64 +787,6 @@ function Install-Caddy {
     }
 }
 
-function Install-Cloudflare {
-    param($Config)
-    Initialize-InstallRoot -Config $Config
-    Write-Step "Installing Cloudflare Tunnel"
-
-    if ($script:dryRun) {
-        Write-Warn "[DRY-RUN] Would install Cloudflare tunnel for $($Config.TunnelUrl)"
-        return $true
-    }
-
-    try {
-        if (-not (Get-Command cloudflared -ErrorAction SilentlyContinue)) {
-            if (Get-Command winget -ErrorAction SilentlyContinue) {
-                Write-Host "    cloudflared not found, installing via winget..." -ForegroundColor Gray
-                winget install Cloudflare.cloudflared --accept-package-agreements --silent 2>&1 |
-                    Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\cloudflare_install_setup.log")
-                $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
-            }
-        }
-        if (-not (Get-Command cloudflared -ErrorAction SilentlyContinue)) {
-            Write-Warn "cloudflared not available. Install it: winget install Cloudflare.cloudflared"
-            return $false
-        }
-
-        $cfDir = Join-Path $Config.InstallRoot "cloudflare"
-        New-Item -Path $cfDir -ItemType Directory -Force | Out-Null
-        $cfPath  = (Get-Command cloudflared).Source
-
-        # Runtime log: in logs\ dir, consistent with other services
-        $cfRuntimeLog = Join-Path $Config.InstallRoot "logs\cloudflare_service.log"
-        Write-Host "    Service log: $cfRuntimeLog" -ForegroundColor Gray
-
-        # Resolve tunnel URL (fallback if config is from old version)
-        if ([string]::IsNullOrWhiteSpace($Config.TunnelUrl)) {
-            $Config.TunnelUrl = Resolve-TunnelUrl -Config $Config
-        }
-
-        # Wrap in cmd.exe to add start marker (consistent with other services)
-        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$cfRuntimeLog`" & `"$cfPath`" tunnel --url $($Config.TunnelUrl) --logfile `"$cfRuntimeLog`"`"`""
-
-        servy-cli uninstall --name="ess-mo-cloudflare" --silent 2>&1 | Out-Null
-        servy-cli install --name="ess-mo-cloudflare" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
-
-        if (-not (Get-Service -Name ess-mo-cloudflare -ErrorAction SilentlyContinue)) {
-            throw "Service 'ess-mo-cloudflare' was not created by servy-cli"
-        }
-        Write-Success "Cloudflare service installed."
-        Write-Success "Tunnel exposes: $($Config.TunnelUrl)"
-        $script:installedComponents += "cloudflare"
-        Write-Log "Cloudflare tunnel installed, target: $($Config.TunnelUrl)"
-        return $true
-    } catch {
-        Write-Err "Cloudflare setup failed: $_"
-        Write-Log "Cloudflare installation failed: $_" -Level "ERROR"
-        return $false
-    }
-}
-
 # ===========================================================
 # ROLLBACK
 # ===========================================================
@@ -1068,7 +814,6 @@ function Get-Components {
         [PSCustomObject]@{ Num = 1; Key = "frontend";   Service = "ess-mo-frontend";   Display = "Frontend (Node / Vite)" }
         [PSCustomObject]@{ Num = 2; Key = "backend";    Service = "ess-mo-backend";    Display = "Backend (FastAPI)" }
         [PSCustomObject]@{ Num = 3; Key = "caddy";      Service = "ess-mo-caddy";      Display = "Caddy reverse proxy" }
-        [PSCustomObject]@{ Num = 4; Key = "cloudflare"; Service = "ess-mo-cloudflare"; Display = "Cloudflare tunnel" }
     )
 }
 
@@ -1079,7 +824,6 @@ function Invoke-ComponentInstall {
         "frontend"   { $result = Install-Frontend -Config $Config }
         "backend"    { $secrets = Get-OrCreateSecrets; $result = Install-Backend -Config $Config -Secrets $secrets }
         "caddy"      { $result = Install-Caddy -Config $Config }
-        "cloudflare" { Select-TunnelTarget -Config $Config | Out-Null; $result = Install-Cloudflare -Config $Config }
     }
     if (-not $result -and -not $script:dryRun) {
         Write-Err "Component '$Key' failed to install."
@@ -1127,7 +871,6 @@ function Start-AllServices {
         Write-Warn "[DRY-RUN] Would start all installed services"
         return
     }
-    $hasCloudflare = $false
     foreach ($c in Get-Components) {
         if (-not (Get-Service -Name $c.Service -ErrorAction SilentlyContinue)) {
             Write-Host "    Skipping $($c.Display) (not installed)" -ForegroundColor Gray
@@ -1137,43 +880,9 @@ function Start-AllServices {
             Start-Service -Name $c.Service -ErrorAction Stop
             Write-Success "Started $($c.Display)"
             Write-Log "Service started: $($c.Service)"
-            if ($c.Key -eq "cloudflare") { $hasCloudflare = $true }
         } catch {
             Write-Err "Failed to start $($c.Display): $_"
             Write-Log "Failed to start $($c.Service): $_" -Level "ERROR"
-        }
-    }
-
-    # After starting Cloudflare tunnel, auto-capture its URL to a file
-    if ($hasCloudflare) {
-        Write-Host "    Waiting for Cloudflare tunnel URL..." -ForegroundColor Gray
-        Start-Sleep -Seconds 4
-        $cfLog = Join-Path $Config.InstallRoot "logs\cloudflare_service.log"
-        if (Test-Path $cfLog) {
-            $tunnelUrl = Get-Content $cfLog -ErrorAction SilentlyContinue |
-                Select-String -Pattern "https://[a-zA-Z0-9-]+\.trycloudflare\.com" |
-                ForEach-Object { $_.Matches.Value } | Select-Object -Last 1
-            if ($tunnelUrl) {
-                Write-Success "Cloudflare tunnel: $tunnelUrl"
-                # Save to a dedicated file (source of truth for other functions)
-                $urlFile = Join-Path $Config.InstallRoot "cloudflare\current_tunnel_url.txt"
-                Set-Content -Path $urlFile -Value $tunnelUrl -Force
-                # Also log to logs\ dir for discoverability
-                $tunnelLog = Join-Path $Config.InstallRoot "logs\cloudflare_tunnel_url.txt"
-                Set-Content -Path $tunnelLog -Value $tunnelUrl -Force
-                # Refresh backend .env if it currently has a tunnel URL (not a custom domain)
-                $envPath = Join-Path $Config.InstallRoot "backend\.env"
-                if (Test-Path $envPath) {
-                    $currentFrontendUrl = Select-String -Path $envPath -Pattern '^FRONTEND_URL=(.*)$' | ForEach-Object { $_.Matches.Groups[1].Value }
-                    if ($currentFrontendUrl -match '\.trycloudflare\.com') {
-                        (Get-Content $envPath) -replace '^FRONTEND_URL=.*', "FRONTEND_URL=$tunnelUrl" | Set-Content $envPath
-                        Write-Success "Backend .env FRONTEND_URL refreshed"
-                        Write-Log "Refreshed backend .env FRONTEND_URL to tunnel: $tunnelUrl"
-                    }
-                }
-            } else {
-                Write-Host "    Tunnel URL not yet available - check later via option 8" -ForegroundColor DarkYellow
-            }
         }
     }
 }
@@ -1208,16 +917,6 @@ function Show-Status {
 
     # Health checks
     Verify-Health -Config $Config
-
-    # Show Cloudflare tunnel URL if available
-    $cfLog = Join-Path $Config.InstallRoot "logs\cloudflare_service.log"
-    if (Test-Path $cfLog) {
-        $tunnelUrl = Get-Content $cfLog -ErrorAction SilentlyContinue |
-            Select-String -Pattern "https://[a-zA-Z0-9-]+\.trycloudflare\.com" |
-            ForEach-Object { $_.Matches.Value } | Select-Object -Last 1
-        if ($tunnelUrl) { Write-Success "Cloudflare tunnel: $tunnelUrl" }
-    }
-
     Write-Log "Status check completed"
 }
 
@@ -1272,7 +971,7 @@ function Invoke-FullDeploy {
     $targetComponents = if ($script:headless -and $Components.Count -gt 0) {
         $Components
     } else {
-        @("frontend", "backend", "caddy", "cloudflare")
+        @("frontend", "backend", "caddy")
     }
     $allSucceeded = $true
 
@@ -1324,24 +1023,6 @@ function Invoke-FullDeploy {
                 $allSucceeded = $false
             }
         } else { Write-Warn "Skipped Caddy." }
-        if (-not $script:headless) { Read-Host "`nPress Enter to continue" | Out-Null }
-    }
-
-    if ($targetComponents -contains "cloudflare") {
-        if (Confirm-Step "Expose this app publicly via a Cloudflare quick tunnel?" -DefaultYes:$false) {
-            # Prompt: what should the tunnel expose? (Caddy / Frontend / Backend / custom)
-            Select-TunnelTarget -Config $Config | Out-Null
-            Start-Spinner "Installing Cloudflare tunnel ..."
-            $cfOk = Install-Cloudflare -Config $Config
-            Stop-Spinner
-            if ($cfOk) {
-                Write-Success "Cloudflare tunnel installed successfully."
-                Write-Log "Cloudflare tunnel installed successfully"
-            } else {
-                Write-Err "Cloudflare tunnel installation FAILED - check logs for details"
-                $allSucceeded = $false
-            }
-        } else { Write-Warn "Skipped Cloudflare tunnel." }
         if (-not $script:headless) { Read-Host "`nPress Enter to continue" | Out-Null }
     }
 
@@ -1431,8 +1112,7 @@ function Show-MainMenu {
     Write-Host "  5) Start services" -ForegroundColor White
     Write-Host "  6) Stop services" -ForegroundColor White
     Write-Host "  7) Caddy network config" -ForegroundColor White
-    Write-Host "  8) Public network config (Cloudflare / URL)" -ForegroundColor White
-    Write-Host "  9) Open logs folder" -ForegroundColor White
+    Write-Host "  8) Open logs folder" -ForegroundColor White
     Write-Host "  Q) Quit" -ForegroundColor White
     Write-Host ""
 }
@@ -1629,116 +1309,6 @@ function Show-CaddyConfig {
                 Restart-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue
                 Write-Success "Caddy restarted with new config"
             }
-        }
-    } while ($sub -notmatch '^[Bb]$')
-}
-
-function Show-NetworkConfig {
-    param($Config)
-    do {
-        # Read current Cloudflare tunnel URL if available
-        $cfTunnelUrl = $null
-        $urlFile = Join-Path $Config.InstallRoot "cloudflare\current_tunnel_url.txt"
-        if (Test-Path $urlFile) {
-            $cfTunnelUrl = Get-Content $urlFile -ErrorAction SilentlyContinue | Select-Object -First 1
-        }
-        # Read from logs\ dir if not found in dedicated file
-        if (-not $cfTunnelUrl) {
-            $cfLog = Join-Path $Config.InstallRoot "logs\cloudflare_service.log"
-            if (Test-Path $cfLog) {
-                $cfTunnelUrl = Get-Content $cfLog -ErrorAction SilentlyContinue |
-                    Select-String -Pattern "https://[a-zA-Z0-9-]+\.trycloudflare\.com" |
-                    ForEach-Object { $_.Matches.Value } | Select-Object -Last 1
-            }
-        }
-        # Ensure LocalUrl default if never set
-        $localUrl = $Config.LocalUrl
-        if ([string]::IsNullOrWhiteSpace($localUrl)) {
-            $localUrl = "http://localhost:$($Config.CaddyPort)"
-        }
-
-        Write-Host ""
-        Write-Host "============================================" -ForegroundColor Cyan
-        Write-Host " Network & Port Configuration" -ForegroundColor Cyan
-        Write-Host "============================================" -ForegroundColor Cyan
-        Write-Host ""
-        Write-Host " Current URLs:" -ForegroundColor White
-        Write-Host "   Public URL    : $($Config.PublicUrl)" -ForegroundColor Gray
-        Write-Host "   Local URL     : $localUrl" -ForegroundColor Gray
-        if ($cfTunnelUrl) {
-            Write-Host "   Cloudflare    : $cfTunnelUrl" -ForegroundColor Green
-        } else {
-            Write-Host "   Cloudflare    : (not started)" -ForegroundColor DarkGray
-        }
-        Write-Host ""
-        Write-Host " 1) Public URL" -ForegroundColor Gray
-        Write-Host " 2) Local URL" -ForegroundColor Gray
-        Write-Host " 3) Cloudflare tunnel" -ForegroundColor Gray
-        Write-Host " B) Back to main menu" -ForegroundColor Gray
-        Write-Host ""
-        $sub = Read-Host "Select option"
-        switch ($sub) {
-            "1" {
-                # Public URL submenu - delegate to existing function
-                Select-PublicUrl -Config $Config | Out-Null
-            }
-            "2" {
-                # Local URL submenu
-                do {
-                    Write-Host ""
-                    Write-Host "============================================" -ForegroundColor Cyan
-                    Write-Host " Local URL" -ForegroundColor Cyan
-                    Write-Host "============================================" -ForegroundColor Cyan
-                    Write-Host " The URL used for local network access." -ForegroundColor Gray
-                    Write-Host " Current: $localUrl" -ForegroundColor Gray
-                    Write-Host ""
-                    Write-Host " 1) Change URL" -ForegroundColor Gray
-                    Write-Host " 2) Exit" -ForegroundColor Gray
-                    Write-Host ""
-                    $opt = Read-Host "Select option"
-                    switch ($opt) {
-                        "1" {
-                            $newUrl = Read-Host "Enter local URL (e.g. http://192.168.1.100:$($Config.CaddyPort))"
-                            if ($newUrl) {
-                                if ($newUrl -match '^https?://') {
-                                    $Config.LocalUrl = $newUrl
-                                    $localUrl = $newUrl
-                                    Save-DeployConfig -Config $Config
-                                    Write-Success "Local URL updated to: $newUrl"
-                                } else {
-                                    Write-Err "Enter a URL starting with http:// or https://"
-                                }
-                            }
-                        }
-                        "2" { break }
-                        default { Write-Warn "Unknown option." }
-                    }
-                } while ($opt -ne "2")
-            }
-            "3" {
-                # Cloudflare tunnel - display only
-                Write-Host ""
-                Write-Host "============================================" -ForegroundColor Cyan
-                Write-Host " Cloudflare Tunnel URL" -ForegroundColor Cyan
-                Write-Host "============================================" -ForegroundColor Cyan
-                if ($cfTunnelUrl) {
-                    Write-Host ""
-                    Write-Host " Your Cloudflare tunnel is active at:" -ForegroundColor White
-                    Write-Host "   $cfTunnelUrl" -ForegroundColor Green
-                    Write-Host ""
-                    Write-Host " This URL is auto-generated by Cloudflare and may change" -ForegroundColor Gray
-                    Write-Host " each time the tunnel restarts." -ForegroundColor Gray
-                } else {
-                    Write-Host ""
-                    Write-Host " No Cloudflare tunnel URL detected." -ForegroundColor Yellow
-                    Write-Host " Start the Cloudflare service first (option 5 from main menu)." -ForegroundColor Gray
-                    Write-Host " The URL will appear here automatically once the tunnel is running." -ForegroundColor Gray
-                }
-                Write-Host ""
-                Read-Host "Press Enter to continue" | Out-Null
-            }
-            "[Bb]" { break }
-            default { Write-Warn "Unknown option." }
         }
     } while ($sub -notmatch '^[Bb]$')
 }
@@ -1970,10 +1540,6 @@ do {
         }
         "^7$" { Show-CaddyConfig -Config $Config }
         "^8$" {
-            # Public network config (Cloudflare / URL / ports)
-            Show-NetworkConfig -Config $Config
-        }
-        "^9$" {
             # Open logs folder
             $logsPath = Join-Path $Config.InstallRoot "logs"
             if (Test-Path $logsPath) { Invoke-Item $logsPath } else { Write-Warn "No logs folder yet." }
