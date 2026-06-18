@@ -390,9 +390,17 @@ function Get-OrCreateSecrets {
 
     Write-Host "These are saved locally only and used to generate the backend's .env file.`n" -ForegroundColor Gray
 
-    # Database settings — only password differs per install; host/port/name/user use defaults
+    # Database settings
     Write-Host "-- Database --" -ForegroundColor Cyan
-    $dbPassSec = Read-Host "DB Password" -AsSecureString
+    $dbHost     = Read-Host "DB Host (default: 192.168.1.172)"
+    if ([string]::IsNullOrWhiteSpace($dbHost)) { $dbHost = "192.168.1.172" }
+    $dbPort     = Read-Host "DB Port (default: 3306)"
+    if ([string]::IsNullOrWhiteSpace($dbPort)) { $dbPort = 3306 } else { $dbPort = [int]$dbPort }
+    $dbName     = Read-Host "DB Name (default: ess)"
+    if ([string]::IsNullOrWhiteSpace($dbName)) { $dbName = "ess" }
+    $dbUser     = Read-Host "DB User (default: root)"
+    if ([string]::IsNullOrWhiteSpace($dbUser)) { $dbUser = "root" }
+    $dbPassSec  = Read-Host "DB Password"
 
     # SMTP settings — host/port are fixed Gmail defaults; 'from' is the same as user
     Write-Host "-- SMTP --" -ForegroundColor Cyan
@@ -401,10 +409,10 @@ function Get-OrCreateSecrets {
 
     $secrets = [PSCustomObject]@{
         db = [PSCustomObject]@{
-            host     = "192.168.1.172"
-            port     = 3306
-            name     = "ess"
-            user     = "root"
+            host     = $dbHost
+            port     = $dbPort
+            name     = $dbName
+            user     = $dbUser
             password = (ConvertFrom-SecureToPlain $dbPassSec)
         }
         smtp = [PSCustomObject]@{
@@ -429,6 +437,7 @@ function Get-OrCreateSecrets {
 # PREREQUISITES
 # ===========================================================
 function Test-Prerequisites {
+    param([switch]$CheckOnly)
     Write-Step "Checking prerequisites"
     $ok = $true
     $missing = @()
@@ -461,6 +470,18 @@ function Test-Prerequisites {
     }
 
     Write-Host ""
+
+    # Check-only mode: just report, no install/update offers
+    if ($CheckOnly) {
+        if ($missing.Count -gt 0) {
+            $missingNames = ($missing | ForEach-Object { $_.Name }) -join ', '
+            Write-Err "Missing prerequisites: $missingNames — install them manually or use menu option 1"
+            Write-Log "Missing prerequisites (check-only): $missingNames" -Level "ERROR"
+            return $false
+        }
+        Write-Success "All prerequisites are installed."
+        return $true
+    }
 
     # Pass 2: install all missing at once
     if ($missing.Count -gt 0) {
@@ -572,21 +593,30 @@ function Install-Frontend {
     }
 
     try {
+        $logsDir = Join-Path $Config.InstallRoot "logs"
+        $svcTimestamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
+        $installLog = Join-Path $logsDir "frontend_installing_${svcTimestamp}.log"
+        Set-Content -Path $installLog -Value "" -Force
+
         $tempDir = Join-Path $env:TEMP "essmo_frontend_clone"
         if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
 
+        "--- git clone ---" | Out-File -FilePath $installLog -Append
         git clone $Config.FrontendRepo $tempDir 2>&1 |
-            Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\frontend_install_clone.log")
+            Tee-Object -FilePath $installLog -Append
 
         $destDir = Join-Path $Config.InstallRoot "frontend"
         New-Item -Path $destDir -ItemType Directory -Force | Out-Null
         Copy-Item -Path "$tempDir\*" -Destination $destDir -Recurse -Force
 
         Push-Location $destDir
-        npm install 2>&1 | Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\frontend_install_npm.log")
-        npm install serve 2>&1 | Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\frontend_install_serve.log")
+        "--- npm install ---" | Out-File -FilePath $installLog -Append
+        npm install 2>&1 | Tee-Object -FilePath $installLog -Append
+        "--- npm install serve ---" | Out-File -FilePath $installLog -Append
+        npm install serve 2>&1 | Tee-Object -FilePath $installLog -Append
         $env:VITE_API_URL = $Config.ApiPrefix
-        npm run build 2>&1 | Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\frontend_install_build.log")
+        "--- npm run build ---" | Out-File -FilePath $installLog -Append
+        npm run build 2>&1 | Tee-Object -FilePath $installLog -Append
         Pop-Location
 
         if (-not (Test-Path (Join-Path $destDir "dist"))) {
@@ -595,8 +625,6 @@ function Install-Frontend {
         Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 
         # Runtime log: capture all stdout/stderr from the running service
-        $logsDir = Join-Path $Config.InstallRoot "logs"
-        $svcTimestamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
         $frontendLog = Join-Path $logsDir "frontend_service_${svcTimestamp}.log"
         Write-Host "    Service log: $frontendLog" -ForegroundColor Gray
 
@@ -632,32 +660,39 @@ function Install-Backend {
     }
 
     try {
+        $logsDir = Join-Path $Config.InstallRoot "logs"
+        $svcTimestamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
+        $installLog = Join-Path $logsDir "backend_installing_${svcTimestamp}.log"
+        Set-Content -Path $installLog -Value "" -Force
+
         $tempDir = Join-Path $env:TEMP "essmo_backend_clone"
         if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
 
+        "--- git clone ---" | Out-File -FilePath $installLog -Append
         git clone $Config.BackendRepo $tempDir 2>&1 |
-            Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\backend_install_clone.log")
+            Tee-Object -FilePath $installLog -Append
 
         $destDir = Join-Path $Config.InstallRoot "backend"
         New-Item -Path $destDir -ItemType Directory -Force | Out-Null
         Copy-Item -Path "$tempDir\*" -Destination $destDir -Recurse -Force
 
-        $logsDir = Join-Path $Config.InstallRoot "logs"
-
         Push-Location $destDir
+        "--- python -m venv ---" | Out-File -FilePath $installLog -Append
         python -m venv venv 2>&1 |
-            Tee-Object -FilePath (Join-Path $logsDir "backend_install_venv.log")
+            Tee-Object -FilePath $installLog -Append
         if (-not (Test-Path (Join-Path $destDir "venv\Scripts\python.exe"))) {
             throw "Virtual environment was not created"
         }
+        "--- pip install -r requirements.txt ---" | Out-File -FilePath $installLog -Append
         & (Join-Path $destDir "venv\Scripts\pip") install -r requirements.txt 2>&1 |
-            Tee-Object -FilePath (Join-Path $logsDir "backend_install_pip.log")
+            Tee-Object -FilePath $installLog -Append
         Pop-Location
         Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 
-        Write-Host "    Generating .env file..." -ForegroundColor Gray
+        Write-Host "    Preparing .env file..." -ForegroundColor Gray
+        "--- generating SECRET_KEY ---" | Out-File -FilePath $installLog -Append
         $generatedKey = & (Join-Path $destDir "venv\Scripts\python") -c "import secrets; print(secrets.token_hex(32))" 2>&1 |
-            Tee-Object -FilePath (Join-Path $logsDir "backend_install_env.log")
+            Tee-Object -FilePath $installLog -Append
         $envContent = @"
 DB_ENGINE=mysql
 DB_HOST=$($Secrets.db.host)
@@ -675,15 +710,139 @@ SMTP_PORT=$($Secrets.smtp.port)
 SMTP_USER="$($Secrets.smtp.user)"
 SMTP_PASS="$($Secrets.smtp.pass)"
 EMAIL_FROM="$($Secrets.smtp.from)"
-FRONTEND_URL=http://localhost:$($Config.CaddyPort)
 "@
-        Set-Content -Path (Join-Path $destDir ".env") -Value $envContent -Force
+
+        # ---- Interactive .env inline editor ----
+        $envFilePath = Join-Path $destDir ".env"
+        $originalLines = $envContent -split "`r?`n"
+        $editLines = @() + $originalLines
+        $saveConfirmed = $false
+
+        function Show-EnvContent {
+            param([string[]]$Lines, [string[]]$OriginalLines)
+            Write-Host ""
+            Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
+            for ($i = 0; $i -lt $Lines.Count; $i++) {
+                $num = ($i + 1).ToString().PadLeft(2)
+                $isDiff = $i -lt $OriginalLines.Count -and $Lines[$i] -ne $OriginalLines[$i]
+                if ($isDiff) {
+                    Write-Host "  $num  $($Lines[$i])" -ForegroundColor Yellow
+                } else {
+                    Write-Host "  $num  $($Lines[$i])" -ForegroundColor Gray
+                }
+            }
+            Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
+        }
+
+        function Test-EnvValid {
+            param([string[]]$Lines)
+            $missing = @()
+            foreach ($key in @("DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME", "SECRET_KEY")) {
+                $found = $false
+                foreach ($line in $Lines) {
+                    if ($line -match "^$key=.+") { $found = $true; break }
+                }
+                if (-not $found) { $missing += $key }
+            }
+            return $missing
+        }
+
+        do {
+            Show-EnvContent -Lines $editLines -OriginalLines $originalLines
+
+            $input = Read-Host "  Line to edit (1-$($editLines.Count)), D=diff, S=save, C=cancel, E=exit"
+
+            if ($input -eq "E" -or $input -eq "e") {
+                throw "User exited .env editor — backend install aborted"
+            }
+
+            if ($input -eq "C" -or $input -eq "c") {
+                Write-Warn "Cancelled. Using default .env values."
+                $saveConfirmed = $false
+                break
+            }
+
+            if ($input -eq "S" -or $input -eq "s") {
+                $missing = Test-EnvValid -Lines $editLines
+                if ($missing.Count -gt 0) {
+                    Write-Warn "Missing required fields: $($missing -join ', ')"
+                    if (-not (Confirm-Step "Save anyway?" -DefaultYes:$false)) {
+                        continue
+                    }
+                }
+                $saveConfirmed = $true
+                break
+            }
+
+            if ($input -eq "D" -or $input -eq "d") {
+                $changes = 0
+                for ($i = 0; $i -lt [Math]::Max($originalLines.Count, $editLines.Count); $i++) {
+                    $o = if ($i -lt $originalLines.Count) { $originalLines[$i] } else { "" }
+                    $e = if ($i -lt $editLines.Count) { $editLines[$i] } else { "" }
+                    $oT = $o.Trim(); $eT = $e.Trim()
+                    if ($oT -eq $eT) { continue }
+                    if ($oT -eq "" -and $eT -eq "") { continue }
+                    if ($changes -eq 0) { Write-Host "  Changes:" -ForegroundColor Cyan }
+                    Write-Host "    - $o" -ForegroundColor Red
+                    Write-Host "    + $e" -ForegroundColor Green
+                    $changes++
+                }
+                if ($changes -eq 0) { Write-Host "    (no changes)" -ForegroundColor Gray }
+                continue
+            }
+
+            # Try parsing as line number
+            $lineNum = 0
+            if ($input -match '^\d+$') { $lineNum = [int]$input }
+            if ($lineNum -lt 1 -or $lineNum -gt $editLines.Count) {
+                Write-Warn "Invalid line number. Enter 1-$($editLines.Count), D, S, or C."
+                continue
+            }
+
+            $idx = $lineNum - 1
+            $currentLine = $editLines[$idx]
+
+            # Parse key and current value
+            $eqPos = $currentLine.IndexOf('=')
+            if ($eqPos -ge 0) {
+                $key = $currentLine.Substring(0, $eqPos)
+                $currentVal = $currentLine.Substring($eqPos + 1)
+                # Strip surrounding quotes for display
+                $displayVal = $currentVal -replace '^"(.*)"$', '$1'
+                $newVal = Read-Host "  $key [$displayVal]"
+                if ([string]::IsNullOrWhiteSpace($newVal)) {
+                    # Keep current value — no change
+                    Write-Host "    (unchanged)" -ForegroundColor Gray
+                } else {
+                    # Preserve quotes if the original had them
+                    if ($currentVal -match '^".*"$') {
+                        $editLines[$idx] = "$key=`"$newVal`""
+                    } else {
+                        $editLines[$idx] = "$key=$newVal"
+                    }
+                }
+            } else {
+                # Blank or comment line — replace whole thing
+                $newVal = Read-Host "  Line $lineNum"
+                if (-not [string]::IsNullOrWhiteSpace($newVal)) {
+                    $editLines[$idx] = $newVal
+                }
+            }
+        } while ($true)
+
+        $finalContent = $editLines -join "`r`n"
+        if ($saveConfirmed) {
+            Set-Content -Path $envFilePath -Value $finalContent -Force
+            Write-Success ".env file written to $envFilePath"
+        } else {
+            Set-Content -Path $envFilePath -Value $envContent -Force
+            Write-Host "    .env written with default values." -ForegroundColor Gray
+        }
+        # ---- End .env inline editor ----
 
         $pythonExe = Join-Path $destDir "venv\Scripts\python.exe"
 
         # Runtime log: capture all uvicorn request/error logs
-        $logsDir = Join-Path $Config.InstallRoot "logs"
-        $svcTimestamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
         $backendLog = Join-Path $logsDir "backend_service_${svcTimestamp}.log"
         Write-Host "    Service log: $backendLog" -ForegroundColor Gray
 
@@ -717,6 +876,11 @@ function Install-Caddy {
     }
 
     try {
+        $logsDir = Join-Path $Config.InstallRoot "logs"
+        $svcTimestamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
+        $installLog = Join-Path $logsDir "caddy_installing_${svcTimestamp}.log"
+        Set-Content -Path $installLog -Value "" -Force
+
         $caddyDir = Join-Path $Config.InstallRoot "caddy"
         New-Item -Path $caddyDir -ItemType Directory -Force | Out-Null
         $caddyExe = Join-Path $caddyDir "caddy.exe"
@@ -724,8 +888,9 @@ function Install-Caddy {
         if (-not (Test-Path $caddyExe)) {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             Write-Host "    Downloading Caddy..." -ForegroundColor Gray
+            "--- downloading Caddy ---" | Out-File -FilePath $installLog -Append
             Invoke-WebRequest -Uri "https://caddyserver.com/api/download?os=windows&arch=amd64" -OutFile $caddyExe -UseBasicParsing 2>&1 |
-                Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\caddy_install_download.log")
+                Tee-Object -FilePath $installLog -Append
             if (-not (Test-Path $caddyExe)) { throw "Caddy download failed" }
             Write-Log "Caddy downloaded from caddyserver.com"
         } else {
@@ -758,12 +923,85 @@ function Install-Caddy {
         $caddyfileLines += "    }"
         $caddyfileLines += "}"
         $caddyfileContent = $caddyfileLines -join "`n"
-        Set-Content -Path $caddyfilePath -Value $caddyfileContent -Force
-        $caddyfileContent | Out-File -FilePath (Join-Path $Config.InstallRoot "logs\caddy_install_config.log") -Encoding utf8
+        $originalCaddyLines = $caddyfileContent -split "`r?`n"
+        $editCaddyLines = @() + $originalCaddyLines
+        $caddySaved = $false
+
+        # ---- Interactive Caddyfile inline editor ----
+        do {
+            Write-Host ""
+            Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
+            for ($i = 0; $i -lt $editCaddyLines.Count; $i++) {
+                $num = ($i + 1).ToString().PadLeft(2)
+                $isDiff = $i -lt $originalCaddyLines.Count -and $editCaddyLines[$i] -ne $originalCaddyLines[$i]
+                if ($isDiff) {
+                    Write-Host "  $num  $($editCaddyLines[$i])" -ForegroundColor Yellow
+                } else {
+                    Write-Host "  $num  $($editCaddyLines[$i])" -ForegroundColor Gray
+                }
+            }
+            Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
+
+            $input = Read-Host "  Line to edit (1-$($editCaddyLines.Count)), D=diff, S=save, C=cancel, E=exit"
+
+            if ($input -eq "E" -or $input -eq "e") {
+                throw "User exited Caddyfile editor — Caddy install aborted"
+            }
+
+            if ($input -eq "C" -or $input -eq "c") {
+                Write-Warn "Using default Caddyfile."
+                $caddySaved = $false
+                break
+            }
+
+            if ($input -eq "S" -or $input -eq "s") {
+                $caddySaved = $true
+                break
+            }
+
+            if ($input -eq "D" -or $input -eq "d") {
+                $changes = 0
+                for ($i = 0; $i -lt [Math]::Max($originalCaddyLines.Count, $editCaddyLines.Count); $i++) {
+                    $o = if ($i -lt $originalCaddyLines.Count) { $originalCaddyLines[$i] } else { "" }
+                    $e = if ($i -lt $editCaddyLines.Count) { $editCaddyLines[$i] } else { "" }
+                    $oT = $o.Trim(); $eT = $e.Trim()
+                    if ($oT -eq $eT) { continue }
+                    if ($oT -eq "" -and $eT -eq "") { continue }
+                    if ($changes -eq 0) { Write-Host "  Changes:" -ForegroundColor Cyan }
+                    Write-Host "    - $o" -ForegroundColor Red
+                    Write-Host "    + $e" -ForegroundColor Green
+                    $changes++
+                }
+                if ($changes -eq 0) { Write-Host "    (no changes)" -ForegroundColor Gray }
+                continue
+            }
+
+            $lineNum = 0
+            if ($input -match '^\d+$') { $lineNum = [int]$input }
+            if ($lineNum -lt 1 -or $lineNum -gt $editCaddyLines.Count) {
+                Write-Warn "Invalid. Enter 1-$($editCaddyLines.Count), D, S, or C."
+                continue
+            }
+
+            $idx = $lineNum - 1
+            $newVal = Read-Host "  Line $lineNum [$($editCaddyLines[$idx])]"
+            if (-not [string]::IsNullOrWhiteSpace($newVal)) {
+                $editCaddyLines[$idx] = $newVal
+            }
+        } while ($true)
+        # ---- End Caddyfile inline editor ----
+
+        $finalCaddyfile = $editCaddyLines -join "`n"
+        if ($caddySaved) {
+            Set-Content -Path $caddyfilePath -Value $finalCaddyfile -Force
+            Write-Success "Caddyfile written to $caddyfilePath"
+        } else {
+            Set-Content -Path $caddyfilePath -Value $caddyfileContent -Force
+        }
+        "--- Caddyfile ---" | Out-File -FilePath $installLog -Append
+        $finalCaddyfile | Out-File -FilePath $installLog -Append
 
         # Runtime log: capture Caddy access/error logs
-        $logsDir = Join-Path $Config.InstallRoot "logs"
-        $svcTimestamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
         $caddyLog = Join-Path $logsDir "caddy_service_${svcTimestamp}.log"
         Write-Host "    Service log: $caddyLog" -ForegroundColor Gray
 
@@ -838,23 +1076,32 @@ function Remove-Component {
     $svcName = "ess-mo-$Key"
     Write-Step "Removing $Key"
     if (-not $script:dryRun) {
-        Stop-Service -Name $svcName -ErrorAction SilentlyContinue
-        servy-cli uninstall --name="$svcName" --silent 2>&1 | Out-Null
+        $logsDir = Join-Path $Config.InstallRoot "logs"
+        $uninstallLog = Join-Path $logsDir "${Key}_uninstalling_$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+        "--- Stopping service $svcName ---" | Out-File -FilePath $uninstallLog -Append
+
+        Stop-Service -Name $svcName -ErrorAction SilentlyContinue 2>&1 | Out-File -FilePath $uninstallLog -Append
+        "--- servy-cli uninstall ---" | Out-File -FilePath $uninstallLog -Append
+        servy-cli uninstall --name="$svcName" --silent 2>&1 | Out-File -FilePath $uninstallLog -Append
         Start-Sleep -Milliseconds 500
 
         if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
             Write-Warn "$svcName is still registered - restart your computer and re-run uninstall."
+            "WARN: $svcName still registered" | Out-File -FilePath $uninstallLog -Append
         } else {
             Write-Success "$svcName service removed."
+            "OK: $svcName removed" | Out-File -FilePath $uninstallLog -Append
         }
 
         if ($DeleteFiles) {
             $path = Join-Path $Config.InstallRoot $Key
             if (Test-Path $path) {
-                Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
+                "--- deleting $path ---" | Out-File -FilePath $uninstallLog -Append
+                Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue 2>&1 | Out-File -FilePath $uninstallLog -Append
                 Write-Success "Deleted $path"
             }
         }
+        Write-Success "Uninstall log: $uninstallLog"
     } else {
         Write-Warn "[DRY-RUN] Would remove $Key service and $(if($DeleteFiles){'delete'}else{'keep'}) its files"
     }
@@ -953,8 +1200,8 @@ function Invoke-FullDeploy {
         }
     }
 
-    # 3. Check prerequisites
-    $prereqResult = Test-Prerequisites
+    # 3. Check prerequisites — check-only, no install/update prompts
+    $prereqResult = Test-Prerequisites -CheckOnly
     if ("BACK" -eq $prereqResult -or -not $prereqResult) {
         if ("BACK" -eq $prereqResult) {
             Write-Warn "Returning to menu."
@@ -963,10 +1210,6 @@ function Invoke-FullDeploy {
         }
         return
     }
-    if (-not $script:headless -or $Components.Count -eq 0 -or ($Components -contains "backend")) {
-        $secrets = Get-OrCreateSecrets
-    }
-
     # Determine which components to deploy
     $targetComponents = if ($script:headless -and $Components.Count -gt 0) {
         $Components
@@ -1085,6 +1328,23 @@ function Invoke-FullDeploy {
         $duration = (Get-Date) - $script:startTime
         Write-Success "Duration: $($duration.Minutes)m $($duration.Seconds)s"
         Write-Success "Log: $($script:logFile)"
+
+        # Routing diagram — show the full access path
+        if ($targetComponents -contains "caddy") {
+            Write-Host ""
+            Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
+            Write-Host "  Access your app at: http://localhost:$($Config.CaddyPort)" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "  Caddy (: $($Config.CaddyPort))" -ForegroundColor Green
+            if ($targetComponents -contains "backend") {
+                Write-Host "    ├── $($Config.ApiPrefix)/*  →  backend  (127.0.0.1:$($Config.BackendPort))" -ForegroundColor Gray
+            }
+            if ($targetComponents -contains "frontend") {
+                Write-Host "    └── /*                  →  frontend (127.0.0.1:$($Config.FrontendPort))" -ForegroundColor Gray
+            }
+            Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
+            Write-Host ""
+        }
     } else {
         Write-Warn "Deployment finished with errors. Check log: $($script:logFile)"
     }
