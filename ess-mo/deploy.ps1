@@ -336,9 +336,7 @@ function Initialize-InstallRoot {
 }
 
 # ===========================================================
-# SECRETS (DB / SMTP credentials, stored outside the script)
-# Nested structure: db.host, db.port, db.name, db.user, db.password
-#                   smtp.host, smtp.port, smtp.user, smtp.pass, smtp.from
+# SECRETS PROTECTION — ensures deploy.secrets.json is gitignored
 # ===========================================================
 function Protect-SecretsFile {
     $gitignore = Join-Path $PSScriptRoot ".gitignore"
@@ -350,77 +348,6 @@ function Protect-SecretsFile {
         Add-Content -Path $gitignore -Value $entry
         Write-Log "Added $entry to .gitignore"
     }
-}
-
-function Get-OrCreateSecrets {
-    if ($script:headless) {
-        if (Test-Path $SecretsPath) {
-            Write-Log "Secrets loaded from $SecretsPath"
-            return Get-Content $SecretsPath -Raw | ConvertFrom-Json
-        }
-        Write-Err "No secrets file found and running in headless mode. Create deploy.secrets.json first."
-        Write-Host "  Template: $SecretsExamplePath" -ForegroundColor Gray
-        exit 1
-    }
-
-    # Ask user: load from file or enter credentials manually
-    do {
-        $useFile = Read-Host "Load DB/SMTP credentials from deploy.secrets.json? (Y/n)  n = enter manually"
-        if ($useFile -eq '' -or $useFile -match '^[Yy]') {
-            if (Test-Path $SecretsPath) {
-                Write-Success "Secrets loaded from $SecretsPath"
-                Write-Log "Secrets loaded from $SecretsPath"
-                return Get-Content $SecretsPath -Raw | ConvertFrom-Json
-            } else {
-                Write-Warn "File not found: $SecretsPath"
-                Write-Host "  Place deploy.secrets.json next to this script, or type 'n' to enter credentials manually." -ForegroundColor Gray
-                # Loop back and ask again
-            }
-        } else {
-            break
-        }
-    } while ($true)
-
-    Write-Host "These are saved locally only and used to generate the backend's .env file.`n" -ForegroundColor Gray
-
-    # Database settings
-    Write-Host "-- Database --" -ForegroundColor Cyan
-    $dbHost     = Read-Host "DB Host (default: 192.168.1.172)"
-    if ([string]::IsNullOrWhiteSpace($dbHost)) { $dbHost = "192.168.1.172" }
-    $dbPort     = Read-Host "DB Port (default: 3306)"
-    if ([string]::IsNullOrWhiteSpace($dbPort)) { $dbPort = 3306 } else { $dbPort = [int]$dbPort }
-    $dbName     = Read-Host "DB Name (default: ess)"
-    if ([string]::IsNullOrWhiteSpace($dbName)) { $dbName = "ess" }
-    $dbUser     = Read-Host "DB User (default: root)"
-    if ([string]::IsNullOrWhiteSpace($dbUser)) { $dbUser = "root" }
-    $dbPass     = Read-Host "DB Password"
-
-    # SMTP settings — host/port are fixed Gmail defaults; 'from' is the same as user
-    Write-Host "-- SMTP --" -ForegroundColor Cyan
-    $smtpUser    = Read-Host "SMTP Email address"
-    $smtpPass    = Read-Host "SMTP App Password"
-
-    $secrets = [PSCustomObject]@{
-        db = [PSCustomObject]@{
-            host     = $dbHost
-            port     = $dbPort
-            name     = $dbName
-            user     = $dbUser
-            password = $dbPass
-        }
-        smtp = [PSCustomObject]@{
-            host = "smtp.gmail.com"
-            port = 587
-            user = $smtpUser
-            pass = $smtpPass
-            from = $smtpUser
-        }
-    }
-    $secrets | ConvertTo-Json | Set-Content $SecretsPath
-    Protect-SecretsFile
-    Write-Success "Saved to $SecretsPath (excluded from git via .gitignore)."
-    Write-Log "Secrets created at $SecretsPath"
-    return $secrets
 }
 
 # ===========================================================
@@ -658,6 +585,9 @@ function Install-Backend {
         $installLog = Join-Path $logsDir "backend_installing_${svcTimestamp}.log"
         Set-Content -Path $installLog -Value "" -Force
 
+        # Show spinner during setup (git clone, venv, pip install)
+        Start-Spinner "Installing Backend ..."
+
         $tempDir = Join-Path $env:TEMP "essmo_backend_clone"
         if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
 
@@ -682,6 +612,9 @@ function Install-Backend {
         Pop-Location
         Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 
+        # Hide spinner before opening the interactive editor
+        Stop-Spinner
+
         Write-Host "    Preparing .env file..." -ForegroundColor Gray
         "--- generating SECRET_KEY ---" | Out-File -FilePath $installLog -Append
         $generatedKey = & (Join-Path $destDir "venv\Scripts\python") -c "import secrets; print(secrets.token_hex(32))" 2>&1 |
@@ -705,36 +638,12 @@ SMTP_PASS="your_app_password"
 EMAIL_FROM="your_email@gmail.com"
 "@
 
-        # ---- .env visual editor (arrow-key driven) ----
+        # ---- .env cursor editor (free-move cursor, footer navigation) ----
         $envFilePath = Join-Path $destDir ".env"
         $saveConfirmed = $false
 
         # Write defaults first
         Set-Content -Path $envFilePath -Value $envContent -Force
-
-        function Show-EnvFile {
-            param([string[]]$Lines, [string[]]$OriginalLines, [int]$Selected)
-            Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
-            for ($i = 0; $i -lt $Lines.Count; $i++) {
-                $num = ($i + 1).ToString().PadLeft(2)
-                $isDiff = $i -lt $OriginalLines.Count -and $OriginalLines[$i] -and $Lines[$i] -ne $OriginalLines[$i]
-                $isNew = $i -ge $OriginalLines.Count
-                $cursor = if ($i -eq $Selected) { ">" } else { " " }
-                if ($isDiff) {
-                    $color = "Yellow"
-                } elseif ($isNew) {
-                    $color = "Green"
-                } else {
-                    $color = "Gray"
-                }
-                if ($i -eq $Selected) {
-                    Write-Host " $cursor$num  $($Lines[$i])" -ForegroundColor Black -BackgroundColor Cyan
-                } else {
-                    Write-Host " $cursor$num  $($Lines[$i])" -ForegroundColor $color
-                }
-            }
-            Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
-        }
 
         function Test-EnvFileValid {
             param([string]$Path)
@@ -746,33 +655,21 @@ EMAIL_FROM="your_email@gmail.com"
             return $missing
         }
 
-        function Edit-Line {
-            param([string[]]$Lines, [int]$Idx)
-            $currentLine = $Lines[$Idx]
-            # Pre-fill the ENTIRE line so user can freely edit any part with arrow keys
-            try {
-                [Microsoft.PowerShell.PSConsoleReadLine]::SetBufferAndFocus($currentLine)
-            } catch {}
-            Write-Host "  " -NoNewline
-            $newLine = Read-Host ""
-            if (-not [string]::IsNullOrWhiteSpace($newLine)) {
-                $Lines[$Idx] = $newLine
-                Set-Content -Path $envFilePath -Value ($Lines -join "`r`n") -Force
-            }
-            return $Lines
-        }
-
         $originalDefaults = ($envContent -split "`r?`n") | Where-Object { $_ -ne "" }
         $lines = Get-Content -Path $envFilePath
         $sel = 0
+        $col = 0
 
-        # Save terminal state
-        $startTop = [Console]::CursorTop
+        # Footer items — navigable like content lines
+        $footerItems = @("  Save and exit", "  Cancel (revert to defaults)")
+        $totalItems = $lines.Count + $footerItems.Count
 
         do {
-            # Redraw from saved position
-            [Console]::SetCursorPosition(0, $startTop)
-            $rowsToClear = $lines.Count + 8
+            # Capture anchor at each iteration so terminal scrolling doesn't drift
+            $startTop = [Console]::CursorTop
+
+            # Clear area
+            $rowsToClear = $totalItems + 6
             for ($r = 0; $r -lt $rowsToClear; $r++) {
                 [Console]::SetCursorPosition(0, $startTop + $r)
                 Write-Host (" " * [Console]::WindowWidth) -NoNewline
@@ -780,46 +677,116 @@ EMAIL_FROM="your_email@gmail.com"
             [Console]::SetCursorPosition(0, $startTop)
 
             Write-Host ""
-            Show-EnvFile -Lines $lines -OriginalLines $originalDefaults -Selected $sel
-            Write-Host "  ", ([char]0x2191), "/", ([char]0x2193), " navigate  Enter edit  S save  C defaults  X abort" -ForegroundColor Gray
+            Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+                $num = ($i + 1).ToString().PadLeft(2)
+                $isDiff = $i -lt $originalDefaults.Count -and $originalDefaults[$i] -and $lines[$i] -ne $originalDefaults[$i]
+                $cur = if ($i -eq $sel) { ">" } else { " " }
+                if ($i -eq $sel) {
+                    Write-Host " $cur$num  $($lines[$i])" -ForegroundColor Black -BackgroundColor Cyan
+                } elseif ($isDiff) {
+                    Write-Host " $cur$num  $($lines[$i])" -ForegroundColor Yellow
+                } else {
+                    Write-Host " $cur$num  $($lines[$i])" -ForegroundColor Gray
+                }
+            }
+            Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
+
+            # Footer items (navigable)
+            for ($i = 0; $i -lt $footerItems.Count; $i++) {
+                $idx = $lines.Count + $i
+                $cur = if ($idx -eq $sel) { ">" } else { " " }
+                if ($idx -eq $sel) {
+                    Write-Host "  $cur$($footerItems[$i])" -ForegroundColor Black -BackgroundColor Cyan
+                } else {
+                    Write-Host "  $cur$($footerItems[$i])" -ForegroundColor Gray
+                }
+            }
+            Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
+            Write-Host "  " + ([char]0x2191) + ([char]0x2193) + " navigate  " + ([char]0x2190) + ([char]0x2192) + " within line  Type to edit  Enter=select" -ForegroundColor Gray
+
+            # Position cursor
+            if ($sel -lt $lines.Count) {
+                $cursorRow = $startTop + 2 + $sel
+                $cursorCol = 6 + [Math]::Min($col, $lines[$sel].Length)
+            } else {
+                $cursorRow = $startTop + 2 + $lines.Count + 1 + ($sel - $lines.Count)
+                $cursorCol = 4
+            }
+            [Console]::SetCursorPosition($cursorCol, $cursorRow)
 
             $keyInfo = [Console]::ReadKey($true)
             $key = $keyInfo.Key
             $char = $keyInfo.KeyChar
 
-            if ($key -eq 'UpArrow' -and $sel -gt 0) {
-                $sel--
-            } elseif ($key -eq 'DownArrow' -and $sel -lt $lines.Count - 1) {
-                $sel++
-            } elseif ($key -eq 'Enter') {
-                $lines = Edit-Line -Lines $lines -Idx $sel
-                $lines = Get-Content -Path $envFilePath
-                # Recalc position in case Read-Host scrolled the terminal
-                $startTop = [Math]::Max(0, [Console]::CursorTop - $lines.Count - 6)
-            } elseif ($char -eq 'S' -or $char -eq 's') {
-                $missing = Test-EnvFileValid -Path $envFilePath
-                if ($missing.Count -gt 0) {
-                    Write-Warn "Missing required fields: $($missing -join ', ')"
-                    if (-not (Confirm-Step "Save anyway?" -DefaultYes:$false)) {
-                        continue
+            if ($key -eq 'Enter') {
+                if ($sel -eq $lines.Count) {
+                    # Save and exit
+                    $missing = Test-EnvFileValid -Path $envFilePath
+                    if ($missing.Count -gt 0) {
+                        Write-Warn "Missing required fields: $($missing -join ', ')"
+                        if (-not (Confirm-Step "Save anyway?" -DefaultYes:$false)) {
+                            continue
+                        }
                     }
+                    $saveConfirmed = $true
+                    break
+                } elseif ($sel -eq $lines.Count + 1) {
+                    # Cancel — revert to defaults
+                    Write-Warn "Using default .env values."
+                    Set-Content -Path $envFilePath -Value $envContent -Force
+                    $lines = Get-Content -Path $envFilePath
+                    $saveConfirmed = $true
+                    break
                 }
-                $saveConfirmed = $true
-                break
-            } elseif ($char -eq 'C' -or $char -eq 'c') {
+            } elseif ($key -eq 'Escape') {
+                # Quick cancel from anywhere
                 Write-Warn "Using default .env values."
                 Set-Content -Path $envFilePath -Value $envContent -Force
                 $lines = Get-Content -Path $envFilePath
-                $sel = 0
                 $saveConfirmed = $true
                 break
-            } elseif ($char -eq 'X' -or $char -eq 'x') {
-                throw "User aborted .env editing — backend install cancelled"
+            } elseif ($key -eq 'UpArrow') {
+                if ($sel -gt 0) {
+                    $sel--
+                    if ($sel -lt $lines.Count) { $col = [Math]::Min($col, $lines[$sel].Length) }
+                }
+            } elseif ($key -eq 'DownArrow') {
+                if ($sel -lt $totalItems - 1) {
+                    $sel++
+                    if ($sel -lt $lines.Count) { $col = [Math]::Min($col, $lines[$sel].Length) }
+                }
+            } elseif ($key -eq 'LeftArrow' -and $sel -lt $lines.Count) {
+                if ($col -gt 0) { $col-- }
+            } elseif ($key -eq 'RightArrow' -and $sel -lt $lines.Count) {
+                if ($col -lt $lines[$sel].Length) { $col++ }
+            } elseif ($key -eq 'Home' -and $sel -lt $lines.Count) {
+                $col = 0
+            } elseif ($key -eq 'End' -and $sel -lt $lines.Count) {
+                $col = $lines[$sel].Length
+            } elseif ($key -eq 'Backspace' -and $sel -lt $lines.Count) {
+                if ($col -gt 0) {
+                    $lines[$sel] = $lines[$sel].Remove($col - 1, 1)
+                    $col--
+                }
+            } elseif ($key -eq 'Delete' -and $sel -lt $lines.Count) {
+                if ($col -lt $lines[$sel].Length) {
+                    $lines[$sel] = $lines[$sel].Remove($col, 1)
+                }
+            } elseif ($key -eq 'Tab' -and $sel -lt $lines.Count) {
+                $lines[$sel] = $lines[$sel].Insert($col, "    ")
+                $col += 4
+            } elseif ($char -ge ' ' -and $char -ne [char]127 -and $sel -lt $lines.Count) {
+                # Printable character - insert at cursor
+                $lines[$sel] = $lines[$sel].Insert($col, $char)
+                $col++
             }
         } while (-not $saveConfirmed)
 
+        # Write final content to file
+        Set-Content -Path $envFilePath -Value ($lines -join "`r`n") -Force
         Write-Success ".env file ready at $envFilePath"
-        # ---- End .env visual editor ----
+        # ---- End .env cursor editor ----
 
         $pythonExe = Join-Path $destDir "venv\Scripts\python.exe"
 
@@ -908,16 +875,20 @@ function Install-Caddy {
         $editCaddyLines = @() + $originalCaddyLines
         $caddySaved = $false
 
-        # ---- Caddyfile visual editor (arrow-key driven) ----
+        # ---- Caddyfile cursor editor (footer navigation) ----
         $sel = 0
+        $col = 0
 
-        # Save terminal state
-        $caddyStartTop = [Console]::CursorTop
+        # Footer items — navigable like content lines
+        $caddyFooterItems = @("  Save and exit", "  Cancel (revert to defaults)")
+        $caddyTotalItems = $editCaddyLines.Count + $caddyFooterItems.Count
 
         do {
-            # Redraw from saved position
-            [Console]::SetCursorPosition(0, $caddyStartTop)
-            $rowsToClear = $editCaddyLines.Count + 6
+            # Capture anchor at each iteration so terminal scrolling doesn't drift
+            $caddyStartTop = [Console]::CursorTop
+
+            # Clear area
+            $rowsToClear = $caddyTotalItems + 6
             for ($r = 0; $r -lt $rowsToClear; $r++) {
                 [Console]::SetCursorPosition(0, $caddyStartTop + $r)
                 Write-Host (" " * [Console]::WindowWidth) -NoNewline
@@ -929,50 +900,98 @@ function Install-Caddy {
             for ($i = 0; $i -lt $editCaddyLines.Count; $i++) {
                 $num = ($i + 1).ToString().PadLeft(2)
                 $isDiff = $i -lt $originalCaddyLines.Count -and $editCaddyLines[$i] -ne $originalCaddyLines[$i]
-                $cursor = if ($i -eq $sel) { ">" } else { " " }
+                $cur = if ($i -eq $sel) { ">" } else { " " }
                 if ($i -eq $sel) {
-                    Write-Host " $cursor$num  $($editCaddyLines[$i])" -ForegroundColor Black -BackgroundColor Cyan
+                    Write-Host " $cur$num  $($editCaddyLines[$i])" -ForegroundColor Black -BackgroundColor Cyan
                 } elseif ($isDiff) {
-                    Write-Host " $cursor$num  $($editCaddyLines[$i])" -ForegroundColor Yellow
+                    Write-Host " $cur$num  $($editCaddyLines[$i])" -ForegroundColor Yellow
                 } else {
-                    Write-Host " $cursor$num  $($editCaddyLines[$i])" -ForegroundColor Gray
+                    Write-Host " $cur$num  $($editCaddyLines[$i])" -ForegroundColor Gray
                 }
             }
             Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
-            Write-Host "  ", ([char]0x2191), "/", ([char]0x2193), " navigate  Enter edit  S save  C defaults  X abort" -ForegroundColor Gray
+
+            # Footer items (navigable)
+            for ($i = 0; $i -lt $caddyFooterItems.Count; $i++) {
+                $idx = $editCaddyLines.Count + $i
+                $cur = if ($idx -eq $sel) { ">" } else { " " }
+                if ($idx -eq $sel) {
+                    Write-Host "  $cur$($caddyFooterItems[$i])" -ForegroundColor Black -BackgroundColor Cyan
+                } else {
+                    Write-Host "  $cur$($caddyFooterItems[$i])" -ForegroundColor Gray
+                }
+            }
+            Write-Host "  " + "─" * 55 -ForegroundColor DarkGray
+            Write-Host "  " + ([char]0x2191) + ([char]0x2193) + " navigate  " + ([char]0x2190) + ([char]0x2192) + " within line  Type to edit  Enter=select" -ForegroundColor Gray
+
+            # Position cursor
+            if ($sel -lt $editCaddyLines.Count) {
+                $cursorRow = $caddyStartTop + 2 + $sel
+                $cursorCol = 6 + [Math]::Min($col, $editCaddyLines[$sel].Length)
+            } else {
+                $footerIdx = $sel - $editCaddyLines.Count
+                $cursorRow = $caddyStartTop + 2 + $editCaddyLines.Count + 1 + $footerIdx
+                $cursorCol = 4
+            }
+            [Console]::SetCursorPosition($cursorCol, $cursorRow)
 
             $keyInfo = [Console]::ReadKey($true)
             $key = $keyInfo.Key
             $char = $keyInfo.KeyChar
 
-            if ($key -eq 'UpArrow' -and $sel -gt 0) {
-                $sel--
-            } elseif ($key -eq 'DownArrow' -and $sel -lt $editCaddyLines.Count - 1) {
-                $sel++
-            } elseif ($key -eq 'Enter') {
-                $currentLine = $editCaddyLines[$sel]
-                try {
-                    [Microsoft.PowerShell.PSConsoleReadLine]::SetBufferAndFocus($currentLine)
-                } catch {}
-                Write-Host "  " -NoNewline
-                $newLine = Read-Host ""
-                if (-not [string]::IsNullOrWhiteSpace($newLine)) {
-                    $editCaddyLines[$sel] = $newLine
+            if ($key -eq 'Enter') {
+                if ($sel -eq $editCaddyLines.Count) {
+                    # Save and exit
+                    $caddySaved = $true
+                    break
+                } elseif ($sel -eq $editCaddyLines.Count + 1) {
+                    # Cancel — revert to defaults
+                    Write-Warn "Using default Caddyfile."
+                    $caddySaved = $false
+                    break
                 }
-                # Recalc position in case Read-Host scrolled the terminal
-                $caddyStartTop = [Math]::Max(0, [Console]::CursorTop - $editCaddyLines.Count - 6)
-            } elseif ($char -eq 'S' -or $char -eq 's') {
-                $caddySaved = $true
-                break
-            } elseif ($char -eq 'C' -or $char -eq 'c') {
+            } elseif ($key -eq 'Escape') {
+                # Quick cancel from anywhere
                 Write-Warn "Using default Caddyfile."
                 $caddySaved = $false
                 break
-            } elseif ($char -eq 'X' -or $char -eq 'x') {
-                throw "User exited Caddyfile editor — Caddy install aborted"
+            } elseif ($key -eq 'UpArrow') {
+                if ($sel -gt 0) {
+                    $sel--
+                    if ($sel -lt $editCaddyLines.Count) { $col = [Math]::Min($col, $editCaddyLines[$sel].Length) }
+                }
+            } elseif ($key -eq 'DownArrow') {
+                if ($sel -lt $caddyTotalItems - 1) {
+                    $sel++
+                    if ($sel -lt $editCaddyLines.Count) { $col = [Math]::Min($col, $editCaddyLines[$sel].Length) }
+                }
+            } elseif ($key -eq 'LeftArrow' -and $sel -lt $editCaddyLines.Count) {
+                if ($col -gt 0) { $col-- }
+            } elseif ($key -eq 'RightArrow' -and $sel -lt $editCaddyLines.Count) {
+                if ($col -lt $editCaddyLines[$sel].Length) { $col++ }
+            } elseif ($key -eq 'Home' -and $sel -lt $editCaddyLines.Count) {
+                $col = 0
+            } elseif ($key -eq 'End' -and $sel -lt $editCaddyLines.Count) {
+                $col = $editCaddyLines[$sel].Length
+            } elseif ($key -eq 'Backspace' -and $sel -lt $editCaddyLines.Count) {
+                if ($col -gt 0) {
+                    $editCaddyLines[$sel] = $editCaddyLines[$sel].Remove($col - 1, 1)
+                    $col--
+                }
+            } elseif ($key -eq 'Delete' -and $sel -lt $editCaddyLines.Count) {
+                if ($col -lt $editCaddyLines[$sel].Length) {
+                    $editCaddyLines[$sel] = $editCaddyLines[$sel].Remove($col, 1)
+                }
+            } elseif ($key -eq 'Tab' -and $sel -lt $editCaddyLines.Count) {
+                $editCaddyLines[$sel] = $editCaddyLines[$sel].Insert($col, "    ")
+                $col += 4
+            } elseif ($char -ge ' ' -and $char -ne [char]127 -and $sel -lt $editCaddyLines.Count) {
+                # Printable character - insert at cursor
+                $editCaddyLines[$sel] = $editCaddyLines[$sel].Insert($col, $char)
+                $col++
             }
         } while ($true)
-        # ---- End Caddyfile visual editor ----
+        # ---- End Caddyfile cursor editor ----
 
         $finalCaddyfile = $editCaddyLines -join "`n"
         if ($caddySaved) {
@@ -1219,9 +1238,7 @@ function Invoke-FullDeploy {
 
     if ($targetComponents -contains "backend") {
         if (Confirm-Step "Install Backend (port $($Config.BackendPort))?") {
-            Start-Spinner "Installing Backend ..."
             $backendOk = Install-Backend -Config $Config
-            Stop-Spinner
             if ($backendOk) {
                 Write-Success "Backend installed successfully on port $($Config.BackendPort)"
                 Write-Log "Backend installed successfully on port $($Config.BackendPort)"
