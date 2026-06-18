@@ -351,7 +351,7 @@ function Select-PublicUrl {
         $cfTunnelUrl = Get-Content $urlFile -ErrorAction SilentlyContinue | Select-Object -First 1
     }
     if (-not $cfTunnelUrl) {
-        $cfLog = Join-Path $Config.InstallRoot "cloudflare\cloudflare.log"
+        $cfLog = Join-Path $Config.InstallRoot "logs\cloudflare_service.log"
         if (Test-Path $cfLog) {
             $cfTunnelUrl = Get-Content $cfLog -ErrorAction SilentlyContinue |
                 Select-String -Pattern "https://[a-zA-Z0-9-]+\.trycloudflare\.com" |
@@ -772,17 +772,17 @@ function Install-Frontend {
         if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
 
         git clone $Config.FrontendRepo $tempDir 2>&1 |
-            Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\frontend_clone.log")
+            Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\frontend_install_clone.log")
 
         $destDir = Join-Path $Config.InstallRoot "frontend"
         New-Item -Path $destDir -ItemType Directory -Force | Out-Null
         Copy-Item -Path "$tempDir\*" -Destination $destDir -Recurse -Force
 
         Push-Location $destDir
-        npm install 2>&1 | Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\frontend_install.log")
-        npm install serve 2>&1 | Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\frontend_serve.log")
+        npm install 2>&1 | Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\frontend_install_npm.log")
+        npm install serve 2>&1 | Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\frontend_install_serve.log")
         $env:VITE_API_URL = $Config.ApiPrefix
-        npm run build 2>&1 | Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\frontend_build.log")
+        npm run build 2>&1 | Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\frontend_install_build.log")
         Pop-Location
 
         if (-not (Test-Path (Join-Path $destDir "dist"))) {
@@ -790,9 +790,15 @@ function Install-Frontend {
         }
         Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 
+        # Runtime log: capture all stdout/stderr from the running service
+        $logsDir = Join-Path $Config.InstallRoot "logs"
+        $svcTimestamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
+        $frontendLog = Join-Path $logsDir "frontend_service_${svcTimestamp}.log"
+        Write-Host "    Service log: $frontendLog" -ForegroundColor Gray
+
         # cmd.exe needs the inner command double-quoted, and Servy needs that
         # quoting preserved literally -> hence the doubled quotes here.
-        $paramStr = "/c `"`"cd /d $destDir && npx serve -s dist -l $($Config.FrontendPort)`"`""
+        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$frontendLog`" & cd /d $destDir && npx serve -s dist -l $($Config.FrontendPort) >> `"$frontendLog`" 2>&1`"`""
 
         servy-cli uninstall --name="ess-mo-frontend" --silent 2>&1 | Out-Null
         servy-cli install --name="ess-mo-frontend" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
@@ -826,30 +832,34 @@ function Install-Backend {
         if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
 
         git clone $Config.BackendRepo $tempDir 2>&1 |
-            Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\backend_clone.log")
+            Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\backend_install_clone.log")
 
         $destDir = Join-Path $Config.InstallRoot "backend"
         New-Item -Path $destDir -ItemType Directory -Force | Out-Null
         Copy-Item -Path "$tempDir\*" -Destination $destDir -Recurse -Force
 
+        $logsDir = Join-Path $Config.InstallRoot "logs"
+
         Push-Location $destDir
-        python -m venv venv
+        python -m venv venv 2>&1 |
+            Tee-Object -FilePath (Join-Path $logsDir "backend_install_venv.log")
         if (-not (Test-Path (Join-Path $destDir "venv\Scripts\python.exe"))) {
             throw "Virtual environment was not created"
         }
         & (Join-Path $destDir "venv\Scripts\pip") install -r requirements.txt 2>&1 |
-            Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\backend_pip.log")
+            Tee-Object -FilePath (Join-Path $logsDir "backend_install_pip.log")
         Pop-Location
         Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 
         Write-Host "    Generating .env file..." -ForegroundColor Gray
-        $generatedKey = & (Join-Path $destDir "venv\Scripts\python") -c "import secrets; print(secrets.token_hex(32))"
+        $generatedKey = & (Join-Path $destDir "venv\Scripts\python") -c "import secrets; print(secrets.token_hex(32))" 2>&1 |
+            Tee-Object -FilePath (Join-Path $logsDir "backend_install_env.log")
         $envContent = @"
 DB_ENGINE=mysql
 DB_HOST=$($Secrets.db.host)
 DB_PORT=$($Secrets.db.port)
-DB_USER=$($Secrets.db.user)
-DB_PASSWORD=$($Secrets.db.password)
+DB_USER="$($Secrets.db.user)"
+DB_PASSWORD="$($Secrets.db.password)"
 DB_NAME=$($Secrets.db.name)
 
 SECRET_KEY=$generatedKey
@@ -858,15 +868,22 @@ ACCESS_TOKEN_EXPIRE_MINUTES=30
 
 SMTP_HOST=$($Secrets.smtp.host)
 SMTP_PORT=$($Secrets.smtp.port)
-SMTP_USER=$($Secrets.smtp.user)
-SMTP_PASS=$($Secrets.smtp.pass)
-EMAIL_FROM=$($Secrets.smtp.from)
+SMTP_USER="$($Secrets.smtp.user)"
+SMTP_PASS="$($Secrets.smtp.pass)"
+EMAIL_FROM="$($Secrets.smtp.from)"
 FRONTEND_URL=$($Config.PublicUrl)
 "@
         Set-Content -Path (Join-Path $destDir ".env") -Value $envContent -Force
 
         $pythonExe = Join-Path $destDir "venv\Scripts\python.exe"
-        $paramStr = "/c `"`"cd /d $destDir && $pythonExe -m uvicorn app.main:app --host 0.0.0.0 --port $($Config.BackendPort)`"`""
+
+        # Runtime log: capture all uvicorn request/error logs
+        $logsDir = Join-Path $Config.InstallRoot "logs"
+        $svcTimestamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
+        $backendLog = Join-Path $logsDir "backend_service_${svcTimestamp}.log"
+        Write-Host "    Service log: $backendLog" -ForegroundColor Gray
+
+        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$backendLog`" & cd /d $destDir && $pythonExe -m uvicorn app.main:app --host 0.0.0.0 --port $($Config.BackendPort) >> `"$backendLog`" 2>&1`"`""
 
         servy-cli uninstall --name="ess-mo-backend" --silent 2>&1 | Out-Null
         servy-cli install --name="ess-mo-backend" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
@@ -903,7 +920,8 @@ function Install-Caddy {
         if (-not (Test-Path $caddyExe)) {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             Write-Host "    Downloading Caddy..." -ForegroundColor Gray
-            Invoke-WebRequest -Uri "https://caddyserver.com/api/download?os=windows&arch=amd64" -OutFile $caddyExe -UseBasicParsing
+            Invoke-WebRequest -Uri "https://caddyserver.com/api/download?os=windows&arch=amd64" -OutFile $caddyExe -UseBasicParsing 2>&1 |
+                Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\caddy_install_download.log")
             if (-not (Test-Path $caddyExe)) { throw "Caddy download failed" }
             Write-Log "Caddy downloaded from caddyserver.com"
         } else {
@@ -937,9 +955,19 @@ function Install-Caddy {
         $caddyfileLines += "}"
         $caddyfileContent = $caddyfileLines -join "`n"
         Set-Content -Path $caddyfilePath -Value $caddyfileContent -Force
+        $caddyfileContent | Out-File -FilePath (Join-Path $Config.InstallRoot "logs\caddy_install_config.log") -Encoding utf8
+
+        # Runtime log: capture Caddy access/error logs
+        $logsDir = Join-Path $Config.InstallRoot "logs"
+        $svcTimestamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
+        $caddyLog = Join-Path $logsDir "caddy_service_${svcTimestamp}.log"
+        Write-Host "    Service log: $caddyLog" -ForegroundColor Gray
+
+        # Wrap in cmd.exe to capture stdout/stderr (consistent with frontend/backend)
+        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$caddyLog`" & cd /d $caddyDir && `"$caddyExe`" run --config `"$caddyfilePath`" >> `"$caddyLog`" 2>&1`"`""
 
         servy-cli uninstall --name="ess-mo-caddy" --silent 2>&1 | Out-Null
-        servy-cli install --name="ess-mo-caddy" --path="$caddyExe" --params="run --config $caddyfilePath"
+        servy-cli install --name="ess-mo-caddy" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
 
         if (-not (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue)) {
             throw "Service 'ess-mo-caddy' was not created by servy-cli"
@@ -970,7 +998,7 @@ function Install-Cloudflare {
             if (Get-Command winget -ErrorAction SilentlyContinue) {
                 Write-Host "    cloudflared not found, installing via winget..." -ForegroundColor Gray
                 winget install Cloudflare.cloudflared --accept-package-agreements --silent 2>&1 |
-                    Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\cloudflare_install.log")
+                    Tee-Object -FilePath (Join-Path $Config.InstallRoot "logs\cloudflare_install_setup.log")
                 $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
             }
         }
@@ -982,15 +1010,21 @@ function Install-Cloudflare {
         $cfDir = Join-Path $Config.InstallRoot "cloudflare"
         New-Item -Path $cfDir -ItemType Directory -Force | Out-Null
         $cfPath  = (Get-Command cloudflared).Source
-        $logPath = Join-Path $cfDir "cloudflare.log"
+
+        # Runtime log: in logs\ dir, consistent with other services
+        $cfRuntimeLog = Join-Path $Config.InstallRoot "logs\cloudflare_service.log"
+        Write-Host "    Service log: $cfRuntimeLog" -ForegroundColor Gray
 
         # Resolve tunnel URL (fallback if config is from old version)
         if ([string]::IsNullOrWhiteSpace($Config.TunnelUrl)) {
             $Config.TunnelUrl = Resolve-TunnelUrl -Config $Config
         }
 
+        # Wrap in cmd.exe to add start marker (consistent with other services)
+        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$cfRuntimeLog`" & `"$cfPath`" tunnel --url $($Config.TunnelUrl) --logfile `"$cfRuntimeLog`"`"`""
+
         servy-cli uninstall --name="ess-mo-cloudflare" --silent 2>&1 | Out-Null
-        servy-cli install --name="ess-mo-cloudflare" --path="$cfPath" --params="tunnel --url $($Config.TunnelUrl) --logfile $logPath"
+        servy-cli install --name="ess-mo-cloudflare" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
 
         if (-not (Get-Service -Name ess-mo-cloudflare -ErrorAction SilentlyContinue)) {
             throw "Service 'ess-mo-cloudflare' was not created by servy-cli"
@@ -1114,7 +1148,7 @@ function Start-AllServices {
     if ($hasCloudflare) {
         Write-Host "    Waiting for Cloudflare tunnel URL..." -ForegroundColor Gray
         Start-Sleep -Seconds 4
-        $cfLog = Join-Path $Config.InstallRoot "cloudflare\cloudflare.log"
+        $cfLog = Join-Path $Config.InstallRoot "logs\cloudflare_service.log"
         if (Test-Path $cfLog) {
             $tunnelUrl = Get-Content $cfLog -ErrorAction SilentlyContinue |
                 Select-String -Pattern "https://[a-zA-Z0-9-]+\.trycloudflare\.com" |
@@ -1124,6 +1158,9 @@ function Start-AllServices {
                 # Save to a dedicated file (source of truth for other functions)
                 $urlFile = Join-Path $Config.InstallRoot "cloudflare\current_tunnel_url.txt"
                 Set-Content -Path $urlFile -Value $tunnelUrl -Force
+                # Also log to logs\ dir for discoverability
+                $tunnelLog = Join-Path $Config.InstallRoot "logs\cloudflare_tunnel_url.txt"
+                Set-Content -Path $tunnelLog -Value $tunnelUrl -Force
                 # Refresh backend .env if it currently has a tunnel URL (not a custom domain)
                 $envPath = Join-Path $Config.InstallRoot "backend\.env"
                 if (Test-Path $envPath) {
@@ -1173,7 +1210,7 @@ function Show-Status {
     Verify-Health -Config $Config
 
     # Show Cloudflare tunnel URL if available
-    $cfLog = Join-Path $Config.InstallRoot "cloudflare\cloudflare.log"
+    $cfLog = Join-Path $Config.InstallRoot "logs\cloudflare_service.log"
     if (Test-Path $cfLog) {
         $tunnelUrl = Get-Content $cfLog -ErrorAction SilentlyContinue |
             Select-String -Pattern "https://[a-zA-Z0-9-]+\.trycloudflare\.com" |
@@ -1605,9 +1642,9 @@ function Show-NetworkConfig {
         if (Test-Path $urlFile) {
             $cfTunnelUrl = Get-Content $urlFile -ErrorAction SilentlyContinue | Select-Object -First 1
         }
-        # Static Cloudflare tunnel URL from cloudflare.log if not found in the dedicated file
+        # Read from logs\ dir if not found in dedicated file
         if (-not $cfTunnelUrl) {
-            $cfLog = Join-Path $Config.InstallRoot "cloudflare\cloudflare.log"
+            $cfLog = Join-Path $Config.InstallRoot "logs\cloudflare_service.log"
             if (Test-Path $cfLog) {
                 $cfTunnelUrl = Get-Content $cfLog -ErrorAction SilentlyContinue |
                     Select-String -Pattern "https://[a-zA-Z0-9-]+\.trycloudflare\.com" |
