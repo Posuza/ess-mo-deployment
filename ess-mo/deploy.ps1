@@ -583,16 +583,28 @@ function Get-SecretsOrInitialize {
             }
             Write-Host ""
 
+            Write-Host ""
+            Write-Host " Edit this file with your real credentials before continuing:" -ForegroundColor Cyan
+            Write-Host "     $SecretsPath" -ForegroundColor White
+            Write-Host ""
+            Write-Host " Required fields:" -ForegroundColor Gray
+            foreach ($p in $placeholders) {
+                Write-Host "    $p" -ForegroundColor Gray
+            }
+            Write-Host ""
+
             if (-not $script:headless) {
-                if (Confirm-Step "Enter your credentials now?" -DefaultYes:$true) {
+                if (Confirm-Step "Have you updated deploy.secrets.json?" -DefaultYes:$false) {
+                    # Reload the file after user edit
                     try {
-                        $s = Invoke-SecretsPrompt -Secrets $s -SecretsPath $SecretsPath
-                        Write-Log "Secrets updated interactively by user"
+                        Write-Host "    Reloading $SecretsPath ..." -ForegroundColor Gray
+                        $s = Get-Content $SecretsPath -Raw -ErrorAction Stop | ConvertFrom-Json
+                        Write-Log "Secrets reloaded from $SecretsPath"
                         Write-Host ""
                         return $s
                     } catch {
-                        Write-Warn "Interactive prompt failed: $_"
-                        Write-Log "Interactive secrets prompt failed: $_" -Level "WARN"
+                        Write-Warn "Could not read $SecretsPath after edit: $_"
+                        Write-Log "Failed to reload $SecretsPath: $_" -Level "WARN"
                     }
                 }
             }
@@ -600,7 +612,7 @@ function Get-SecretsOrInitialize {
             # Fall back to defaults
             Write-Warn "Using default credentials — the backend may not connect until you update:"
             Write-Host "     $SecretsPath" -ForegroundColor Cyan
-            Write-Host "     (or edit the .env file in the install folder after deployment)" -ForegroundColor Gray
+            Write-Host "     (or edit .env after deployment)" -ForegroundColor Gray
             Write-Host ""
             $s = Get-SecretsDefaults
             $json = $s | ConvertTo-Json -Depth 4
@@ -616,23 +628,47 @@ function Get-SecretsOrInitialize {
     }
 
     # --- File missing entirely ---
-    if (-not $script:headless) {
-        Write-Host ""
-        Write-Host " [!] deploy.secrets.json not found." -ForegroundColor Yellow
-        if (Confirm-Step "Create it with default values now?" -DefaultYes:$true) {
-            $s = Invoke-SecretsPrompt -Secrets (Get-SecretsDefaults) -SecretsPath $SecretsPath
-            Write-Log "Secrets created interactively by user"
-            Write-Host ""
-            return $s
-        }
-    } else {
-        Write-Warn "deploy.secrets.json not found — creating with defaults."
-    }
+    Write-Host ""
+    Write-Host " [!] deploy.secrets.json not found." -ForegroundColor Yellow
+    Write-Host " Creating a template file for you to edit..." -ForegroundColor Gray
 
     $s = Get-SecretsDefaults
     $json = $s | ConvertTo-Json -Depth 4
     Set-Content -Path $SecretsPath -Value $json -Force
     Protect-SecretsFile
+
+    Write-Host ""
+    Write-Host " Edit this file with your real credentials:" -ForegroundColor Cyan
+    Write-Host "     $SecretsPath" -ForegroundColor White
+    Write-Host ""
+    Write-Host " Required fields:" -ForegroundColor Gray
+    Write-Host "  db.host     (your MySQL server address)" -ForegroundColor Gray
+    Write-Host "  db.user     (your MySQL user)" -ForegroundColor Gray
+    Write-Host "  db.name     (your MySQL database name)" -ForegroundColor Gray
+    Write-Host "  db.password (your MySQL password)" -ForegroundColor Gray
+    Write-Host "  smtp.user   (your email)" -ForegroundColor Gray
+    Write-Host "  smtp.pass   (your SMTP app password)" -ForegroundColor Gray
+    Write-Host "  smtp.from   (from address)" -ForegroundColor Gray
+    Write-Host ""
+
+    if (-not $script:headless) {
+        if (Confirm-Step "Have you updated deploy.secrets.json?" -DefaultYes:$false) {
+            try {
+                Write-Host "    Reloading $SecretsPath ..." -ForegroundColor Gray
+                $s = Get-Content $SecretsPath -Raw -ErrorAction Stop | ConvertFrom-Json
+                Write-Log "Secrets reloaded from $SecretsPath"
+                Write-Host ""
+                return $s
+            } catch {
+                Write-Warn "Could not read $SecretsPath after edit: $_"
+                Write-Log "Failed to reload $SecretsPath: $_" -Level "WARN"
+            }
+        }
+    }
+
+    Write-Warn "Using default credentials — the backend may not connect until you update:"
+    Write-Host "     $SecretsPath" -ForegroundColor Cyan
+    Write-Host ""
     Write-Log "Secrets created with defaults" -Level "WARN"
     return $s
 }
@@ -827,16 +863,29 @@ function Test-PortInUse {
 # HEALTH VERIFICATION
 # ===========================================================
 function Test-Endpoint {
-    param([string]$Url, [string]$Name, [int]$TimeoutSec = 5)
-    try {
-        Invoke-RestMethod -Uri $Url -TimeoutSec $TimeoutSec -ErrorAction Stop | Out-Null
-        Write-Success "$Name ($Url): responding"
-        Write-Log "Health check passed: $Name ($Url)"
-        return $true
-    } catch {
-        Write-Err "$Name ($Url): not responding"
-        Write-Log "Health check failed: $Name ($Url) - $_" -Level "ERROR"
-        return $false
+    param([string]$Url, [string]$Name, [int]$TimeoutSec = 5, [int]$Retries = 7, [int]$RetryDelaySec = 3)
+    $attempts = $Retries + 1
+    for ($i = 1; $i -le $attempts; $i++) {
+        try {
+            Invoke-RestMethod -Uri $Url -TimeoutSec $TimeoutSec -ErrorAction Stop | Out-Null
+            if ($i -gt 1) {
+                Write-Success "$Name ($Url): responding"
+                Write-Log "Health check passed: $Name ($Url) (after $($i-1) retries)"
+            } else {
+                Write-Success "$Name ($Url): responding"
+                Write-Log "Health check passed: $Name ($Url)"
+            }
+            return $true
+        } catch {
+            if ($i -lt $attempts) {
+                Write-Warn "$Name ($Url): waiting ($i/$Retries)..."
+                Start-Sleep -Seconds $RetryDelaySec
+            } else {
+                Write-Err "$Name ($Url): not responding"
+                Write-Log "Health check failed: $Name ($Url) - $_" -Level "ERROR"
+                return $false
+            }
+        }
     }
 }
 
