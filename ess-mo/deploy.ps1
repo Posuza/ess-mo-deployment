@@ -953,7 +953,7 @@ function Install-Frontend {
         Write-Host "    Service log: $serviceLog" -ForegroundColor Gray
         Write-FileLog -Path $installLog -Text "Service log: $serviceLog"
 
-        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$serviceLog`" & cd /d $appDir && npx serve -s `"$curLink`" -l $appPort >> `"$serviceLog`" 2>&1`"`""
+        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$serviceLog`" & cd /d $appDir && npx --yes serve -s `"$curLink`" -l $appPort >> `"$serviceLog`" 2>&1`"`""
 
         servy-cli uninstall --name="$svcName" --quiet 2>&1 | Out-Null
         servy-cli install --name="$svcName" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
@@ -1181,14 +1181,20 @@ function Install-Caddy {
         Set-Content -Path $caddyfilePath -Value $caddyfileContent -Force
         Write-FileLog -Path $caddyInstallLog -Text "Caddyfile config written to $caddyfilePath"
 
+        # Stop only OUR Caddy service to release its ports (admin:2019, proxy:$($Config.CaddyPort))
+        # This does NOT affect other Caddy instances from other deployments/apps
+        Stop-Service -Name "ess-mo-caddy" -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+
         # Runtime log: capture Caddy access/error logs
         $svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
         $caddyLog = Join-Path $logsDir "caddy_service_${svcTs}.log"
         Write-Host "    Service log: $caddyLog" -ForegroundColor Gray
 
         # Wrap in cmd.exe to capture stdout/stderr (consistent with frontend/backend)
-        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$caddyLog`" & cd /d $caddyDir && `"$caddyExe`" run --config `"$caddyfilePath`" >> `"$caddyLog`" 2>&1`"`""
+        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$caddyLog`" & cd /d $caddyDir && `"$caddyExe`" run --config `"$caddyfilePath`" --admin off >> `"$caddyLog`" 2>&1`"`""
 
+        # Unregister old service (process already stopped above)
         servy-cli uninstall --name="ess-mo-caddy" --quiet 2>&1 | Out-Null
         servy-cli install --name="ess-mo-caddy" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
 
