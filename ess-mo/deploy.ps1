@@ -586,6 +586,14 @@ function Get-SecretsOrInitialize {
             Write-Host " Edit this file with your real credentials before continuing:" -ForegroundColor Cyan
             Write-Host "     $SecretsPath" -ForegroundColor White
             Write-Host ""
+            Write-Host " Required fields:" -ForegroundColor Gray
+            Write-Host "  db.host     (your MySQL server address)" -ForegroundColor Gray
+            Write-Host "  db.user     (your MySQL user)" -ForegroundColor Gray
+            Write-Host "  db.name     (your MySQL database name)" -ForegroundColor Gray
+            Write-Host "  db.password (your MySQL password)" -ForegroundColor Gray
+            Write-Host "  smtp.user   (your email)" -ForegroundColor Gray
+            Write-Host "  smtp.pass   (your SMTP app password)" -ForegroundColor Gray
+            Write-Host ""
 
             if (-not $script:headless) {
                 if (Confirm-Step "Have you updated deploy.secrets.json?" -DefaultYes:$false) {
@@ -831,15 +839,21 @@ function Test-Prerequisites {
 # ===========================================================
 function Test-PortInUse {
     param([int]$Port)
-    # Returns $true if the port is already bound (TCP) on any interface
+    # Returns $true if the port is already in use (TCP) on localhost
+    # Uses TcpClient instead of netstat for reliability across locales/Windows versions
+    $tcp = $null
     try {
-        $connections = netstat -an | Select-String "TCP.*:$Port\s"
-        if ($connections) {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $iar = $tcp.BeginConnect('127.0.0.1', $Port, $null, $null)
+        $connected = $iar.AsyncWaitHandle.WaitOne(500)
+        if ($connected -and $tcp.Connected) {
+            $tcp.EndConnect($iar)
             return $true
         }
     } catch {
-        # netstat might not be available, skip check
         Write-Log "Could not check port $Port availability: $_" -Level "WARN"
+    } finally {
+        if ($tcp) { $tcp.Close() }
     }
     return $false
 }
@@ -1329,12 +1343,20 @@ if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Fo
 $svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $caddyLog = Join-Path $logsDir "caddy_service_${svcTs}.log"
 
+# Use TcpClient instead of netstat for port checking (reliable across locales/Windows versions)
 function Test-PortInUse {
     param([int]$Port)
+    $tcp = $null
     try {
-        $connections = netstat -an | Select-String "TCP.*:$Port\s"
-        if ($connections) { return $true }
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $iar = $tcp.BeginConnect("127.0.0.1", $Port, $null, $null)
+        $connected = $iar.AsyncWaitHandle.WaitOne(500)
+        if ($connected -and $tcp.Connected) {
+            $tcp.EndConnect($iar)
+            return $true
+        }
     } catch { }
+    finally { if ($tcp) { $tcp.Close() } }
     return $false
 }
 
@@ -1344,7 +1366,7 @@ function Test-PortInUse {
 $adminPort = 2019
 while ($adminPort -le 2118) {
     if (-not (Test-PortInUse -Port $adminPort)) { break }
-    "    Admin port $adminPort -> IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
+    "    Admin port ${adminPort}: IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
     $adminPort++
 }
 if ($adminPort -gt 2118) {
@@ -1359,7 +1381,7 @@ $proxyPort = __DEFAULT_PROXY_PORT__
 $proxyMax = $proxyPort + 99
 while ($proxyPort -le $proxyMax) {
     if (-not (Test-PortInUse -Port $proxyPort)) { break }
-    "    Proxy port $proxyPort -> IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
+    "    Proxy port ${proxyPort}: IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
     $proxyPort++
 }
 if ($proxyPort -gt $proxyMax) {
@@ -1630,8 +1652,8 @@ $statusFile = Join-Path $caddyDir "caddy-ports.json"
 
 function Show-ReleaseHistory {
     param($Config, [string]$AppName = "frontend")
-    $relDir = Join-Path $Config.InstallRoot $AppName "webroot" "releases"
-    $curLink = Join-Path $Config.InstallRoot $AppName "webroot" "current"
+    $relDir = Join-Path (Join-Path (Join-Path $Config.InstallRoot $AppName) "webroot") "releases"
+    $curLink = Join-Path (Join-Path (Join-Path $Config.InstallRoot $AppName) "webroot") "current"
 
     if (-not (Test-Path $relDir)) {
         Write-Warn "No releases found for '$AppName'."
@@ -1664,8 +1686,8 @@ function Show-ReleaseHistory {
 function Invoke-RollbackApp {
     param($Config, [string]$AppName = "frontend")
 
-    $relDir  = Join-Path $Config.InstallRoot $AppName "webroot" "releases"
-    $curLink = Join-Path $Config.InstallRoot $AppName "webroot" "current"
+    $relDir  = Join-Path (Join-Path (Join-Path $Config.InstallRoot $AppName) "webroot") "releases"
+    $curLink = Join-Path (Join-Path (Join-Path $Config.InstallRoot $AppName) "webroot") "current"
     $svcName = "ess-mo-$AppName"
 
     if (-not (Test-Path $relDir)) {
@@ -1744,7 +1766,8 @@ function Invoke-ComponentInstall {
             Write-Step "Checking deployment credentials"
             $secrets = Get-SecretsOrInitialize
             if (-not $secrets) {
-                Write-Warn "Returning to main menu."
+                Write-Warn "Backend installation cancelled - no valid credentials."
+                Write-Log "Backend install cancelled: no secrets" -Level "WARN"
                 return $false
             }
             $result = Install-Backend -Config $Config -Secrets $secrets
@@ -1822,6 +1845,11 @@ function Start-AllServices {
         try {
             Start-Service -Name $c.Service -ErrorAction Stop
             Write-Success "Started $($c.Display)"
+            # Show address for each service
+            switch ($c.Key) {
+                "frontend" { Write-Host "    Address: http://localhost:$($Config.FrontendPort)" -ForegroundColor Gray }
+                "backend"  { Write-Host "    Address: http://localhost:$($Config.BackendPort)$($Config.ApiPrefix)" -ForegroundColor Gray }
+            }
             Write-Log "Service started: $($c.Service)"
         } catch {
             Write-Err "Failed to start $($c.Display): $_"
@@ -1870,6 +1898,21 @@ function Show-Status {
         }
     }
     $rows | Format-Table -AutoSize | Out-Host
+
+    # Show port summary alongside health
+    Write-Host " ── Addresses ──" -ForegroundColor Cyan
+    Write-Host "  Frontend : http://localhost:$($Config.FrontendPort)" -ForegroundColor Green
+    Write-Host "  Backend  : http://localhost:$($Config.BackendPort)$($Config.ApiPrefix)" -ForegroundColor Green
+    if (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue) {
+        $caddyPorts = Get-CaddyActualPorts -Config $Config
+        Write-Host "  Caddy proxy : http://localhost:$($caddyPorts.proxy)" -ForegroundColor Green
+        if ($caddyPorts.admin) {
+            Write-Host "  Caddy admin : http://localhost:$($caddyPorts.admin)" -ForegroundColor Gray
+        } else {
+            Write-Host "  Caddy admin : (not yet available)" -ForegroundColor DarkYellow
+        }
+    }
+    Write-Host ""
 
     # Health checks
     Verify-Health -Config $Config
@@ -2012,7 +2055,7 @@ function Invoke-FullDeploy {
 
         # Read actual Caddy port from status file (if available)
         $displayCaddyPort = $Config.CaddyPort
-        $caddyPortsFile = Join-Path $Config.InstallRoot "caddy" "caddy-ports.json"
+        $caddyPortsFile = Join-Path (Join-Path $Config.InstallRoot "caddy") "caddy-ports.json"
         if (Test-Path $caddyPortsFile) {
             try {
                 $portsData = Get-Content $caddyPortsFile -Raw -ErrorAction Stop | ConvertFrom-Json
@@ -2280,12 +2323,20 @@ if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Fo
 $svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $caddyLog = Join-Path $logsDir "caddy_service_${svcTs}.log"
 
+# Use TcpClient instead of netstat for port checking (reliable across locales/Windows versions)
 function Test-PortInUse {
     param([int]$Port)
+    $tcp = $null
     try {
-        $connections = netstat -an | Select-String "TCP.*:$Port\s"
-        if ($connections) { return $true }
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $iar = $tcp.BeginConnect("127.0.0.1", $Port, $null, $null)
+        $connected = $iar.AsyncWaitHandle.WaitOne(500)
+        if ($connected -and $tcp.Connected) {
+            $tcp.EndConnect($iar)
+            return $true
+        }
     } catch { }
+    finally { if ($tcp) { $tcp.Close() } }
     return $false
 }
 
@@ -2295,7 +2346,7 @@ function Test-PortInUse {
 $adminPort = 2019
 while ($adminPort -le 2118) {
     if (-not (Test-PortInUse -Port $adminPort)) { break }
-    "    Admin port $adminPort -> IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
+    "    Admin port ${adminPort}: IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
     $adminPort++
 }
 if ($adminPort -gt 2118) {
@@ -2310,7 +2361,7 @@ $proxyPort = __DEFAULT_PROXY_PORT__
 $proxyMax = $proxyPort + 99
 while ($proxyPort -le $proxyMax) {
     if (-not (Test-PortInUse -Port $proxyPort)) { break }
-    "    Proxy port $proxyPort -> IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
+    "    Proxy port ${proxyPort}: IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
     $proxyPort++
 }
 if ($proxyPort -gt $proxyMax) {
@@ -2419,7 +2470,11 @@ do {
                 $c = $compList | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
                 if ($c -and (Confirm-Step "Install $($c.Display)?")) {
                     Initialize-Logger -Config $Config
-                    Invoke-ComponentInstall -Key $c.Key -Config $Config | Out-Null
+                    $installOk = Invoke-ComponentInstall -Key $c.Key -Config $Config
+                    if (-not $installOk) {
+                        Write-Host ""
+                        Write-Warn "$($c.Display) installation was cancelled or failed."
+                    }
                 }
             }
         }
@@ -2531,6 +2586,19 @@ do {
                     } else {
                         Start-Service -Name $c.Service -ErrorAction Stop
                         Write-Success "Started $($c.Display)"
+                        # Show address information for the started service
+                        switch ($c.Key) {
+                            "frontend" { Write-Host "    Address: http://localhost:$($Config.FrontendPort)" -ForegroundColor Gray }
+                            "backend"  { Write-Host "    Address: http://localhost:$($Config.BackendPort)$($Config.ApiPrefix)" -ForegroundColor Gray }
+                            "caddy"    {
+                                Start-Sleep -Seconds 2
+                                $caddyPorts = Get-CaddyActualPorts -Config $Config
+                                Write-Host "    Proxy: http://localhost:$($caddyPorts.proxy)" -ForegroundColor Gray
+                                if ($caddyPorts.admin) {
+                                    Write-Host "    Admin API: http://localhost:$($caddyPorts.admin)" -ForegroundColor Gray
+                                }
+                            }
+                        }
                         Write-Log "Started $($c.Display)"
                     }
                 }
