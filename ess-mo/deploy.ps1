@@ -847,6 +847,33 @@ function Test-PortInUse {
 # ===========================================================
 # HEALTH VERIFICATION
 # ===========================================================
+function Get-CaddyActualPorts {
+    param($Config)
+    <#
+    .SYNOPSIS
+      Reads caddy-ports.json (written by the runner script at each start)
+      and returns the actual proxy and admin ports Caddy is using.
+      Returns a hashtable with keys: proxy, admin
+    #>
+    $caddyDir = Join-Path $Config.InstallRoot "caddy"
+    $portsFile = Join-Path $caddyDir "caddy-ports.json"
+    $result = @{ proxy = $Config.CaddyPort; admin = $null }
+    if (Test-Path $portsFile) {
+        try {
+            $portsData = Get-Content $portsFile -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ($portsData.proxy -and $portsData.proxy -gt 0) {
+                $result.proxy = [int]$portsData.proxy
+            }
+            if ($portsData.admin -and $portsData.admin -gt 0) {
+                $result.admin = [int]$portsData.admin
+            }
+        } catch {
+            Write-Log "Could not read $portsFile : $_" -Level "WARN"
+        }
+    }
+    return $result
+}
+
 function Test-Endpoint {
     param([string]$Url, [string]$Name, [int]$TimeoutSec = 5, [int]$Retries = 7, [int]$RetryDelaySec = 3)
     $attempts = $Retries + 1
@@ -886,8 +913,26 @@ function Verify-Health {
         if (-not (Test-Endpoint -Url "http://localhost:$($Config.FrontendPort)" -Name "Frontend")) { $allOk = $false }
     }
     if (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue) {
-        if (-not (Test-Endpoint -Url "http://localhost:$($Config.CaddyPort)$($Config.ApiPrefix)/health" -Name "Caddy proxy")) { $allOk = $false }
+        $caddyPorts = Get-CaddyActualPorts -Config $Config
+        $caddyProxyPort = $caddyPorts.proxy
+        if (-not (Test-Endpoint -Url "http://localhost:${caddyProxyPort}$($Config.ApiPrefix)/health" -Name "Caddy proxy")) { $allOk = $false }
     }
+
+    # Show port summary after health checks
+    Write-Host ""
+    Write-Host " ── Ports ──" -ForegroundColor Cyan
+    Write-Host "  Frontend : $($Config.FrontendPort)" -ForegroundColor Green
+    Write-Host "  Backend  : $($Config.BackendPort)" -ForegroundColor Green
+    if (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue) {
+        $caddyPorts = Get-CaddyActualPorts -Config $Config
+        Write-Host "  Caddy proxy : $($caddyPorts.proxy)" -ForegroundColor Green
+        if ($caddyPorts.admin) {
+            Write-Host "  Caddy admin : $($caddyPorts.admin)" -ForegroundColor Gray
+        } else {
+            Write-Host "  Caddy admin : (not available yet - service may still be starting)" -ForegroundColor DarkYellow
+        }
+    }
+    Write-Host ""
 
     return $allOk
 }
@@ -1187,13 +1232,13 @@ function Install-Caddy {
             return $null
         }
 
-        $foundAdmin = Find-FreePort -Start 2019 -End 2099
+        $foundAdmin = Find-FreePort -Start 2019 -End 2118
         if ($foundAdmin) {
             Write-Host "      Admin API: $foundAdmin" -ForegroundColor Green
             Write-FileLog -Path $caddyInstallLog -Text "Free admin port: $foundAdmin"
         } else {
-            Write-Host "      Admin API: NONE FREE (check port range 2019-2099)" -ForegroundColor Red
-            Write-FileLog -Path $caddyInstallLog -Text "No free admin port found in 2019-2099"
+            Write-Host "      Admin API: NONE FREE (check port range 2019-2118)" -ForegroundColor Red
+            Write-FileLog -Path $caddyInstallLog -Text "No free admin port found in 2019-2118"
         }
 
         $foundProxy = Find-FreePort -Start $Config.CaddyPort -End ($Config.CaddyPort + 99)
@@ -1292,15 +1337,15 @@ function Test-PortInUse {
 
 "========== Service started at $(Get-Date) ==========" | Out-File -FilePath $caddyLog -Encoding ASCII
 
-# Find free admin port (start at 2019, scan up to 2099)
+# Find free admin port (start at 2019, scan up to 2118)
 $adminPort = 2019
-while ($adminPort -le 2099) {
+while ($adminPort -le 2118) {
     if (-not (Test-PortInUse -Port $adminPort)) { break }
     "    Admin port $adminPort -> IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
     $adminPort++
 }
-if ($adminPort -gt 2099) {
-    "FATAL: No free admin port found in range 2019-2099" | Out-File -FilePath $caddyLog -Append
+if ($adminPort -gt 2118) {
+    "FATAL: No free admin port found in range 2019-2118" | Out-File -FilePath $caddyLog -Append
     exit 1
 }
 $env:CADDY_ADMIN = "127.0.0.1:$adminPort"
@@ -1320,6 +1365,11 @@ if ($proxyPort -gt $proxyMax) {
 }
 $env:CADDY_PORT = "$proxyPort"
 "    Proxy port: $proxyPort" | Out-File -FilePath $caddyLog -Append
+
+# Write selected ports to a status file so health checks can find Caddy
+$statusFile = Join-Path $caddyDir "caddy-ports.json"
+@{admin = $adminPort; proxy = $proxyPort} | ConvertTo-Json | Out-File -FilePath $statusFile -Force
+"    Ports status: $statusFile" | Out-File -FilePath $caddyLog -Append
 
 "    Starting Caddy..." | Out-File -FilePath $caddyLog -Append
 & $caddyExe run --config $caddyfile 2>&1 | Out-File -FilePath $caddyLog -Append
@@ -1341,8 +1391,11 @@ $env:CADDY_PORT = "$proxyPort"
         }
 
         # ---- Validate Caddyfile syntax BEFORE creating the service ----
+        # Set env vars so Caddy can resolve {$CADDY_PORT} and {$CADDY_ADMIN}
+        $env:CADDY_PORT = "$($Config.CaddyPort)"
+        $env:CADDY_ADMIN = "127.0.0.1:$(if ($foundAdmin) { $foundAdmin } else { 2019 })"
         Write-Host "    Validating Caddyfile syntax..." -ForegroundColor Gray
-        Write-FileLog -Path $caddyInstallLog -Text "--- Caddyfile validation ---"
+        Write-FileLog -Path $caddyInstallLog -Text "--- Caddyfile validation (CADDY_PORT=$env:CADDY_PORT, CADDY_ADMIN=$env:CADDY_ADMIN) ---"
         try {
             $validationOutput = & $caddyExe validate --config "$caddyfilePath" 2>&1 | Out-String
             Write-FileLog -Path $caddyInstallLog -Text "Validation result: $validationOutput"
@@ -1355,6 +1408,8 @@ $env:CADDY_PORT = "$proxyPort"
             Write-Err "Caddyfile validation FAILED:"
             Write-Host "    $validationDetail" -ForegroundColor Red
         }
+        Remove-Item Env:\CADDY_PORT -ErrorAction SilentlyContinue
+        Remove-Item Env:\CADDY_ADMIN -ErrorAction SilentlyContinue
         Write-FileLog -Path $caddyInstallLog -Text "--- end validation ---"
 
         # Stop only OUR Caddy service to release its ports (admin:2019, proxy:$($Config.CaddyPort))
@@ -1478,24 +1533,61 @@ $env:CADDY_PORT = "$proxyPort"
                 Write-FileLog -Path $caddyInstallLog -Text "WARN: No runtime log found in $logsDir"
             }
 
-            # ---- Final port check: is Caddy actually listening? ----
+            # ---- Final port check: read actual ports from caddy-ports.json ----
             Start-Sleep -Seconds 3
-            if (Test-PortInUse -Port $Config.CaddyPort) {
-                Write-Success "Caddy is listening on port $($Config.CaddyPort)"
-                Write-FileLog -Path $caddyInstallLog -Text "VERIFIED: Caddy listening on port $($Config.CaddyPort)"
-            } else {
-                Write-Err "Caddy is NOT listening on port $($Config.CaddyPort) after startup"
-                Write-FileLog -Path $caddyInstallLog -Text "FAILED: Caddy not listening on port $($Config.CaddyPort)"
-                # Try netstat to see what's on the port
+            $actualProxyPort = $null
+            $portsFile = Join-Path $caddyDir "caddy-ports.json"
+            $pollAttempts = 0
+            while ($pollAttempts -lt 5 -and -not (Test-Path $portsFile)) {
+                Start-Sleep -Seconds 2
+                $pollAttempts++
+            }
+            if (Test-Path $portsFile) {
                 try {
-                    $netstatOutput = netstat -an | Select-String ":$($Config.CaddyPort)" | Out-String
-                    Write-FileLog -Path $caddyInstallLog -Text "Netstat for port $($Config.CaddyPort): $netstatOutput"
+                    $portsData = Get-Content $portsFile -Raw -ErrorAction Stop | ConvertFrom-Json
+                    $actualProxyPort = [int]$portsData.proxy
+                    $actualAdminPort = [int]$portsData.admin
+                    Write-FileLog -Path $caddyInstallLog -Text "caddy-ports.json: proxy=$actualProxyPort, admin=$actualAdminPort"
+                } catch {
+                    Write-FileLog -Path $caddyInstallLog -Text "Could not parse $portsFile : $_"
+                }
+            }
+            if (-not $actualProxyPort) {
+                # Fallback: scan for the runner-chosen port via netstat
+                Write-FileLog -Path $caddyInstallLog -Text "caddy-ports.json not found, scanning netstat for Caddy port..."
+                $startPort = $Config.CaddyPort
+                $endPort = $startPort + 99
+                for ($sp = $startPort; $sp -le $endPort; $sp++) {
+                    if (Test-PortInUse -Port $sp) {
+                        # Found something on this port - check if it responds like Caddy
+                        try {
+                            $testUrl = "http://localhost:${sp}$($Config.ApiPrefix)/health"
+                            $response = Invoke-WebRequest -Uri $testUrl -TimeoutSec 2 -UseBasicParsing -ErrorAction SilentlyContinue
+                            if ($response.StatusCode -eq 200) {
+                                $actualProxyPort = $sp
+                                Write-FileLog -Path $caddyInstallLog -Text "Found Caddy responding on port $sp via health check"
+                                break
+                            }
+                        } catch { }
+                    }
+                }
+            }
+
+            if ($actualProxyPort) {
+                Write-Success "Caddy is listening on port $actualProxyPort"
+                Write-FileLog -Path $caddyInstallLog -Text "VERIFIED: Caddy listening on port $actualProxyPort"
+            } else {
+                Write-Err "Caddy is NOT listening on any port in range $($Config.CaddyPort)-$($Config.CaddyPort + 99) after startup"
+                Write-FileLog -Path $caddyInstallLog -Text "FAILED: Caddy not listening on any checked port"
+                # Try netstat to see Caddy's process
+                try {
+                    $netstatOutput = netstat -ano | Select-String ":($($Config.CaddyPort)|$($Config.CaddyPort + 1))" | Out-String
+                    Write-FileLog -Path $caddyInstallLog -Text "Netstat for proxy port range: $netstatOutput"
                 } catch { }
             }
 
-            # Caddy is alive — the admin port check is now done dynamically by the runner script
-            Write-Host "    Caddy is running (proxy port $($Config.CaddyPort) confirmed)" -ForegroundColor Gray
-            Write-FileLog -Path $caddyInstallLog -Text "Caddy confirmed running on proxy port $($Config.CaddyPort)"
+            Write-Host "    Caddy is running (proxy port $($actualProxyPort))" -ForegroundColor Gray
+            Write-FileLog -Path $caddyInstallLog -Text "Caddy confirmed running on proxy port $($actualProxyPort)"
         } catch {
             $startError = $_
             Write-Err "Failed to start Caddy service: $startError"
@@ -1506,9 +1598,11 @@ $env:CADDY_PORT = "$proxyPort"
                 Write-FileLog -Path $caddyInstallLog -Text "Service query: $svcInfo"
             } catch { }
             # Try to dump runtime log if it exists
-            if (Test-Path $caddyLog) {
-                $errLog = Get-Content $caddyLog -ErrorAction SilentlyContinue | Select-Object -Last 20
-                Write-FileLog -Path $caddyInstallLog -Text "--- Last 20 lines of runtime log ---"
+            $latestErrLog = Get-ChildItem -Path $logsDir -Filter "caddy_service_*.log" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($latestErrLog) {
+                $errLog = Get-Content $latestErrLog.FullName -ErrorAction SilentlyContinue | Select-Object -Last 20
+                Write-FileLog -Path $caddyInstallLog -Text "--- Last 20 lines of runtime log ($($latestErrLog.Name)) ---"
                 foreach ($_errLine in $errLog) {
                     Write-FileLog -Path $caddyInstallLog -Text $_errLine
                 }
@@ -1724,6 +1818,19 @@ function Start-AllServices {
             Write-Log "Failed to start $($c.Service): $_" -Level "ERROR"
         }
     }
+    # Show ports after Caddy starts (give runner time to write status file)
+    if (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue) {
+        Start-Sleep -Seconds 3
+        $caddyPorts = Get-CaddyActualPorts -Config $Config
+        Write-Host ""
+        Write-Host " ── Caddy Ports ──" -ForegroundColor Cyan
+        Write-Host "  Proxy : $($caddyPorts.proxy)" -ForegroundColor Green
+        if ($caddyPorts.admin) {
+            Write-Host "  Admin : $($caddyPorts.admin)" -ForegroundColor Gray
+        } else {
+            Write-Host "  Admin : (not yet available)" -ForegroundColor DarkYellow
+        }
+    }
 }
 
 function Stop-AllServices {
@@ -1893,12 +2000,24 @@ function Invoke-FullDeploy {
         Write-Success "Duration: $($duration.Minutes)m $($duration.Seconds)s"
         Write-Success "Log: $($script:logFile)"
 
+        # Read actual Caddy port from status file (if available)
+        $displayCaddyPort = $Config.CaddyPort
+        $caddyPortsFile = Join-Path $Config.InstallRoot "caddy" "caddy-ports.json"
+        if (Test-Path $caddyPortsFile) {
+            try {
+                $portsData = Get-Content $caddyPortsFile -Raw -ErrorAction Stop | ConvertFrom-Json
+                if ($portsData.proxy -and $portsData.proxy -gt 0) {
+                    $displayCaddyPort = [int]$portsData.proxy
+                }
+            } catch { }
+        }
+
         # Architecture diagram
         Write-Host ""
-        Write-Host "  Local access: http://localhost:$($Config.CaddyPort)" -ForegroundColor Green
+        Write-Host "  Local access: http://localhost:${displayCaddyPort}" -ForegroundColor Green
         Write-Host "  ┌──────────────────────────────────────────────────┐" -ForegroundColor Cyan
         Write-Host "  │                   CADDY                         │" -ForegroundColor Cyan
-        Write-Host "  │             (port $($Config.CaddyPort))                │" -ForegroundColor Cyan
+        Write-Host "  │             (port ${displayCaddyPort})                │" -ForegroundColor Cyan
         Write-Host "  └────────┬─────────────────────────┬───────────────┘" -ForegroundColor Cyan
         Write-Host "           │                         │" -ForegroundColor Cyan
         Write-Host "           ▼                         ▼" -ForegroundColor Cyan
@@ -1907,7 +2026,7 @@ function Invoke-FullDeploy {
         Write-Host "  │  (port $($Config.FrontendPort))    │        │    (port $($Config.BackendPort))     │" -ForegroundColor Cyan
         Write-Host "  └────────────────┘        └──────────────────┘" -ForegroundColor Cyan
         Write-Host ""
-        Write-Host "  Browser → http://localhost:$($Config.CaddyPort)  →  Caddy routes:" -ForegroundColor White
+        Write-Host "  Browser → http://localhost:${displayCaddyPort}  →  Caddy routes:" -ForegroundColor White
         Write-Host "    $($Config.ApiPrefix)/*  →  Backend  (:$($Config.BackendPort))" -ForegroundColor Gray
         Write-Host "    /*               →  Frontend (:$($Config.FrontendPort))" -ForegroundColor Gray
     } else {
@@ -1973,7 +2092,13 @@ function Show-CaddyConfig {
         Write-Host " Caddy Reverse Proxy Configuration" -ForegroundColor Cyan
         Write-Host "============================================" -ForegroundColor Cyan
         Write-Host ""
-        Write-Host " Caddy listener : 127.0.0.1:$($Config.CaddyPort)" -ForegroundColor White
+        $caddyPorts = Get-CaddyActualPorts -Config $Config
+        Write-Host " Caddy proxy : $($caddyPorts.proxy)" -ForegroundColor Green
+        if ($caddyPorts.admin) {
+            Write-Host " Caddy admin : $($caddyPorts.admin)" -ForegroundColor Gray
+        } else {
+            Write-Host " Caddy admin : (not yet available)" -ForegroundColor DarkYellow
+        }
         Write-Host ""
         Write-Host " Available targets:" -ForegroundColor White
         if ($availableTargets.Count -gt 0) {
@@ -2116,7 +2241,7 @@ function Show-CaddyConfig {
                 }
 
                 $caddyfileLines = @()
-                $caddyfileLines += ":$($Config.CaddyPort) {"
+                $caddyfileLines += ":{\$CADDY_PORT} {"
                 foreach ($r in $finalRoutes) {
                     $caddyfileLines += "    handle $($r.Path) {"
                     $caddyfileLines += "        reverse_proxy $($r.Target)"
@@ -2131,8 +2256,74 @@ function Show-CaddyConfig {
                 $caddyfileContent = $caddyfileLines -join "`n"
 
                 Set-Content -Path $caddyfilePath -Value $caddyfileContent -Force
+
+                # Also regenerate the runner script so it picks up latest config
+                $runnerScript = Join-Path $caddyDir "caddy-run.ps1"
+                $defaultProxyPort = $Config.CaddyPort
+                $runnerContent = @'
+$caddyDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$caddyExe = Join-Path $caddyDir "caddy.exe"
+$caddyfile = Join-Path $caddyDir "Caddyfile"
+$logsDir   = Join-Path $caddyDir "..\logs"
+if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
+
+$svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
+$caddyLog = Join-Path $logsDir "caddy_service_${svcTs}.log"
+
+function Test-PortInUse {
+    param([int]$Port)
+    try {
+        $connections = netstat -an | Select-String "TCP.*:$Port\s"
+        if ($connections) { return $true }
+    } catch { }
+    return $false
+}
+
+"========== Service started at $(Get-Date) ==========" | Out-File -FilePath $caddyLog -Encoding ASCII
+
+# Find free admin port (start at 2019, scan up to 2118)
+$adminPort = 2019
+while ($adminPort -le 2118) {
+    if (-not (Test-PortInUse -Port $adminPort)) { break }
+    "    Admin port $adminPort -> IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
+    $adminPort++
+}
+if ($adminPort -gt 2118) {
+    "FATAL: No free admin port found in range 2019-2118" | Out-File -FilePath $caddyLog -Append
+    exit 1
+}
+$env:CADDY_ADMIN = "127.0.0.1:$adminPort"
+"    Admin port: $adminPort" | Out-File -FilePath $caddyLog -Append
+
+# Find free proxy port (start at __DEFAULT_PROXY_PORT__, scan up to +99)
+$proxyPort = __DEFAULT_PROXY_PORT__
+$proxyMax = $proxyPort + 99
+while ($proxyPort -le $proxyMax) {
+    if (-not (Test-PortInUse -Port $proxyPort)) { break }
+    "    Proxy port $proxyPort -> IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
+    $proxyPort++
+}
+if ($proxyPort -gt $proxyMax) {
+    "FATAL: No free proxy port found starting from $($proxyMax - 99)" | Out-File -FilePath $caddyLog -Append
+    exit 1
+}
+$env:CADDY_PORT = "$proxyPort"
+"    Proxy port: $proxyPort" | Out-File -FilePath $caddyLog -Append
+
+# Write selected ports to a status file so health checks can find Caddy
+$statusFile = Join-Path $caddyDir "caddy-ports.json"
+@{admin = $adminPort; proxy = $proxyPort} | ConvertTo-Json | Out-File -FilePath $statusFile -Force
+"    Ports status: $statusFile" | Out-File -FilePath $caddyLog -Append
+
+"    Starting Caddy..." | Out-File -FilePath $caddyLog -Append
+& $caddyExe run --config $caddyfile 2>&1 | Out-File -FilePath $caddyLog -Append
+'@
+                $runnerContent = $runnerContent.Replace('__DEFAULT_PROXY_PORT__', $defaultProxyPort)
+                Set-Content -Path $runnerScript -Value $runnerContent -Force
+
                 Restart-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue
                 Write-Success "Caddy restarted with new config"
+                Write-Host "    Caddyfile and runner script regenerated" -ForegroundColor Gray
             }
         }
     } while ($sub -notmatch '^[Bb]$')
