@@ -1189,7 +1189,7 @@ function Install-Caddy {
             if ($ownerProcess -and $ownerProcess.ProcessName -match '(?i)^caddy') {
                 # Another Caddy instance holds port 2019 - scan upward for a free port
                 Write-Host "      $caddyAdminPort → IN USE (by $ownerLabel)" -ForegroundColor Red
-                Write-FileLog -Path $caddyInstallLog -Text "$caddyAdminPort: IN USE by $ownerLabel"
+                Write-FileLog -Path $caddyInstallLog -Text "${caddyAdminPort}: IN USE by $ownerLabel"
 
                 $scanStart = $caddyAdminPort + 1
                 $caddyAdminPort = $scanStart
@@ -1208,11 +1208,11 @@ function Install-Caddy {
                         } catch { }
                         $scanLabel = if ($scanOwner) { "by $($scanOwner.ProcessName) (PID $scanPid)" } else { "by PID $scanPid (unknown)" }
                         Write-Host "      $caddyAdminPort → IN USE ($scanLabel)" -ForegroundColor Red
-                        Write-FileLog -Path $caddyInstallLog -Text "$caddyAdminPort: IN USE $scanLabel"
+                        Write-FileLog -Path $caddyInstallLog -Text "${caddyAdminPort}: IN USE $scanLabel"
                         $caddyAdminPort++
                     } else {
                         Write-Host "      $caddyAdminPort → FREE" -ForegroundColor Green
-                        Write-FileLog -Path $caddyInstallLog -Text "$caddyAdminPort: FREE"
+                        Write-FileLog -Path $caddyInstallLog -Text "${caddyAdminPort}: FREE"
                         break
                     }
                 }
@@ -1228,7 +1228,7 @@ function Install-Caddy {
             } else {
                 # Non-Caddy process holds port 2019 - we cannot work around it
                 Write-Host "      $caddyAdminPort → IN USE (by $ownerLabel)" -ForegroundColor Red
-                Write-FileLog -Path $caddyInstallLog -Text "$caddyAdminPort: IN USE by $ownerLabel (not Caddy)"
+                Write-FileLog -Path $caddyInstallLog -Text "${caddyAdminPort}: IN USE by $ownerLabel (not Caddy)"
                 $msg = "Port $caddyAdminPort (Caddy admin API) is held by $ownerLabel. Caddy cannot start until this is resolved."
                 Write-Err $msg
                 Write-FileLog -Path $caddyInstallLog -Text "ERROR: $msg"
@@ -1236,7 +1236,7 @@ function Install-Caddy {
         } else {
             Write-Host "      $caddyAdminPort → FREE" -ForegroundColor Green
             Write-Host "    Selected: $caddyAdminPort (default)" -ForegroundColor Gray
-            Write-FileLog -Path $caddyInstallLog -Text "$caddyAdminPort: FREE (default)"
+            Write-FileLog -Path $caddyInstallLog -Text "${caddyAdminPort}: FREE (default)"
         }
         Write-FileLog -Path $caddyInstallLog -Text "--- end admin port scan ---"
 
@@ -1484,7 +1484,7 @@ function Install-Caddy {
             # Also verify the admin API port is now in use (means Caddy is alive)
             Start-Sleep -Seconds 1
             if (Test-PortInUse -Port $caddyAdminPort) {
-                Write-Host "    Admin API port $caddyAdminPort: in use (Caddy is alive)" -ForegroundColor Gray
+                Write-Host "    Admin API port ${caddyAdminPort}: in use (Caddy is alive)" -ForegroundColor Gray
                 Write-FileLog -Path $caddyInstallLog -Text "Caddy admin API ($caddyAdminPort): active"
             } else {
                 Write-Warn "Admin API port $caddyAdminPort is NOT in use - Caddy may have crashed"
