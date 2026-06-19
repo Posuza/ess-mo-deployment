@@ -1302,7 +1302,7 @@ function Install-Caddy {
 
         $caddyfilePath = Join-Path $caddyDir "Caddyfile"
         $caddyfileLines = @()
-        $caddyfileLines += ":`{$CADDY_PORT`} {"
+        $caddyfileLines += ":`{`$CADDY_PORT`} {"
         foreach ($r in $caddyRoutes) {
             $caddyfileLines += "    handle $($r.Path) {"
             $caddyfileLines += "        reverse_proxy $($r.Target)"
@@ -1363,8 +1363,8 @@ if ($adminPort -gt 2099) {
 $env:CADDY_ADMIN = "127.0.0.1:$adminPort"
 "    Admin port: $adminPort" | Out-File -FilePath $caddyLog -Append
 
-# Find free proxy port (start at configured port, scan up to +99)
-$proxyPort = '$defaultProxyPort'
+# Find free proxy port (start at __DEFAULT_PROXY_PORT__, scan up to +99)
+$proxyPort = __DEFAULT_PROXY_PORT__
 $proxyMax = $proxyPort + 99
 while ($proxyPort -le $proxyMax) {
     if (-not (Test-PortInUse -Port $proxyPort)) { break }
@@ -1381,7 +1381,7 @@ $env:CADDY_PORT = "$proxyPort"
 "    Starting Caddy..." | Out-File -FilePath $caddyLog -Append
 & $caddyExe run --config $caddyfile 2>&1 | Out-File -FilePath $caddyLog -Append
 '@
-        $runnerContent = $runnerContent.Replace("'$defaultProxyPort'", $defaultProxyPort)
+        $runnerContent = $runnerContent.Replace('__DEFAULT_PROXY_PORT__', $defaultProxyPort)
         Set-Content -Path $runnerScript -Value $runnerContent -Force
         Write-FileLog -Path $caddyInstallLog -Text "Runner script written to $runnerScript"
         Write-FileLog -Path $caddyInstallLog -Text "--- runner script (default proxy port: $defaultProxyPort) ---"
@@ -1511,28 +1511,28 @@ $env:CADDY_PORT = "$proxyPort"
             }
 
             # ---- Check the runtime log for startup errors ----
-            if (Test-Path $caddyLog) {
-                Start-Sleep -Seconds 2  # Give Caddy time to write to log
-                $logContent = Get-Content $caddyLog -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            $latestLog = Get-ChildItem -Path $logsDir -Filter "caddy_service_*.log" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($latestLog) {
+                $logContent = Get-Content $latestLog.FullName -ErrorAction SilentlyContinue
                 Write-FileLog -Path $caddyInstallLog -Text "--- Runtime log content (first 30 lines) ---"
                 $lineCount = 0
                 foreach ($_logLine in $logContent) {
                     $lineCount++
                     if ($lineCount -gt 30) {
-                        Write-FileLog -Path $caddyInstallLog -Text "... (truncated, full log at $caddyLog)"
+                        Write-FileLog -Path $caddyInstallLog -Text "... (truncated, full log at $($latestLog.FullName))"
                         break
                     }
                     Write-FileLog -Path $caddyInstallLog -Text $_logLine
-                    # Highlight errors in console
                     if ($_logLine -match '(?i)(error|fail|panic|refused|cannot|unable|conflict|bind)') {
                         Write-Host "    [LOG] $_logLine" -ForegroundColor Red
                     }
                 }
                 Write-FileLog -Path $caddyInstallLog -Text "--- end runtime log ---"
             } else {
-                # Log file doesn't exist yet - Caddy may not have started
-                Write-Warn "Caddy runtime log not found yet - service may not have started"
-                Write-FileLog -Path $caddyInstallLog -Text "WARN: Runtime log not found at $caddyLog"
+                Write-Warn "Caddy runtime log not found yet"
+                Write-FileLog -Path $caddyInstallLog -Text "WARN: No runtime log found in $logsDir"
             }
 
             # ---- Final port check: is Caddy actually listening? ----
