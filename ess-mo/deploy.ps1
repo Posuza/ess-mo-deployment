@@ -1486,60 +1486,55 @@ function Invoke-FullDeploy {
     }
     $allSucceeded = $true
 
-    # Resolve secrets upfront (skip if backend not in the list)
+    # --- Credentials: resolve once upfront ---
     $secrets = $null
     if ($targetComponents -contains "backend") {
         Write-Step "Checking deployment credentials"
         $secrets = Get-SecretsOrInitialize
-        if (-not $script:headless) { Read-Host "`nPress Enter to continue" | Out-Null }
     }
 
+    Write-Step "Installing components"
+
     if ($targetComponents -contains "frontend") {
-        if (Confirm-Step "Install Frontend (port $($Config.FrontendPort))?") {
-            Start-Spinner "Installing Frontend ..."
-            $frontendOk = Install-Frontend -Config $Config
-            Stop-Spinner
-            if ($frontendOk) {
-                Write-Success "Frontend installed successfully on port $($Config.FrontendPort)"
-                Write-Log "Frontend installed successfully on port $($Config.FrontendPort)"
-            } else {
-                Write-Err "Frontend installation FAILED - check logs for details"
-                $allSucceeded = $false
-            }
-        } else { Write-Warn "Skipped Frontend." }
-        if (-not $script:headless) { Read-Host "`nPress Enter to continue" | Out-Null }
+        Write-Host "  Frontend (port $($Config.FrontendPort))..." -ForegroundColor Gray
+        Start-Spinner "Installing Frontend ..."
+        $frontendOk = Install-Frontend -Config $Config
+        Stop-Spinner
+        if ($frontendOk) {
+            Write-Success "Frontend installed on port $($Config.FrontendPort)"
+            Write-Log "Frontend installed on port $($Config.FrontendPort)"
+        } else {
+            Write-Err "Frontend installation FAILED"
+            $allSucceeded = $false
+        }
     }
 
     if ($targetComponents -contains "backend") {
-        if (Confirm-Step "Install Backend (port $($Config.BackendPort))?") {
-            Start-Spinner "Installing Backend ..."
-            $backendOk = Install-Backend -Config $Config -Secrets $secrets
-            Stop-Spinner
-            if ($backendOk) {
-                Write-Success "Backend installed successfully on port $($Config.BackendPort)"
-                Write-Log "Backend installed successfully on port $($Config.BackendPort)"
-            } else {
-                Write-Err "Backend installation FAILED - check logs for details"
-                $allSucceeded = $false
-            }
-        } else { Write-Warn "Skipped Backend." }
-        if (-not $script:headless) { Read-Host "`nPress Enter to continue" | Out-Null }
+        Write-Host "  Backend (port $($Config.BackendPort))..." -ForegroundColor Gray
+        Start-Spinner "Installing Backend ..."
+        $backendOk = Install-Backend -Config $Config -Secrets $secrets
+        Stop-Spinner
+        if ($backendOk) {
+            Write-Success "Backend installed on port $($Config.BackendPort)"
+            Write-Log "Backend installed on port $($Config.BackendPort)"
+        } else {
+            Write-Err "Backend installation FAILED"
+            $allSucceeded = $false
+        }
     }
 
     if ($targetComponents -contains "caddy") {
-        if (Confirm-Step "Install Caddy reverse proxy (port $($Config.CaddyPort))?") {
-            Start-Spinner "Installing Caddy ..."
-            $caddyOk = Install-Caddy -Config $Config
-            Stop-Spinner
-            if ($caddyOk) {
-                Write-Success "Caddy installed successfully on port $($Config.CaddyPort)"
-                Write-Log "Caddy installed successfully on port $($Config.CaddyPort)"
-            } else {
-                Write-Err "Caddy installation FAILED - check logs for details"
-                $allSucceeded = $false
-            }
-        } else { Write-Warn "Skipped Caddy." }
-        if (-not $script:headless) { Read-Host "`nPress Enter to continue" | Out-Null }
+        Write-Host "  Caddy reverse proxy (port $($Config.CaddyPort))..." -ForegroundColor Gray
+        Start-Spinner "Installing Caddy ..."
+        $caddyOk = Install-Caddy -Config $Config
+        Stop-Spinner
+        if ($caddyOk) {
+            Write-Success "Caddy installed on port $($Config.CaddyPort)"
+            Write-Log "Caddy installed on port $($Config.CaddyPort)"
+        } else {
+            Write-Err "Caddy installation FAILED"
+            $allSucceeded = $false
+        }
     }
 
     # Roll back on failure (only in non-dry-run mode)
