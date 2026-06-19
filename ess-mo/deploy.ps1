@@ -959,6 +959,7 @@ function Install-Frontend {
     $svcName  = "ess-mo-frontend"
     $appPort  = $Config.FrontendPort
     $logsDir  = Join-Path (Join-Path $Config.InstallRoot "logs") "frontend"
+    New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
 
     # Track whether we've swapped, for auto-rollback on failure
     $swapped = $false
@@ -1082,6 +1083,7 @@ function Install-Backend {
     }
 
     $logsDir  = Join-Path (Join-Path $Config.InstallRoot "logs") "backend"
+    New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
     $appDir   = Join-Path $Config.InstallRoot "backend"
     $repoDir  = Join-Path $appDir "repo"
     $svcName  = "ess-mo-backend"
@@ -1209,6 +1211,7 @@ function Install-Caddy {
 
     try {
         $logsDir = Join-Path (Join-Path $Config.InstallRoot "logs") "caddy"
+        New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
         $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
         $caddyInstallLog = Join-Path $logsDir "caddy_install_${ts}.log"
 
