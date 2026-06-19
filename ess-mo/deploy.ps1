@@ -604,7 +604,7 @@ function Get-SecretsOrInitialize {
                         return $s
                     } catch {
                         Write-Warn "Could not read $SecretsPath after edit: $_"
-                        Write-Log "Failed to reload $SecretsPath: $_" -Level "WARN"
+                        Write-Log "Failed to reload ${SecretsPath}: $_" -Level "WARN"
                     }
                 }
             }
@@ -661,7 +661,7 @@ function Get-SecretsOrInitialize {
                 return $s
             } catch {
                 Write-Warn "Could not read $SecretsPath after edit: $_"
-                Write-Log "Failed to reload $SecretsPath: $_" -Level "WARN"
+                Write-Log "Failed to reload ${SecretsPath}: $_" -Level "WARN"
             }
         }
     }
