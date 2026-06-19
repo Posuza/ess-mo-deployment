@@ -1173,106 +1173,50 @@ function Install-Caddy {
         Write-FileLog -Path $caddyInstallLog -Text "Target port: $($Config.CaddyPort)"
         Write-FileLog -Path $caddyInstallLog -Text "Timestamp: $ts"
 
-        # ---- Port availability checks ----
-        # Caddy's admin API always listens on localhost:2019 by default.
-        # If another Caddy instance (from a different deployment) already holds :2019,
-        # our Caddy will fail to start. We detect this and auto-assign a unique admin port.
-        $caddyAdminPort = 2019
-        $caddyAdminEnv = $null  # set to "CADDY_ADMIN=..." if we need a custom port
+        # ---- Port availability checks (informational - runner handles runtime) ----
+        Write-Host "    Scanning for free ports..." -ForegroundColor Gray
+        Write-FileLog -Path $caddyInstallLog -Text "--- Port scan (informational) ---"
 
-        Write-Host "    Admin API port scan:" -ForegroundColor Gray
-        Write-FileLog -Path $caddyInstallLog -Text "--- Admin port scan ---"
-
-        if (Test-PortInUse -Port $caddyAdminPort) {
-            # Identify which process holds port 2019
-            $ownerProcess = $null
-            $ownerPid = $null
-            try {
-                $connRow = netstat -ano | Select-String "TCP.*:$caddyAdminPort\s" | Select-Object -First 1
-                if ($connRow) {
-                    $parts = $connRow -split '\s+' | Where-Object { $_ -ne '' }
-                    $ownerPid = $parts[-1]
-                    $ownerProcess = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
-                }
-            } catch { }
-
-            $ownerLabel = if ($ownerProcess) { "$($ownerProcess.ProcessName) (PID $ownerPid)" } else { "PID $ownerPid (unknown)" }
-
-            if ($ownerProcess -and $ownerProcess.ProcessName -match '(?i)^caddy') {
-                # Another Caddy instance holds port 2019 - scan upward for a free port
-                Write-Host "      $caddyAdminPort → IN USE (by $ownerLabel)" -ForegroundColor Red
-                Write-FileLog -Path $caddyInstallLog -Text "${caddyAdminPort}: IN USE by $ownerLabel"
-
-                $scanStart = $caddyAdminPort + 1
-                $caddyAdminPort = $scanStart
-                while ($caddyAdminPort -le 2099) {
-                    if (Test-PortInUse -Port $caddyAdminPort) {
-                        # Show who holds this port too
-                        $scanOwner = $null
-                        $scanPid = $null
-                        try {
-                            $scanRow = netstat -ano | Select-String "TCP.*:$($caddyAdminPort)\s" | Select-Object -First 1
-                            if ($scanRow) {
-                                $scanParts = $scanRow -split '\s+' | Where-Object { $_ -ne '' }
-                                $scanPid = $scanParts[-1]
-                                $scanOwner = Get-Process -Id $scanPid -ErrorAction SilentlyContinue
-                            }
-                        } catch { }
-                        $scanLabel = if ($scanOwner) { "by $($scanOwner.ProcessName) (PID $scanPid)" } else { "by PID $scanPid (unknown)" }
-                        Write-Host "      $caddyAdminPort → IN USE ($scanLabel)" -ForegroundColor Red
-                        Write-FileLog -Path $caddyInstallLog -Text "${caddyAdminPort}: IN USE $scanLabel"
-                        $caddyAdminPort++
-                    } else {
-                        Write-Host "      $caddyAdminPort → FREE" -ForegroundColor Green
-                        Write-FileLog -Path $caddyInstallLog -Text "${caddyAdminPort}: FREE"
-                        break
-                    }
-                }
-
-                # If we exhausted the scan range without finding a free port, error out
-                if ($caddyAdminPort -gt 2099) {
-                    throw "No free admin port found in range 2020-2099. All ports are in use."
-                }
-
-                $caddyAdminEnv = "set CADDY_ADMIN=127.0.0.1:$caddyAdminPort && "
-                Write-Host "    Selected: $caddyAdminPort" -ForegroundColor Yellow
-                Write-FileLog -Path $caddyInstallLog -Text "Selected admin port: $caddyAdminPort"
-            } else {
-                # Non-Caddy process holds port 2019 - we cannot work around it
-                Write-Host "      $caddyAdminPort → IN USE (by $ownerLabel)" -ForegroundColor Red
-                Write-FileLog -Path $caddyInstallLog -Text "${caddyAdminPort}: IN USE by $ownerLabel (not Caddy)"
-                $msg = "Port $caddyAdminPort (Caddy admin API) is held by $ownerLabel. Caddy cannot start until this is resolved."
-                Write-Err $msg
-                Write-FileLog -Path $caddyInstallLog -Text "ERROR: $msg"
+        function Find-FreePort {
+            param([int]$Start, [int]$End)
+            $p = $Start
+            while ($p -le $End) {
+                if (-not (Test-PortInUse -Port $p)) { return $p }
+                $p++
             }
-        } else {
-            Write-Host "      $caddyAdminPort → FREE" -ForegroundColor Green
-            Write-Host "    Selected: $caddyAdminPort (default)" -ForegroundColor Gray
-            Write-FileLog -Path $caddyInstallLog -Text "${caddyAdminPort}: FREE (default)"
+            return $null
         }
-        Write-FileLog -Path $caddyInstallLog -Text "--- end admin port scan ---"
 
-        if (Test-PortInUse -Port $Config.CaddyPort) {
-            $msg = "Port $($Config.CaddyPort) (Caddy proxy) is ALREADY IN USE. Change the port in config or stop the other process first."
-            Write-Err $msg
-            Write-FileLog -Path $caddyInstallLog -Text "WARN: $msg"
+        $foundAdmin = Find-FreePort -Start 2019 -End 2099
+        if ($foundAdmin) {
+            Write-Host "      Admin API: $foundAdmin" -ForegroundColor Green
+            Write-FileLog -Path $caddyInstallLog -Text "Free admin port: $foundAdmin"
         } else {
-            Write-Host "    Port $($Config.CaddyPort) (Caddy proxy): free" -ForegroundColor Gray
-            Write-FileLog -Path $caddyInstallLog -Text "Port $($Config.CaddyPort) (proxy): free"
+            Write-Host "      Admin API: NONE FREE (check port range 2019-2099)" -ForegroundColor Red
+            Write-FileLog -Path $caddyInstallLog -Text "No free admin port found in 2019-2099"
         }
-        Write-FileLog -Path $caddyInstallLog -Text "Port checks complete"
 
-        # ── Clear port summary for the user ──
-        $adminLabel = if ($caddyAdminEnv) { "auto (2019 was taken)" } else { "default" }
+        $foundProxy = Find-FreePort -Start $Config.CaddyPort -End ($Config.CaddyPort + 99)
+        if ($foundProxy) {
+            Write-Host "      Proxy:      $foundProxy" -ForegroundColor Green
+            Write-FileLog -Path $caddyInstallLog -Text "Free proxy port: $foundProxy"
+        } else {
+            Write-Host "      Proxy:      NONE FREE (check port range $($Config.CaddyPort)-$($Config.CaddyPort + 99))" -ForegroundColor Red
+            Write-FileLog -Path $caddyInstallLog -Text "No free proxy port found in $($Config.CaddyPort)-$($Config.CaddyPort + 99)"
+        }
+        Write-FileLog -Path $caddyInstallLog -Text "--- end port scan ---"
+
+        # ── Port summary ──
+        $adminDisplay = if ($foundAdmin) { $foundAdmin } else { "?" }
+        $proxyDisplay = if ($foundProxy) { $foundProxy } else { "?" }
         Write-Host ""
         Write-Host "    ┌──────────────────────────────────┐" -ForegroundColor Cyan
         Write-Host "    │  Caddy service ports:             │" -ForegroundColor Cyan
-        Write-Host "    │    Proxy  (users visit this): $($Config.CaddyPort)" -ForegroundColor $(if ($caddyAdminEnv) { "Yellow" } else { "Green" })
-        Write-Host "    │    Admin  (Caddy internal): $caddyAdminPort" -ForegroundColor $(if ($caddyAdminEnv) { "Yellow" } else { "Gray" })
+        Write-Host "    │    Proxy  (users visit this): $proxyDisplay" -ForegroundColor Green
+        Write-Host "    │    Admin  (Caddy internal): $adminDisplay" -ForegroundColor Gray
         Write-Host "    └──────────────────────────────────┘" -ForegroundColor Cyan
         Write-Host ""
-        Write-FileLog -Path $caddyInstallLog -Text "Caddy proxy port: $($Config.CaddyPort)"
-        Write-FileLog -Path $caddyInstallLog -Text "Caddy admin port: $caddyAdminPort ($adminLabel)"
+        Write-FileLog -Path $caddyInstallLog -Text "Ports: proxy=$proxyDisplay, admin=$adminDisplay"
 
         $caddyDir = Join-Path $Config.InstallRoot "caddy"
         New-Item -Path $caddyDir -ItemType Directory -Force | Out-Null
@@ -1574,9 +1518,8 @@ $env:CADDY_PORT = "$proxyPort"
         }
 
         $script:installedComponents += "caddy"
-        $adminLabel = if ($caddyAdminEnv) { "auto (2019 was taken)" } else { "default" }
-        Write-Success "Caddy installed: proxy=$($Config.CaddyPort), admin=$caddyAdminPort ($adminLabel)"
-        Write-Log "Caddy installed successfully: proxy=$($Config.CaddyPort), admin=$caddyAdminPort ($adminLabel)"
+        Write-Success "Caddy installed: proxy=$($Config.CaddyPort), admin=dynamic"
+        Write-Log "Caddy installed successfully: proxy=$($Config.CaddyPort), admin=dynamic"
         return $true
     } catch {
         Write-Err "Caddy setup failed: $_"
