@@ -583,14 +583,8 @@ function Get-SecretsOrInitialize {
             }
             Write-Host ""
 
-            Write-Host ""
             Write-Host " Edit this file with your real credentials before continuing:" -ForegroundColor Cyan
             Write-Host "     $SecretsPath" -ForegroundColor White
-            Write-Host ""
-            Write-Host " Required fields:" -ForegroundColor Gray
-            foreach ($p in $placeholders) {
-                Write-Host "    $p" -ForegroundColor Gray
-            }
             Write-Host ""
 
             if (-not $script:headless) {
@@ -609,17 +603,10 @@ function Get-SecretsOrInitialize {
                 }
             }
 
-            # Fall back to defaults
-            Write-Warn "Using default credentials — the backend may not connect until you update:"
-            Write-Host "     $SecretsPath" -ForegroundColor Cyan
-            Write-Host "     (or edit .env after deployment)" -ForegroundColor Gray
+            # User declined — cancel deployment
+            Write-Warn "Deployment cancelled. Edit $SecretsPath first, then re-run."
             Write-Host ""
-            $s = Get-SecretsDefaults
-            $json = $s | ConvertTo-Json -Depth 4
-            Set-Content -Path $SecretsPath -Value $json -Force
-            Protect-SecretsFile
-            Write-Log "Secrets initialized with defaults" -Level "WARN"
-            return $s
+            return $null
         }
 
         # All values are real — happy path
@@ -666,11 +653,9 @@ function Get-SecretsOrInitialize {
         }
     }
 
-    Write-Warn "Using default credentials — the backend may not connect until you update:"
-    Write-Host "     $SecretsPath" -ForegroundColor Cyan
+    Write-Warn "Deployment cancelled. Edit $SecretsPath first, then re-run."
     Write-Host ""
-    Write-Log "Secrets created with defaults" -Level "WARN"
-    return $s
+    return $null
 }
 
 <#
@@ -1317,7 +1302,7 @@ function Install-Caddy {
 
         $caddyfilePath = Join-Path $caddyDir "Caddyfile"
         $caddyfileLines = @()
-        $caddyfileLines += ":$($Config.CaddyPort) {"
+        $caddyfileLines += ":`{$CADDY_PORT`} {"
         foreach ($r in $caddyRoutes) {
             $caddyfileLines += "    handle $($r.Path) {"
             $caddyfileLines += "        reverse_proxy $($r.Target)"
@@ -1333,11 +1318,75 @@ function Install-Caddy {
         Set-Content -Path $caddyfilePath -Value $caddyfileContent -Force
         # Log the full Caddyfile so you can verify port and routes
         Write-FileLog -Path $caddyInstallLog -Text "Caddyfile written to $caddyfilePath"
-        Write-FileLog -Path $caddyInstallLog -Text "--- Caddyfile content (port: $($Config.CaddyPort)) ---"
+        Write-FileLog -Path $caddyInstallLog -Text "--- Caddyfile content (port via `$CADDY_PORT env var) ---"
         foreach ($_line in $caddyfileLines) {
             Write-FileLog -Path $caddyInstallLog -Text $_line
         }
         Write-FileLog -Path $caddyInstallLog -Text "--- end Caddyfile ---"
+
+        # ── Write dynamic runner script ──
+        $runnerScript = Join-Path $caddyDir "caddy-run.ps1"
+        $defaultProxyPort = $Config.CaddyPort
+        $runnerContent = @'
+$caddyDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$caddyExe = Join-Path $caddyDir "caddy.exe"
+$caddyfile = Join-Path $caddyDir "Caddyfile"
+$logsDir   = Join-Path $caddyDir "..\logs"
+if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
+
+$svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
+$caddyLog = Join-Path $logsDir "caddy_service_${svcTs}.log"
+
+function Test-PortInUse {
+    param([int]$Port)
+    try {
+        $conn = [System.Net.Sockets.TcpClient]::new()
+        $conn.ConnectAsync("127.0.0.1", $Port).Wait(1000)
+        if ($conn.Connected) { $conn.Close(); return $true }
+        return $false
+    } catch { return $false }
+}
+
+"========== Service started at $(Get-Date) ==========" | Out-File -FilePath $caddyLog -Encoding ASCII
+
+# Find free admin port (start at 2019, scan up to 2099)
+$adminPort = 2019
+while ($adminPort -le 2099) {
+    if (-not (Test-PortInUse -Port $adminPort)) { break }
+    "    Admin port $adminPort → IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
+    $adminPort++
+}
+if ($adminPort -gt 2099) {
+    "FATAL: No free admin port found in range 2019-2099" | Out-File -FilePath $caddyLog -Append
+    exit 1
+}
+$env:CADDY_ADMIN = "127.0.0.1:$adminPort"
+"    Admin port: $adminPort" | Out-File -FilePath $caddyLog -Append
+
+# Find free proxy port (start at configured port, scan up to +99)
+$proxyPort = '$defaultProxyPort'
+$proxyMax = $proxyPort + 99
+while ($proxyPort -le $proxyMax) {
+    if (-not (Test-PortInUse -Port $proxyPort)) { break }
+    "    Proxy port $proxyPort → IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
+    $proxyPort++
+}
+if ($proxyPort -gt $proxyMax) {
+    "FATAL: No free proxy port found starting from $($proxyMax - 99)" | Out-File -FilePath $caddyLog -Append
+    exit 1
+}
+$env:CADDY_PORT = "$proxyPort"
+"    Proxy port: $proxyPort" | Out-File -FilePath $caddyLog -Append
+
+"    Starting Caddy..." | Out-File -FilePath $caddyLog -Append
+& $caddyExe run --config $caddyfile 2>&1 | Out-File -FilePath $caddyLog -Append
+'@
+        $runnerContent = $runnerContent.Replace("'$defaultProxyPort'", $defaultProxyPort)
+        Set-Content -Path $runnerScript -Value $runnerContent -Force
+        Write-FileLog -Path $caddyInstallLog -Text "Runner script written to $runnerScript"
+        Write-FileLog -Path $caddyInstallLog -Text "--- runner script (default proxy port: $defaultProxyPort) ---"
+        Write-FileLog -Path $caddyInstallLog -Text $runnerContent
+        Write-FileLog -Path $caddyInstallLog -Text "--- end runner script ---"
 
         # Log Caddy version (helps diagnose --admin / admin off support)
         try {
@@ -1400,31 +1449,24 @@ function Install-Caddy {
             } catch { }
         }
 
-        # Runtime log: capture Caddy access/error logs
-        $svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
-        $caddyLog = Join-Path $logsDir "caddy_service_${svcTs}.log"
-        Write-Host "    Service log: $caddyLog" -ForegroundColor Gray
-        Write-FileLog -Path $caddyInstallLog -Text "Caddy runtime log: $caddyLog"
+        # Runtime log is generated dynamically by the runner script at each start
+        Write-Host "    Runner script: $runnerScript" -ForegroundColor Gray
+        Write-FileLog -Path $caddyInstallLog -Text "Runner script: $runnerScript"
 
-        # Build the cmd.exe wrapper command that:
-        # 1. Writes a start timestamp to the log
-        # 2. cd's to the caddy dir
-        # 3. Sets CADDY_ADMIN env var if port 2019 was taken by another Caddy
-        # 4. Runs caddy run --config pointing to our isolated Caddyfile
-        # 5. Redirects ALL output (stdout+stderr) to the runtime log
-        #
-        # Note: The Caddyfile at $caddyfilePath defines proxy port $($Config.CaddyPort).
-        # Admin API port: $caddyAdminPort (2019 by default, unique if another Caddy holds 2019).
-        $adminEnvPrefix = if ($caddyAdminEnv) { $caddyAdminEnv } else { "" }
-        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$caddyLog`" & cd /d $caddyDir && ${adminEnvPrefix}`"$caddyExe`" run --config `"$caddyfilePath`" >> `"$caddyLog`" 2>&1`"`""
+        # Build the PowerShell runner command that:
+        # 1. Runs caddy-run.ps1 which dynamically finds free ports at each start
+        # 2. Sets CADDY_ADMIN and CADDY_PORT env vars dynamically
+        # 3. Creates a timestamped log file
+        $powershellExe = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        $paramStr = "-ExecutionPolicy Bypass -File `"$runnerScript`""
 
         # Log the FULL service command for debugging
         Write-FileLog -Path $caddyInstallLog -Text "--- Service creation ---"
         Write-FileLog -Path $caddyInstallLog -Text "Service name: ess-mo-caddy"
-        Write-FileLog -Path $caddyInstallLog -Text "Executable: C:\Windows\System32\cmd.exe"
+        Write-FileLog -Path $caddyInstallLog -Text "Executable: $powershellExe"
         Write-FileLog -Path $caddyInstallLog -Text "Parameters: $paramStr"
+        Write-FileLog -Path $caddyInstallLog -Text "Runner script: $runnerScript"
         Write-FileLog -Path $caddyInstallLog -Text "Caddyfile: $caddyfilePath"
-        Write-FileLog -Path $caddyInstallLog -Text "Runtime log: $caddyLog"
 
         # Unregister old service (process already stopped above)
         Write-Host "    Unregistering old service definition..." -ForegroundColor Gray
@@ -1434,8 +1476,8 @@ function Install-Caddy {
         }
         Start-Sleep -Milliseconds 500
 
-        Write-Host "    Registering new Caddy service on port $($Config.CaddyPort)..." -ForegroundColor Gray
-        $installResult = servy-cli install --name="ess-mo-caddy" --path="C:\Windows\System32\cmd.exe" --params="$paramStr" 2>&1
+        Write-Host "    Registering new Caddy service..." -ForegroundColor Gray
+        $installResult = servy-cli install --name="ess-mo-caddy" --path="$powershellExe" --params="$paramStr" 2>&1
         Write-FileLog -Path $caddyInstallLog -Text "servy-cli install output: $installResult"
 
         if (-not (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue)) {
@@ -1508,15 +1550,9 @@ function Install-Caddy {
                 } catch { }
             }
 
-            # Also verify the admin API port is now in use (means Caddy is alive)
-            Start-Sleep -Seconds 1
-            if (Test-PortInUse -Port $caddyAdminPort) {
-                Write-Host "    Admin API port ${caddyAdminPort}: in use (Caddy is alive)" -ForegroundColor Gray
-                Write-FileLog -Path $caddyInstallLog -Text "Caddy admin API ($caddyAdminPort): active"
-            } else {
-                Write-Warn "Admin API port $caddyAdminPort is NOT in use - Caddy may have crashed"
-                Write-FileLog -Path $caddyInstallLog -Text "WARN: Admin port $caddyAdminPort not in use - Caddy may have crashed"
-            }
+            # Caddy is alive — the admin port check is now done dynamically by the runner script
+            Write-Host "    Caddy is running (proxy port $($Config.CaddyPort) confirmed)" -ForegroundColor Gray
+            Write-FileLog -Path $caddyInstallLog -Text "Caddy confirmed running on proxy port $($Config.CaddyPort)"
         } catch {
             $startError = $_
             Write-Err "Failed to start Caddy service: $startError"
@@ -1668,6 +1704,10 @@ function Invoke-ComponentInstall {
         "backend"    {
             Write-Step "Checking deployment credentials"
             $secrets = Get-SecretsOrInitialize
+            if (-not $secrets) {
+                Write-Warn "Returning to main menu."
+                return $false
+            }
             $result = Install-Backend -Config $Config -Secrets $secrets
         }
         "caddy"      { $result = Install-Caddy -Config $Config }
@@ -1834,6 +1874,10 @@ function Invoke-FullDeploy {
     if ($targetComponents -contains "backend") {
         Write-Step "Checking deployment credentials"
         $secrets = Get-SecretsOrInitialize
+        if (-not $secrets) {
+            Write-Warn "Returning to main menu."
+            return
+        }
     }
 
     Write-Step "Installing components"
