@@ -934,6 +934,8 @@ function Install-Frontend {
 
         # --- 5. Create new release ---
         $releaseDir = Join-Path $relDir $ts
+        # Ensure destination exists (avoid Copy-Item container/leaf ambiguity)
+        New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
         Copy-Item -Path "$distDir\*" -Destination $releaseDir -Recurse -Force
         Write-Success "Release created: $ts"
         Write-FileLog -Path $installLog -Text "Release created: $releaseDir"
