@@ -123,6 +123,90 @@ function Write-Success ($msg) { Write-Host "    $msg"   -ForegroundColor Green; 
 function Write-Err     ($msg) { Write-Host "    $msg"   -ForegroundColor Red;     Write-Log "ERROR: $msg"; $script:hasErrors = $true }
 function Write-Warn    ($msg) { Write-Host "    $msg"   -ForegroundColor DarkYellow; Write-Log "WARN: $msg" }
 
+function Edit-WithDefault {
+    param([string]$Default, [string]$Prompt)
+    # Writes $Prompt, then $Default as pre-filled editable text.
+    # Closing `"` is appended after Enter so the line reads cleanly.
+    # Arrows/Home/End supported; Backspace deletes; Enter confirms.
+    # Ctrl+V / Shift+Insert paste from clipboard.
+    Write-Host -NoNewline $Prompt
+    $buf = [System.Collections.Generic.List[char]]($Default.ToCharArray())
+    Write-Host -NoNewline ($buf -join '')
+    $pos = $buf.Count
+    $plen = $Prompt.Length
+    while ($true) {
+        $ki = [System.Console]::ReadKey($true)
+        switch ($ki.Key) {
+            Enter   { break }
+            BackSpace {
+                if ($pos -gt 0) {
+                    $pos--; $buf.RemoveAt($pos)
+                    [System.Console]::CursorLeft = $plen
+                    Write-Host -NoNewline (($buf -join '') + ' ')
+                    [System.Console]::CursorLeft = $plen + $pos
+                }
+            }
+            LeftArrow  { if ($pos -gt 0) { $pos--; [Console]::CursorLeft = $plen + $pos } }
+            RightArrow { if ($pos -lt $buf.Count) { $pos++; [Console]::CursorLeft = $plen + $pos } }
+            Home       { $pos = 0; [Console]::CursorLeft = $plen }
+            End        { $pos = $buf.Count; [Console]::CursorLeft = $plen + $pos }
+            Delete {
+                if ($pos -lt $buf.Count) {
+                    $buf.RemoveAt($pos)
+                    [System.Console]::CursorLeft = $plen
+                    Write-Host -NoNewline (($buf -join '') + ' ')
+                    [System.Console]::CursorLeft = $plen + $pos
+                }
+            }
+            default {
+                # --- Paste: Ctrl+V or Shift+Insert ---
+                if (($ki.Modifiers -band [System.ConsoleModifiers]::Control) -and $ki.Key -eq [System.ConsoleKey]::V) {
+                    $pasteText = Get-Clipboard -ErrorAction SilentlyContinue
+                    if ($pasteText) {
+                        # Strip newlines (single-line field)
+                        $pasteText = $pasteText -replace "`r`n", '' -replace "`n", '' -replace "`r", ''
+                        foreach ($ch in $pasteText.ToCharArray()) {
+                            if ($ch -ge 32) {
+                                $buf.Insert($pos, $ch)
+                                $pos++
+                            }
+                        }
+                        [System.Console]::CursorLeft = $plen
+                        Write-Host -NoNewline (($buf -join '') + ' ')
+                        [System.Console]::CursorLeft = $plen + $pos
+                    }
+                    break
+                }
+                if (($ki.Modifiers -band [System.ConsoleModifiers]::Shift) -and $ki.Key -eq [System.ConsoleKey]::Insert) {
+                    $pasteText = Get-Clipboard -ErrorAction SilentlyContinue
+                    if ($pasteText) {
+                        $pasteText = $pasteText -replace "`r`n", '' -replace "`n", '' -replace "`r", ''
+                        foreach ($ch in $pasteText.ToCharArray()) {
+                            if ($ch -ge 32) {
+                                $buf.Insert($pos, $ch)
+                                $pos++
+                            }
+                        }
+                        [System.Console]::CursorLeft = $plen
+                        Write-Host -NoNewline (($buf -join '') + ' ')
+                        [System.Console]::CursorLeft = $plen + $pos
+                    }
+                    break
+                }
+                # --- Normal character input ---
+                if ($ki.KeyChar -ge 32) {
+                    $buf.Insert($pos, $ki.KeyChar)
+                    $pos++
+                    Write-Host -NoNewline $ki.KeyChar
+                }
+            }
+        }
+    }
+    Write-Host '"'
+    if ($buf.Count -eq 0) { return $Default }
+    return ($buf -join '')
+}
+
 # ===========================================================
 # SPINNER - rotating stick animation during long operations
 # ===========================================================
@@ -346,59 +430,6 @@ function Select-CaddyPort {
     return $Config.CaddyPort
 }
 
-function Select-PublicUrl {
-    param($Config)
-
-    if ($script:headless) {
-        if ([string]::IsNullOrWhiteSpace($Config.PublicUrl)) {
-            $Config.PublicUrl = "http://localhost:$($Config.CaddyPort)"
-        }
-        return $Config.PublicUrl
-    }
-
-    $hasCurrent = -not [string]::IsNullOrWhiteSpace($Config.PublicUrl)
-
-    Write-Host ""
-    Write-Host "============================================" -ForegroundColor Cyan
-    Write-Host " Public URL" -ForegroundColor Cyan
-    Write-Host "============================================" -ForegroundColor Cyan
-    Write-Host " The public URL where users access the app." -ForegroundColor Gray
-    if ($hasCurrent) {
-        Write-Host " Current config : $($Config.PublicUrl)" -ForegroundColor Gray
-    }
-    Write-Host ""
-    Write-Host " 1) Keep current" -ForegroundColor Gray
-    Write-Host " 2) Enter custom URL / domain" -ForegroundColor Gray
-    Write-Host ""
-
-    $choice = $null
-    do {
-        $opt = Read-Host "Select option [1]"
-        if ([string]::IsNullOrWhiteSpace($opt)) { $opt = "1" }
-        switch ($opt) {
-            "1" {
-                if ($hasCurrent) { $choice = $Config.PublicUrl }
-                else { Write-Err "No current URL set. Pick another option." }
-            }
-            "2" {
-                $custom = Read-Host "Enter public URL (e.g. https://yourdomain.com)"
-                if ($custom -match '^https?://') { $choice = $custom }
-                else { Write-Err "Enter a URL starting with http:// or https://" }
-            }
-            default { Write-Err "Select 1-2" }
-        }
-    } while ($null -eq $choice)
-
-    if ($choice -ne $Config.PublicUrl) {
-        $Config.PublicUrl = $choice
-        Save-DeployConfig -Config $Config
-        Write-Success "Public URL set to: $choice"
-        Write-Log "Public URL changed to: $choice"
-    }
-
-    return $Config.PublicUrl
-}
-
 function Initialize-InstallRoot {
     param($Config)
     if ($script:dryRun) { Write-Warn "[DRY-RUN] Would create: $($Config.InstallRoot)"; return }
@@ -413,8 +444,9 @@ function Initialize-InstallRoot {
 #                   smtp.host, smtp.port, smtp.user, smtp.pass, smtp.from
 # ===========================================================
 function Protect-SecretsFile {
+    param([string]$Path = $SecretsPath)
     $gitignore = Join-Path $PSScriptRoot ".gitignore"
-    $entry = "deploy.secrets.json"
+    $entry = Split-Path $Path -Leaf
     if (-not (Test-Path $gitignore)) {
         Set-Content -Path $gitignore -Value $entry
         Write-Log "Created .gitignore with $entry"
@@ -424,13 +456,72 @@ function Protect-SecretsFile {
     }
 }
 
-function ConvertFrom-SecureToPlain {
-    param($SecureString)
-    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
-    try { return [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr) }
-    finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+function Get-SecretsOrInitialize {
+    <#
+    .SYNOPSIS
+      Load secrets from deploy.secrets.json, or show a template if missing.
+      Checks for REPLACE_WITH_* / YOUR_* placeholder values and warns if found.
+      No interactive prompts — user edits the JSON file directly.
+    #>
+
+    if (-not (Test-Path $SecretsPath)) {
+        Write-Host ""
+        Write-Host " [!] deploy.secrets.json not found." -ForegroundColor Yellow
+        Write-Host "     Create it with this structure:" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host '  {' -ForegroundColor Cyan
+        Write-Host '    "db": {' -ForegroundColor Cyan
+        Write-Host '      "host": "192.168.1.172",' -ForegroundColor Cyan
+        Write-Host '      "port": 3306,' -ForegroundColor Cyan
+        Write-Host '      "name": "ess",' -ForegroundColor Cyan
+        Write-Host '      "user": "root",' -ForegroundColor Cyan
+        Write-Host '      "password": "YOUR_DB_PASSWORD"' -ForegroundColor Cyan
+        Write-Host '    },' -ForegroundColor Cyan
+        Write-Host '    "smtp": {' -ForegroundColor Cyan
+        Write-Host '      "host": "smtp.gmail.com",' -ForegroundColor Cyan
+        Write-Host '      "port": 587,' -ForegroundColor Cyan
+        Write-Host '      "user": "YOUR_EMAIL",' -ForegroundColor Cyan
+        Write-Host '      "pass": "YOUR_APP_PASSWORD",' -ForegroundColor Cyan
+        Write-Host '      "from": "YOUR_FROM_EMAIL"' -ForegroundColor Cyan
+        Write-Host '    }' -ForegroundColor Cyan
+        Write-Host '  }' -ForegroundColor Cyan
+        Write-Host ""
+        Write-Log "deploy.secrets.json missing — user must create it first" -Level "WARN"
+        return $null
+    }
+
+    # File exists — check for placeholder values
+    $s = Get-Content $SecretsPath -Raw -ErrorAction Stop | ConvertFrom-Json
+
+    $placeholderPattern = 'REPLACE_WITH_|YOUR_|CHANGE_THIS|PLACEHOLDER'
+    $placeholders = @()
+    if ($s.db.host     -match $placeholderPattern) { $placeholders += '  db.host (e.g. "192.168.1.172")' }
+    if ($s.db.user     -match $placeholderPattern) { $placeholders += '  db.user (e.g. "root")' }
+    if ($s.db.name     -match $placeholderPattern) { $placeholders += '  db.name (e.g. "ess")' }
+    if ($s.db.password -match $placeholderPattern) { $placeholders += '  db.password (your MySQL password)' }
+    if ($s.smtp.user   -match $placeholderPattern) { $placeholders += '  smtp.user (your email)' }
+    if ($s.smtp.pass   -match $placeholderPattern) { $placeholders += '  smtp.pass (app password)' }
+    if ($s.smtp.from   -match $placeholderPattern) { $placeholders += '  smtp.from (from address)' }
+
+    if ($placeholders.Count -gt 0) {
+        Write-Host ""
+        Write-Host " [!] deploy.secrets.json still has placeholder values:" -ForegroundColor Yellow
+        foreach ($p in $placeholders) {
+            Write-Host "    $p" -ForegroundColor Yellow
+        }
+        Write-Host ""
+        Write-Host "     Open this file and replace them with your real credentials:" -ForegroundColor Gray
+        Write-Host "     $SecretsPath" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Log "deploy.secrets.json has $($placeholders.Count) placeholder(s) — user must edit first" -Level "WARN"
+        return $null
+    }
+
+    Write-Log "Secrets loaded from $SecretsPath"
+    return $s
 }
 
+<#
 function Get-OrCreateSecrets {
     if ($script:headless) {
         if (Test-Path $SecretsPath) {
@@ -442,79 +533,66 @@ function Get-OrCreateSecrets {
         exit 1
     }
 
-    # Ask user: load from file or enter credentials manually
-    do {
-        $useFile = Read-Host "Load DB/SMTP credentials from deploy.secrets.json? (Y/n)  n = enter manually"
-        if ($useFile -eq '' -or $useFile -match '^[Yy]') {
-            if (Test-Path $SecretsPath) {
-                Write-Success "Secrets loaded from $SecretsPath"
-                Write-Log "Secrets loaded from $SecretsPath"
-                return Get-Content $SecretsPath -Raw | ConvertFrom-Json
-            } else {
-                Write-Warn "File not found: $SecretsPath"
-                Write-Host "  Place deploy.secrets.json next to this script, or type 'n' to enter credentials manually." -ForegroundColor Gray
-                # Loop back and ask again
-            }
-        } else {
-            break
+    # If file exists, show current values and ask to edit or use as-is
+    $existing = $null
+    if (Test-Path $SecretsPath) {
+        $existing = Get-Content $SecretsPath -Raw | ConvertFrom-Json
+        Write-Host "`nCurrent secrets from $SecretsPath :" -ForegroundColor Cyan
+        Write-Host ($existing | ConvertTo-Json) -ForegroundColor Gray
+        Write-Host ""
+        $useExisting = Read-Host "Use these existing values? (Y/n)"
+        if ($useExisting -eq '' -or $useExisting -match '^[Yy]') {
+            Write-Success "Using existing secrets."
+            return $existing
         }
-    } while ($true)
+    }
 
     Write-Host "These are saved locally only and used to generate the backend's .env file.`n" -ForegroundColor Gray
 
+    # Set defaults from existing file if available
+    $defDbHost   = if ($existing) { $existing.db.host } else { "192.168.1.140" }
+    $defDbUser   = if ($existing) { $existing.db.user } else { "root" }
+    $defDbName   = if ($existing) { $existing.db.name } else { "ess" }
+    $defDbPass   = if ($existing) { $existing.db.password } else { "" }
+    $defSmtpUser = if ($existing) { $existing.smtp.user } else { "" }
+    $defSmtpPass = if ($existing) { $existing.smtp.pass } else { "" }
+    $defSmtpFrom = if ($existing) { $existing.smtp.from } else { "" }
+
     # Database settings
     Write-Host "-- Database --" -ForegroundColor Cyan
-    Write-Host '  "host": "192.168.1.140"' -ForegroundColor Gray
-    Write-Host '    Press [Enter] to skip / Type new host' -ForegroundColor DarkGray
-    $dbHostIn = Read-Host ">"
-    if (-not $dbHostIn) { $dbHostIn = "192.168.1.140" }
-    Write-Host '  "port": "3306"' -ForegroundColor Gray
-    Write-Host '    Press [Enter] to skip / Type new port' -ForegroundColor DarkGray
-    $dbPort = Read-Host ">"
-    if (-not $dbPort) { $dbPort = "3306" }
-    Write-Host '  "user": "root"' -ForegroundColor Gray
-    Write-Host '    Press [Enter] to skip / Type new user' -ForegroundColor DarkGray
-    $dbUser = Read-Host ">"
-    if (-not $dbUser) { $dbUser = "root" }
-    Write-Host '  "name": "ess"' -ForegroundColor Gray
-    Write-Host '    Press [Enter] to skip / Type new name' -ForegroundColor DarkGray
-    $dbName = Read-Host ">"
-    if (-not $dbName) { $dbName = "ess" }
-    Write-Host '  "password": "********"' -ForegroundColor Gray
-    $dbPassSec = Read-Host "> Enter DB password"
+    $dbHostIn = Edit-WithDefault -Default $defDbHost -Prompt "#Edit or Skip for default > `"host`": `""
+    Write-Host "    `"host`": `"$dbHostIn`"" -ForegroundColor Green
+
+    $dbUser = Edit-WithDefault -Default $defDbUser -Prompt "#Edit or Skip for default > `"user`": `""
+    Write-Host "    `"user`": `"$dbUser`"" -ForegroundColor Green
+
+    $dbName = Edit-WithDefault -Default $defDbName -Prompt "#Edit or Skip for default > `"name`": `""
+    Write-Host "    `"name`": `"$dbName`"" -ForegroundColor Green
+
+    $dbPassword = Edit-WithDefault -Default $defDbPass -Prompt "#Edit or Skip for default > `"password`": `""
+    Write-Host "    `"password`": `"$dbPassword`"" -ForegroundColor Green
 
     # SMTP settings
     Write-Host "-- SMTP --" -ForegroundColor Cyan
-    Write-Host '  "host": "smtp.gmail.com"' -ForegroundColor Gray
-    Write-Host '    Press [Enter] to skip / Type new host' -ForegroundColor DarkGray
-    $smtpHostIn = Read-Host ">"
-    if (-not $smtpHostIn) { $smtpHostIn = "smtp.gmail.com" }
-    Write-Host '  "port": "587"' -ForegroundColor Gray
-    Write-Host '    Press [Enter] to skip / Type new port' -ForegroundColor DarkGray
-    $smtpPort = Read-Host ">"
-    if (-not $smtpPort) { $smtpPort = "587" }
-    Write-Host '  "user": ""' -ForegroundColor Gray
-    Write-Host '    Enter SMTP user (email address)' -ForegroundColor DarkGray
-    $smtpUser = Read-Host ">"
-    Write-Host '  "pass": "********"' -ForegroundColor Gray
-    $smtpPassSec = Read-Host "> Enter SMTP app password" -AsSecureString
-    Write-Host '  "from": ""' -ForegroundColor Gray
-    $emailFrom = Read-Host "> Enter email 'From' address"
-    if (-not $emailFrom) { $emailFrom = $smtpUser }
+    $smtpUser = Edit-WithDefault -Default $defSmtpUser -Prompt "#Edit or Skip for default > `"user`": `""
+    Write-Host "    `"user`": `"$smtpUser`"" -ForegroundColor Green
+
+    $smtpPassword = Edit-WithDefault -Default $defSmtpPass -Prompt "#Edit or Skip for default > `"pass`": `""
+    Write-Host "    `"pass`": `"$smtpPassword`"" -ForegroundColor Green
+
+    $emailFrom = Edit-WithDefault -Default $defSmtpFrom -Prompt "#Edit or Skip for default > `"from`": `""
+    Write-Host "    `"from`": `"$emailFrom`"" -ForegroundColor Green
 
     $secrets = [PSCustomObject]@{
         db = [PSCustomObject]@{
             host     = $dbHostIn
-            port     = $dbPort
-            name     = $dbName
             user     = $dbUser
-            password = (ConvertFrom-SecureToPlain $dbPassSec)
+            name     = $dbName
+            password = $dbPassword
         }
         smtp = [PSCustomObject]@{
-            host = $smtpHostIn
-            port = $smtpPort
             user = $smtpUser
-            pass = (ConvertFrom-SecureToPlain $smtpPassSec)
+            pass = $smtpPassword
             from = $emailFrom
         }
     }
@@ -524,11 +602,13 @@ function Get-OrCreateSecrets {
     Write-Log "Secrets created at $SecretsPath"
     return $secrets
 }
+#>
 
 # ===========================================================
 # PREREQUISITES
 # ===========================================================
 function Test-Prerequisites {
+    param([switch]$CheckOnly)
     Write-Step "Checking prerequisites"
     $ok = $true
     $missing = @()
@@ -560,12 +640,15 @@ function Test-Prerequisites {
 
     Write-Host ""
 
-    # Pass 2: install all missing at once
+    # Pass 2: install all missing at once (skip if CheckOnly)
     if ($missing.Count -gt 0) {
         $missingNames = ($missing | ForEach-Object { $_.Name }) -join ', '
-        if ($script:headless) {
-            Write-Err "Missing prerequisites (headless mode): $missingNames"
-            Write-Log "Missing prerequisites (headless): $missingNames" -Level "ERROR"
+        if ($script:headless -or $CheckOnly) {
+            Write-Err "Missing prerequisites: $missingNames"
+            if ($CheckOnly) {
+                Write-Host "    Run option 1 from the main menu to install them." -ForegroundColor Gray
+            }
+            Write-Log "Missing prerequisites: $missingNames" -Level "ERROR"
             return $false
         }
         if (Confirm-Step "Install missing prerequisites: $missingNames?" -DefaultYes:$true) {
@@ -601,8 +684,6 @@ function Test-Prerequisites {
     } else {
         Write-Success "All prerequisites are already installed."
     }
-
-    # (update step skipped — updates are handled via full install)
 
     if (-not $ok) { return $false }
     return $true
@@ -650,61 +731,127 @@ function Verify-Health {
 function Install-Frontend {
     param($Config)
     Initialize-InstallRoot -Config $Config
-    Write-Step "Installing Frontend"
+    Write-Step "Installing / Updating Frontend"
 
     if ($script:dryRun) {
         Write-Warn "[DRY-RUN] Would install Frontend from $($Config.FrontendRepo) on port $($Config.FrontendPort)"
         return $true
     }
 
+    $appDir   = Join-Path $Config.InstallRoot "frontend"
+    $repoDir  = Join-Path $appDir "repo"
+    $webRoot  = Join-Path $appDir "webroot"
+    $relDir   = Join-Path $webRoot "releases"
+    $curLink  = Join-Path $webRoot "current"
+    $svcName  = "ess-mo-frontend"
+    $appPort  = $Config.FrontendPort
+    $logsDir  = Join-Path $Config.InstallRoot "logs"
+
+    # Track whether we've swapped, for auto-rollback on failure
+    $swapped = $false
+    $prevTarget = $null
+
     try {
-        $logsDir = Join-Path $Config.InstallRoot "logs"
+        New-Item -Path $relDir -ItemType Directory -Force | Out-Null
+
         $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
-        $frontendInstallLog = Join-Path $logsDir "frontend_install_${ts}.log"
+        $installLog = Join-Path $logsDir "frontend_install_${ts}.log"
 
-        $tempDir = Join-Path $env:TEMP "essmo_frontend_clone"
-        if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
+        # --- 1. Persistent repo ---
+        if (Test-Path (Join-Path $repoDir ".git")) {
+            Write-Host "    Updating repo..." -ForegroundColor Gray
+            Write-FileLog -Path $installLog -Text "Repo exists, updating via git fetch + reset"
+            Push-Location $repoDir
+            git fetch --depth 1 origin main 2>&1 | Add-FileLog -Path $installLog
+            git reset --hard origin/main 2>&1 | Add-FileLog -Path $installLog
+            Pop-Location
+        } else {
+            Write-Host "    Cloning repo (first time)..." -ForegroundColor Gray
+            Write-FileLog -Path $installLog -Text "First-time clone"
+            if (Test-Path $repoDir) { Remove-Item $repoDir -Recurse -Force }
+            git clone $Config.FrontendRepo $repoDir 2>&1 | Add-FileLog -Path $installLog
+        }
 
-        git clone $Config.FrontendRepo $tempDir 2>&1 | Add-FileLog -Path $frontendInstallLog
+        # --- 2. npm install ---
+        Write-Host "    Installing dependencies..." -ForegroundColor Gray
+        Push-Location $repoDir
+        npm install 2>&1 | Add-FileLog -Path $installLog
+        npm install serve 2>&1 | Add-FileLog -Path $installLog
 
-        $destDir = Join-Path $Config.InstallRoot "frontend"
-        New-Item -Path $destDir -ItemType Directory -Force | Out-Null
-        Copy-Item -Path "$tempDir\*" -Destination $destDir -Recurse -Force
-
-        Push-Location $destDir
-        npm install 2>&1 | Add-FileLog -Path $frontendInstallLog
-        npm install serve 2>&1 | Add-FileLog -Path $frontendInstallLog
+        # --- 3. Build ---
+        Write-Host "    Building..." -ForegroundColor Gray
         $env:VITE_API_URL = $Config.ApiPrefix
-        npm run build 2>&1 | Add-FileLog -Path $frontendInstallLog
+        npm run build 2>&1 | Add-FileLog -Path $installLog
         Pop-Location
 
-        if (-not (Test-Path (Join-Path $destDir "dist"))) {
+        $distDir = Join-Path $repoDir "dist"
+        if (-not (Test-Path $distDir)) {
             throw "Frontend build failed - dist folder not created"
         }
-        Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 
-        # Runtime log: capture all stdout/stderr from the running service
+        # --- 4. Save previous symlink target before swapping ---
+        $prevTarget = if (Test-Path $curLink) {
+            try { (Get-Item $curLink -ErrorAction Stop).Target } catch { $null }
+        } else { $null }
+
+        # --- 5. Create new release ---
+        $releaseDir = Join-Path $relDir $ts
+        Copy-Item -Path "$distDir\*" -Destination $releaseDir -Recurse -Force
+        Write-Success "Release created: $ts"
+        Write-FileLog -Path $installLog -Text "Release created: $releaseDir"
+
+        # --- 6. Swap symlink: current → new release ---
+        if (Test-Path $curLink) { Remove-Item $curLink -Force }
+        New-Item -ItemType SymbolicLink -Path $curLink -Target $releaseDir -Force | Out-Null
+        $swapped = $true
+        Write-Success "Symlink swapped: current \u2192 $ts"
+        Write-FileLog -Path $installLog -Text "Symlink: $curLink \u2192 $releaseDir"
+
+        # --- 7. Create / update service (timestamped service log) ---
         $svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
-        $frontendLog = Join-Path $logsDir "frontend_service_${svcTs}.log"
-        Write-Host "    Service log: $frontendLog" -ForegroundColor Gray
+        $serviceLog = Join-Path $logsDir "frontend_service_${svcTs}.log"
+        Write-Host "    Service log: $serviceLog" -ForegroundColor Gray
+        Write-FileLog -Path $installLog -Text "Service log: $serviceLog"
 
-        # cmd.exe needs the inner command double-quoted, and Servy needs that
-        # quoting preserved literally -> hence the doubled quotes here.
-        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$frontendLog`" & cd /d $destDir && npx serve -s dist -l $($Config.FrontendPort) >> `"$frontendLog`" 2>&1`"`""
+        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$serviceLog`" & cd /d $appDir && npx serve -s `"$curLink`" -l $appPort >> `"$serviceLog`" 2>&1`"`""
 
-        servy-cli uninstall --name="ess-mo-frontend" --silent 2>&1 | Out-Null
-        servy-cli install --name="ess-mo-frontend" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
+        servy-cli uninstall --name="$svcName" --silent 2>&1 | Out-Null
+        servy-cli install --name="$svcName" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
 
-        if (-not (Get-Service -Name ess-mo-frontend -ErrorAction SilentlyContinue)) {
-            throw "Service 'ess-mo-frontend' was not created by servy-cli"
+        if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
+            throw "Service '$svcName' was not created by servy-cli"
         }
-        Write-Success "Frontend service installed."
+        Write-FileLog -Path $installLog -Text "Service $svcName installed/updated"
+        Write-Success "Service updated: $svcName"
+
+        # --- 8. Auto-cleanup: keep last 3 releases ---
+        $keepCount = 3
+        $releases = Get-ChildItem -Path $relDir -Directory | Sort-Object Name -Descending
+        if ($releases.Count -gt $keepCount) {
+            $releases | Select-Object -Skip $keepCount | ForEach-Object {
+                Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                Write-FileLog -Path $installLog -Text "Cleaned up old release: $($_.Name)"
+            }
+            Write-Success "Cleaned up old releases (kept last $keepCount)"
+        }
+
         $script:installedComponents += "frontend"
-        Write-Log "Frontend installed successfully on port $($Config.FrontendPort)"
+        Write-Log "Frontend installed/updated successfully (release: $ts, port: $appPort)"
         return $true
+
     } catch {
         Write-Err "Frontend setup failed: $_"
         Write-Log "Frontend installation failed: $_" -Level "ERROR"
+
+        # Auto-rollback: if we swapped symlink and old release exists, restore it
+        if ($swapped -and $prevTarget -and (Test-Path $prevTarget)) {
+            Write-Warn "Auto-rolling back to previous release..."
+            Remove-Item $curLink -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType SymbolicLink -Path $curLink -Target $prevTarget -Force | Out-Null
+            Write-Success "Rolled back to previous release"
+            Write-Log "Auto-rollback to $prevTarget after install failure" -Level "WARN"
+        }
+
         return $false
     }
 }
@@ -712,80 +859,122 @@ function Install-Frontend {
 function Install-Backend {
     param($Config, $Secrets)
     Initialize-InstallRoot -Config $Config
-    Write-Step "Installing Backend"
+    Write-Step "Installing / Updating Backend"
 
     if ($script:dryRun) {
         Write-Warn "[DRY-RUN] Would install Backend from $($Config.BackendRepo) on port $($Config.BackendPort)"
         return $true
     }
 
+    $logsDir  = Join-Path $Config.InstallRoot "logs"
+    $appDir   = Join-Path $Config.InstallRoot "backend"
+    $repoDir  = Join-Path $appDir "repo"
+    $svcName  = "ess-mo-backend"
+    $appPort  = $Config.BackendPort
+
     try {
-        $logsDir = Join-Path $Config.InstallRoot "logs"
         $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
-        $backendInstallLog = Join-Path $logsDir "backend_install_${ts}.log"
+        $installLog = Join-Path $logsDir "backend_install_${ts}.log"
 
-        $tempDir = Join-Path $env:TEMP "essmo_backend_clone"
-        if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
-
-        git clone $Config.BackendRepo $tempDir 2>&1 | Add-FileLog -Path $backendInstallLog
-
-        $destDir = Join-Path $Config.InstallRoot "backend"
-        New-Item -Path $destDir -ItemType Directory -Force | Out-Null
-        Copy-Item -Path "$tempDir\*" -Destination $destDir -Recurse -Force
-
-        Push-Location $destDir
-        python -m venv venv 2>&1 | Add-FileLog -Path $backendInstallLog
-        if (-not (Test-Path (Join-Path $destDir "venv\Scripts\python.exe"))) {
-            throw "Virtual environment was not created"
+        # --- 1. Persistent repo ---
+        if (Test-Path (Join-Path $repoDir ".git")) {
+            Write-Host "    Updating repo..." -ForegroundColor Gray
+            Write-FileLog -Path $installLog -Text "Repo exists, updating via git fetch + reset"
+            Push-Location $repoDir
+            git fetch --depth 1 origin main 2>&1 | Add-FileLog -Path $installLog
+            git reset --hard origin/main 2>&1 | Add-FileLog -Path $installLog
+            Pop-Location
+        } else {
+            Write-Host "    Cloning repo (first time)..." -ForegroundColor Gray
+            Write-FileLog -Path $installLog -Text "First-time clone"
+            if (Test-Path $repoDir) { Remove-Item $repoDir -Recurse -Force }
+            git clone $Config.BackendRepo $repoDir 2>&1 | Add-FileLog -Path $installLog
         }
-        & (Join-Path $destDir "venv\Scripts\pip") install -r requirements.txt 2>&1 |
-            Add-FileLog -Path $backendInstallLog
-        Pop-Location
-        Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 
+        # --- 2. Virtual environment (create once, reuse) ---
+        $venvDir = Join-Path $repoDir "venv"
+        $pythonExe = Join-Path $venvDir "Scripts\python.exe"
+        if (-not (Test-Path $pythonExe)) {
+            Write-Host "    Creating virtual environment..." -ForegroundColor Gray
+            Write-FileLog -Path $installLog -Text "Creating venv"
+            Push-Location $repoDir
+            python -m venv venv 2>&1 | Add-FileLog -Path $installLog
+            Pop-Location
+            if (-not (Test-Path $pythonExe)) {
+                throw "Virtual environment was not created"
+            }
+        } else {
+            Write-Host "    Virtual environment exists (skipping)" -ForegroundColor Gray
+        }
+
+        # --- 3. Install / update dependencies (pip is smart — only delta) ---
+        Write-Host "    Installing dependencies..." -ForegroundColor Gray
+        & $pythonExe -m pip install -r (Join-Path $repoDir "requirements.txt") 2>&1 | Add-FileLog -Path $installLog
+
+        # --- 4. Generate .env file ---
         Write-Host "    Generating .env file..." -ForegroundColor Gray
-        $generatedKey = & (Join-Path $destDir "venv\Scripts\python") -c "import secrets; print(secrets.token_hex(32))" 2>&1 |
-            Add-FileLog -Path $backendInstallLog
+        # Capture raw output, trim it, validate it
+        $rawKey = & $pythonExe -c "import secrets; print(secrets.token_hex(32))" 2>&1
+        $generatedKey = ($rawKey | Select-Object -Last 1).Trim()
+        if ([string]::IsNullOrWhiteSpace($generatedKey) -or $generatedKey.Length -lt 16) {
+            Write-Warn "Python key generation failed or returned invalid value, using fallback"
+            Write-FileLog -Path $installLog -Text "Python key generation returned: '$rawKey', using fallback"
+            $generatedKey = [System.Guid]::NewGuid().ToString("N") + [System.Guid]::NewGuid().ToString("N")
+        }
+        Write-FileLog -Path $installLog -Text "SECRET_KEY generated ($($generatedKey.Length) chars)"
+
+        # Escape values for .env: backslash first, then double-quote
+        # python-dotenv parses "key=\"val\"" as literal "val"
+        $envDbUser   = $Secrets.db.user.Replace('\', '\\').Replace('"', '\\"')
+        $envDbPass   = $Secrets.db.password.Replace('\', '\\').Replace('"', '\\"')
+        $envDbHost   = $Secrets.db.host.Replace('\', '\\').Replace('"', '\\"')
+        $envDbName   = $Secrets.db.name.Replace('\', '\\').Replace('"', '\\"')
+        $envSmtpUser = $Secrets.smtp.user.Replace('\', '\\').Replace('"', '\\"')
+        $envSmtpPass = $Secrets.smtp.pass.Replace('\', '\\').Replace('"', '\\"')
+        $envSmtpFrom = $Secrets.smtp.from.Replace('\', '\\').Replace('"', '\\"')
+
         $envContent = @"
 DB_ENGINE=mysql
-DB_HOST=$($Secrets.db.host)
-DB_PORT=$($Secrets.db.port)
-DB_USER="$($Secrets.db.user)"
-DB_PASSWORD="$($Secrets.db.password)"
-DB_NAME=$($Secrets.db.name)
+DB_HOST=$envDbHost
+DB_PORT=3306
+DB_USER="$envDbUser"
+DB_PASSWORD="$envDbPass"
+DB_NAME=$envDbName
 
 SECRET_KEY=$generatedKey
 ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=30
 
-SMTP_HOST=$($Secrets.smtp.host)
-SMTP_PORT=$($Secrets.smtp.port)
-SMTP_USER="$($Secrets.smtp.user)"
-SMTP_PASS="$($Secrets.smtp.pass)"
-EMAIL_FROM="$($Secrets.smtp.from)"
-FRONTEND_URL=$($Config.PublicUrl)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER="$envSmtpUser"
+SMTP_PASS="$envSmtpPass"
+EMAIL_FROM="$envSmtpFrom"
 "@
-        Set-Content -Path (Join-Path $destDir ".env") -Value $envContent -Force
+        Set-Content -Path (Join-Path $repoDir ".env") -Value $envContent -Force
+        Write-FileLog -Path $installLog -Text ".env generated with SECRET_KEY ($($generatedKey.Length) chars)"
 
-        $pythonExe = Join-Path $destDir "venv\Scripts\python.exe"
-
-        # Runtime log: capture all uvicorn request/error logs
+        # --- 5. Create / update service (timestamped service log) ---
         $svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
-        $backendLog = Join-Path $logsDir "backend_service_${svcTs}.log"
-        Write-Host "    Service log: $backendLog" -ForegroundColor Gray
+        $serviceLog = Join-Path $logsDir "backend_service_${svcTs}.log"
+        Write-Host "    Service log: $serviceLog" -ForegroundColor Gray
+        Write-FileLog -Path $installLog -Text "Service log: $serviceLog"
 
-        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$backendLog`" & cd /d $destDir && $pythonExe -m uvicorn app.main:app --host 0.0.0.0 --port $($Config.BackendPort) >> `"$backendLog`" 2>&1`"`""
+        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$serviceLog`" & cd /d $repoDir && $pythonExe -m uvicorn app.main:app --host 0.0.0.0 --port $appPort >> `"$serviceLog`" 2>&1`"`""
 
-        servy-cli uninstall --name="ess-mo-backend" --silent 2>&1 | Out-Null
-        servy-cli install --name="ess-mo-backend" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
+        servy-cli uninstall --name="$svcName" --silent 2>&1 | Out-Null
+        servy-cli install --name="$svcName" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
 
-        if (-not (Get-Service -Name ess-mo-backend -ErrorAction SilentlyContinue)) {
-            throw "Service 'ess-mo-backend' was not created by servy-cli"
+        if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
+            throw "Service '$svcName' was not created by servy-cli"
         }
-        Write-Success "Backend service installed."
+        Write-FileLog -Path $installLog -Text "Service $svcName installed/updated"
+        Write-Success "Service updated: $svcName"
+
         $script:installedComponents += "backend"
-        Write-Log "Backend installed successfully on port $($Config.BackendPort)"
+        Write-Log "Backend installed/updated successfully on port $appPort"
         return $true
+
     } catch {
         Write-Err "Backend setup failed: $_"
         Write-Log "Backend installation failed: $_" -Level "ERROR"
@@ -878,7 +1067,88 @@ function Install-Caddy {
 }
 
 # ===========================================================
-# ROLLBACK
+# FRONTEND RELEASES (symlink management)
+# ===========================================================
+
+function Show-ReleaseHistory {
+    param($Config, [string]$AppName = "frontend")
+    $relDir = Join-Path $Config.InstallRoot $AppName "webroot" "releases"
+    $curLink = Join-Path $Config.InstallRoot $AppName "webroot" "current"
+
+    if (-not (Test-Path $relDir)) {
+        Write-Warn "No releases found for '$AppName'."
+        return
+    }
+
+    $currentTarget = if (Test-Path $curLink) {
+        try { (Get-Item $curLink -ErrorAction Stop).Target } catch { $null }
+    } else { $null }
+
+    $releases = Get-ChildItem -Path $relDir -Directory | Sort-Object Name -Descending
+
+    if ($releases.Count -eq 0) {
+        Write-Warn "No releases found for '$AppName'."
+        return
+    }
+
+    Write-Host ""
+    Write-Host "=== $AppName Release History ($($releases.Count) total) ===" -ForegroundColor Cyan
+    Write-Host ""
+    foreach ($r in $releases) {
+        $marker = if ($currentTarget -and $r.FullName -eq $currentTarget) { "  \u2190 CURRENT" } else { "" }
+        $color = if ($marker) { 'Green' } else { 'Gray' }
+        Write-Host "  $($r.Name)$marker" -ForegroundColor $color
+    }
+    Write-Host ""
+    Write-Log "Release history shown for $AppName ($($releases.Count) releases)"
+}
+
+function Invoke-RollbackApp {
+    param($Config, [string]$AppName = "frontend")
+
+    $relDir  = Join-Path $Config.InstallRoot $AppName "webroot" "releases"
+    $curLink = Join-Path $Config.InstallRoot $AppName "webroot" "current"
+    $svcName = "ess-mo-$AppName"
+
+    if (-not (Test-Path $relDir)) {
+        Write-Warn "No releases found for '$AppName'."
+        return $false
+    }
+
+    $releases = Get-ChildItem -Path $relDir -Directory | Sort-Object Name -Descending
+    if ($releases.Count -lt 2) {
+        Write-Warn "Need at least 2 releases to rollback '$AppName'."
+        return $false
+    }
+
+    $currentTarget = if (Test-Path $curLink) {
+        try { (Get-Item $curLink -ErrorAction Stop).Target } catch { $null }
+    } else { $null }
+
+    # Previous release = most recent non-current
+    $targetRelease = $releases | Where-Object { $_.FullName -ne $currentTarget } | Select-Object -First 1
+
+    if (-not $targetRelease) {
+        Write-Warn "No previous release found to rollback to."
+        return $false
+    }
+
+    Write-Step "Rolling back $AppName: $($(Split-Path $currentTarget -Leaf)) \u2192 $($targetRelease.Name)"
+
+    if ($script:dryRun) {
+        Write-Warn "[DRY-RUN] Would swap symlink back to $($targetRelease.Name)"
+        return $true
+    }
+
+    Remove-Item $curLink -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType SymbolicLink -Path $curLink -Target $targetRelease.FullName -Force | Out-Null
+    Write-Success "Rolled back $AppName to release: $($targetRelease.Name)"
+    Write-Log "$AppName rolled back to release: $($targetRelease.Name)"
+    return $true
+}
+
+# ===========================================================
+# ROLLBACK (full deployment failure)
 # ===========================================================
 function Invoke-Rollback {
     param($Config)
@@ -912,7 +1182,15 @@ function Invoke-ComponentInstall {
     $result = $false
     switch ($Key) {
         "frontend"   { $result = Install-Frontend -Config $Config }
-        "backend"    { $secrets = Get-OrCreateSecrets; $result = Install-Backend -Config $Config -Secrets $secrets }
+        "backend"    {
+            $secrets = Get-SecretsOrInitialize
+            if (-not $secrets) {
+                Write-Warn "Backend install postponed — edit deploy.secrets.json first."
+                Write-Log "Backend install skipped: deploy.secrets.json needs editing" -Level "WARN"
+                return $false
+            }
+            $result = Install-Backend -Config $Config -Secrets $secrets
+        }
         "caddy"      { $result = Install-Caddy -Config $Config }
     }
     if (-not $result -and -not $script:dryRun) {
@@ -1054,8 +1332,8 @@ function Invoke-FullDeploy {
         }
     }
 
-    # 3. Check prerequisites
-    $prereqResult = Test-Prerequisites
+    # 3. Check prerequisites (check-only: no install prompts)
+    $prereqResult = Test-Prerequisites -CheckOnly
     if ("BACK" -eq $prereqResult -or -not $prereqResult) {
         if ("BACK" -eq $prereqResult) {
             Write-Warn "Returning to menu."
@@ -1064,10 +1342,6 @@ function Invoke-FullDeploy {
         }
         return
     }
-    if (-not $script:headless -or $Components.Count -eq 0 -or ($Components -contains "backend")) {
-        $secrets = Get-OrCreateSecrets
-    }
-
     # Determine which components to deploy
     $targetComponents = if ($script:headless -and $Components.Count -gt 0) {
         $Components
@@ -1094,16 +1368,22 @@ function Invoke-FullDeploy {
 
     if ($targetComponents -contains "backend") {
         if (Confirm-Step "Install Backend (port $($Config.BackendPort))?") {
-            $secrets = Get-OrCreateSecrets
-            Start-Spinner "Installing Backend ..."
-            $backendOk = Install-Backend -Config $Config -Secrets $secrets
-            Stop-Spinner
-            if ($backendOk) {
-                Write-Success "Backend installed successfully on port $($Config.BackendPort)"
-                Write-Log "Backend installed successfully on port $($Config.BackendPort)"
-            } else {
-                Write-Err "Backend installation FAILED - check logs for details"
+            $secrets = Get-SecretsOrInitialize
+            if (-not $secrets) {
+                Write-Warn "Backend install postponed — edit deploy.secrets.json first."
+                Write-Log "Backend install skipped: deploy.secrets.json needs editing" -Level "WARN"
                 $allSucceeded = $false
+            } else {
+                Start-Spinner "Installing Backend ..."
+                $backendOk = Install-Backend -Config $Config -Secrets $secrets
+                Stop-Spinner
+                if ($backendOk) {
+                    Write-Success "Backend installed successfully on port $($Config.BackendPort)"
+                    Write-Log "Backend installed successfully on port $($Config.BackendPort)"
+                } else {
+                    Write-Err "Backend installation FAILED - check logs for details"
+                    $allSucceeded = $false
+                }
             }
         } else { Write-Warn "Skipped Backend." }
         if (-not $script:headless) { Read-Host "`nPress Enter to continue" | Out-Null }
@@ -1225,14 +1505,13 @@ function Show-MainMenu {
     }
     Write-Host ""
     Write-Host "  1) Check prerequisites" -ForegroundColor White
-    Write-Host "  2) Install components" -ForegroundColor White
+    Write-Host "  2) Install / update components" -ForegroundColor White
     Write-Host "  3) Uninstall components" -ForegroundColor White
     Write-Host "  4) Service status / health check" -ForegroundColor White
     Write-Host "  5) Start services" -ForegroundColor White
     Write-Host "  6) Stop services" -ForegroundColor White
     Write-Host "  7) Caddy network config" -ForegroundColor White
-    Write-Host "  8) Network & URL configuration" -ForegroundColor White
-    Write-Host "  9) Open logs folder" -ForegroundColor White
+    Write-Host "  8) Open logs folder" -ForegroundColor White
     Write-Host "  Q) Quit" -ForegroundColor White
     Write-Host ""
 }
@@ -1433,72 +1712,7 @@ function Show-CaddyConfig {
     } while ($sub -notmatch '^[Bb]$')
 }
 
-function Show-NetworkConfig {
-    param($Config)
-    do {
-        # Ensure LocalUrl default if never set
-        $localUrl = $Config.LocalUrl
-        if ([string]::IsNullOrWhiteSpace($localUrl)) {
-            $localUrl = "http://localhost:$($Config.CaddyPort)"
-        }
 
-        Write-Host ""
-        Write-Host "============================================" -ForegroundColor Cyan
-        Write-Host " Network & Port Configuration" -ForegroundColor Cyan
-        Write-Host "============================================" -ForegroundColor Cyan
-        Write-Host ""
-        Write-Host " Current URLs:" -ForegroundColor White
-        Write-Host "   Public URL    : $($Config.PublicUrl)" -ForegroundColor Gray
-        Write-Host "   Local URL     : $localUrl" -ForegroundColor Gray
-        Write-Host ""
-        Write-Host " 1) Public URL" -ForegroundColor Gray
-        Write-Host " 2) Local URL" -ForegroundColor Gray
-        Write-Host " B) Back to main menu" -ForegroundColor Gray
-        Write-Host ""
-        $sub = Read-Host "Select option"
-        switch ($sub) {
-            "1" {
-                # Public URL submenu - delegate to existing function
-                Select-PublicUrl -Config $Config | Out-Null
-            }
-            "2" {
-                # Local URL submenu
-                do {
-                    Write-Host ""
-                    Write-Host "============================================" -ForegroundColor Cyan
-                    Write-Host " Local URL" -ForegroundColor Cyan
-                    Write-Host "============================================" -ForegroundColor Cyan
-                    Write-Host " The URL used for local network access." -ForegroundColor Gray
-                    Write-Host " Current: $localUrl" -ForegroundColor Gray
-                    Write-Host ""
-                    Write-Host " 1) Change URL" -ForegroundColor Gray
-                    Write-Host " 2) Exit" -ForegroundColor Gray
-                    Write-Host ""
-                    $opt = Read-Host "Select option"
-                    switch ($opt) {
-                        "1" {
-                            $newUrl = Read-Host "Enter local URL (e.g. http://192.168.1.100:$($Config.CaddyPort))"
-                            if ($newUrl) {
-                                if ($newUrl -match '^https?://') {
-                                    $Config.LocalUrl = $newUrl
-                                    $localUrl = $newUrl
-                                    Save-DeployConfig -Config $Config
-                                    Write-Success "Local URL updated to: $newUrl"
-                                } else {
-                                    Write-Err "Enter a URL starting with http:// or https://"
-                                }
-                            }
-                        }
-                        "2" { break }
-                        default { Write-Warn "Unknown option." }
-                    }
-                } while ($opt -ne "2")
-            }
-            "[Bb]" { break }
-            default { Write-Warn "Unknown option." }
-        }
-    } while ($sub -notmatch '^[Bb]$')
-}
 
 function Select-Component {
     param([string]$ActionLabel)
@@ -1550,6 +1764,7 @@ do {
     switch -Regex ($choice) {
         "^1$" {
             # Check prerequisites
+            Initialize-Logger -Config $Config
             Test-Prerequisites | Out-Null
         }
         "^2$" {
@@ -1569,7 +1784,7 @@ do {
                     Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor DarkGray
                 }
             }
-            Write-Host " B) Back" -ForegroundColor Gray
+            Write-Host "  B) Back" -ForegroundColor Gray
             $sub = Read-Host "`nSelect to install"
             if ($sub -match '^[Aa]$') {
                 Invoke-FullDeploy -Config $Config
@@ -1651,10 +1866,12 @@ do {
         }
         "^4$" {
             # Service status / health check
+            Initialize-Logger -Config $Config
             Show-Status -Config $Config
         }
         "^5$" {
             # Start services - sub-prompt
+            Initialize-Logger -Config $Config
             Write-Host ""
             Write-Host " A) Start all services" -ForegroundColor White
             foreach ($c in Get-Components) {
@@ -1680,17 +1897,21 @@ do {
                     $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
                     if (-not $svc) {
                         Write-Warn "$($c.Display) is not installed."
+                        Write-Log "Start failed: $($c.Display) not installed" -Level "WARN"
                     } elseif ($svc.Status -eq 'Running') {
                         Write-Warn "$($c.Display) is already running."
+                        Write-Log "Start skipped: $($c.Display) already running" -Level "INFO"
                     } else {
                         Start-Service -Name $c.Service -ErrorAction Stop
                         Write-Success "Started $($c.Display)"
+                        Write-Log "Started $($c.Display)"
                     }
                 }
             }
         }
         "^6$" {
             # Stop services - sub-prompt
+            Initialize-Logger -Config $Config
             Write-Host ""
             Write-Host " A) Stop all services" -ForegroundColor White
             foreach ($c in Get-Components) {
@@ -1716,21 +1937,24 @@ do {
                     $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
                     if (-not $svc) {
                         Write-Warn "$($c.Display) is not installed."
+                        Write-Log "Stop failed: $($c.Display) not installed" -Level "WARN"
                     } elseif ($svc.Status -ne 'Running') {
                         Write-Warn "$($c.Display) is already stopped."
+                        Write-Log "Stop skipped: $($c.Display) already stopped" -Level "INFO"
                     } else {
                         Stop-Service -Name $c.Service -ErrorAction Stop
                         Write-Success "Stopped $($c.Display)"
+                        Write-Log "Stopped $($c.Display)"
                     }
                 }
             }
         }
-        "^7$" { Show-CaddyConfig -Config $Config }
-        "^8$" {
-            # Network & URL configuration
-            Show-NetworkConfig -Config $Config
+        "^7$" {
+            # Caddy network config
+            Initialize-Logger -Config $Config
+            Show-CaddyConfig -Config $Config
         }
-        "^9$" {
+        "^8$" {
             # Open logs folder
             $logsPath = Join-Path $Config.InstallRoot "logs"
             if (Test-Path $logsPath) { Invoke-Item $logsPath } else { Write-Warn "No logs folder yet." }
