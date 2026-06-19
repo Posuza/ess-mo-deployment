@@ -514,46 +514,24 @@ function Invoke-SecretsPrompt {
     Write-Host " You can paste with Ctrl+V (right-click paste also works)." -ForegroundColor Cyan
     Write-Host ""
 
-    $placeholderPattern = 'REPLACE_WITH_|YOUR_|CHANGE_THIS|PLACEHOLDER'
-
     # --- DB section ---
     Write-Host " [Database]" -ForegroundColor Magenta
-    if ($Secrets.db.host -match $placeholderPattern) {
-        $Secrets.db.host = Read-WithDefault -Default "192.168.1.172" -Prompt "  DB host"
-    }
-    if ($Secrets.db.port -match $placeholderPattern) {
-        $val = Read-WithDefault -Default $Secrets.db.port -Prompt "  DB port"
-        $Secrets.db.port = [int]$val
-    }
-    if ($Secrets.db.name -match $placeholderPattern) {
-        $Secrets.db.name = Read-WithDefault -Default "ess" -Prompt "  DB name"
-    }
-    if ($Secrets.db.user -match $placeholderPattern) {
-        $Secrets.db.user = Read-WithDefault -Default "root" -Prompt "  DB user"
-    }
-    if ($Secrets.db.password -match $placeholderPattern) {
-        $Secrets.db.password = Read-WithDefault -Default "" -Prompt "  DB password" -Mask
-    }
+    $Secrets.db.host = Read-WithDefault -Default $Secrets.db.host -Prompt "  DB host"
+    $val = Read-WithDefault -Default $Secrets.db.port -Prompt "  DB port"
+    $Secrets.db.port = [int]$val
+    $Secrets.db.name = Read-WithDefault -Default $Secrets.db.name -Prompt "  DB name"
+    $Secrets.db.user = Read-WithDefault -Default $Secrets.db.user -Prompt "  DB user"
+    $Secrets.db.password = Read-WithDefault -Default $Secrets.db.password -Prompt "  DB password" -Mask
 
     # --- SMTP section ---
     Write-Host ""
     Write-Host " [SMTP]" -ForegroundColor Magenta
-    if ($Secrets.smtp.host -match $placeholderPattern) {
-        $Secrets.smtp.host = Read-WithDefault -Default "smtp.gmail.com" -Prompt "  SMTP host"
-    }
-    if ($Secrets.smtp.port -match $placeholderPattern) {
-        $val = Read-WithDefault -Default $Secrets.smtp.port -Prompt "  SMTP port"
-        $Secrets.smtp.port = [int]$val
-    }
-    if ($Secrets.smtp.user -match $placeholderPattern) {
-        $Secrets.smtp.user = Read-WithDefault -Default "" -Prompt "  SMTP user"
-    }
-    if ($Secrets.smtp.pass -match $placeholderPattern) {
-        $Secrets.smtp.pass = Read-WithDefault -Default "" -Prompt "  SMTP app pass" -Mask
-    }
-    if ($Secrets.smtp.from -match $placeholderPattern) {
-        $Secrets.smtp.from = Read-WithDefault -Default "" -Prompt "  SMTP from"
-    }
+    $Secrets.smtp.host = Read-WithDefault -Default $Secrets.smtp.host -Prompt "  SMTP host"
+    $val = Read-WithDefault -Default $Secrets.smtp.port -Prompt "  SMTP port"
+    $Secrets.smtp.port = [int]$val
+    $Secrets.smtp.user = Read-WithDefault -Default $Secrets.smtp.user -Prompt "  SMTP user"
+    $Secrets.smtp.pass = Read-WithDefault -Default $Secrets.smtp.pass -Prompt "  SMTP app pass" -Mask
+    $Secrets.smtp.from = Read-WithDefault -Default $Secrets.smtp.from -Prompt "  SMTP from"
 
     # Save back to JSON
     $json = $Secrets | ConvertTo-Json -Depth 4
