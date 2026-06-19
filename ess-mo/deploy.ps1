@@ -958,7 +958,7 @@ function Install-Frontend {
     $curLink  = Join-Path $webRoot "current"
     $svcName  = "ess-mo-frontend"
     $appPort  = $Config.FrontendPort
-    $logsDir  = Join-Path $Config.InstallRoot "logs" "frontend"
+    $logsDir  = Join-Path (Join-Path $Config.InstallRoot "logs") "frontend"
 
     # Track whether we've swapped, for auto-rollback on failure
     $swapped = $false
@@ -1081,7 +1081,7 @@ function Install-Backend {
         return $true
     }
 
-    $logsDir  = Join-Path $Config.InstallRoot "logs" "backend"
+    $logsDir  = Join-Path (Join-Path $Config.InstallRoot "logs") "backend"
     $appDir   = Join-Path $Config.InstallRoot "backend"
     $repoDir  = Join-Path $appDir "repo"
     $svcName  = "ess-mo-backend"
@@ -1208,7 +1208,7 @@ function Install-Caddy {
     }
 
     try {
-        $logsDir = Join-Path $Config.InstallRoot "logs" "caddy"
+        $logsDir = Join-Path (Join-Path $Config.InstallRoot "logs") "caddy"
         $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
         $caddyInstallLog = Join-Path $logsDir "caddy_install_${ts}.log"
 
@@ -1320,7 +1320,7 @@ function Install-Caddy {
 $caddyDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $caddyExe = Join-Path $caddyDir "caddy.exe"
 $caddyfile = Join-Path $caddyDir "Caddyfile"
-$logsDir   = Join-Path (Split-Path $caddyDir -Parent) "logs" "caddy"
+$logsDir   = Join-Path (Join-Path (Split-Path $caddyDir -Parent) "logs") "caddy"
 if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
 
 $svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
@@ -1787,7 +1787,7 @@ function Remove-Component {
                 Write-FileLog -Path $uninstallLog -Text "OK: Deleted $path"
             }
             # Also remove this component's log subfolder
-            $logSubDir = Join-Path $Config.InstallRoot "logs" $Key
+            $logSubDir = Join-Path (Join-Path $Config.InstallRoot "logs") $Key
             if (Test-Path $logSubDir) {
                 Remove-Item -Path $logSubDir -Recurse -Force -ErrorAction SilentlyContinue 2>&1 | Add-FileLog -Path $uninstallLog
                 Write-Success "Deleted logs for $Key"
@@ -2271,7 +2271,7 @@ function Show-CaddyConfig {
 $caddyDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $caddyExe = Join-Path $caddyDir "caddy.exe"
 $caddyfile = Join-Path $caddyDir "Caddyfile"
-$logsDir   = Join-Path (Split-Path $caddyDir -Parent) "logs" "caddy"
+$logsDir   = Join-Path (Join-Path (Split-Path $caddyDir -Parent) "logs") "caddy"
 if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
 
 $svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
