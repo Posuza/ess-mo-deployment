@@ -1,6 +1,6 @@
 # Servy Full-Stack Deployment Manager
 
-Automates installing the **ESS MO** app (Vue frontend + FastAPI backend + Caddy reverse proxy + Cloudflare tunnel) as Windows services via [Servy](https://github.com/servy-community/servy).
+Automates installing the **ESS MO** app (Vue frontend + FastAPI backend + Caddy reverse proxy) as Windows services via [Servy](https://github.com/servy-community/servy).
 
 ---
 
@@ -9,6 +9,8 @@ Automates installing the **ESS MO** app (Vue frontend + FastAPI backend + Caddy 
 Edit these **before** your first deploy if your setup differs from the defaults.
 
 ### `deploy.config.json` — settings (ports, paths, repos)
+
+### `deploy.secrtes.json` — settings (credentials)
 
 Created automatically on first run. Edit it to change:
 
@@ -21,11 +23,8 @@ Created automatically on first run. Edit it to change:
 | `FrontendPort` | `3009` | Port the frontend serves on | ✅ Change if needed |
 | `BackendPort` | `8009` | Port the backend API runs on | ✅ Change if needed |
 | `CaddyPort` | `8089` | Port the reverse proxy listens on | ✅ Change if needed |
-| `PublicUrl` | `http://localhost:8089` | External URL users access the app at | ✅ Set to your domain, IP, or Cloudflare tunnel URL |
-| `LocalUrl` | `http://localhost:8089` | Local network URL for internal access | ✅ Set to your local server IP/hostname |
 | `ApiPrefix` | `/api/v1` | API path prefix | ✅ Any prefix starting with `/` (e.g. `/api`, `/v2`) |
 | `InstallRoot` | *(set at startup)* | Where files get installed (e.g. `C:\Ess_Mo`) | ✅ Set at startup or edit in config |
-| `TunnelTarget` | `caddy` | What Cloudflare exposes (`caddy` / `frontend` / `backend` / `custom`) | ✅ Change via option 8 menu |
 
 ### `deploy.secrets.json` — credentials (DB, SMTP)
 
@@ -44,7 +43,17 @@ Auto-gitignored. Copy `deploy.secrets.example.json` → `deploy.secrets.json` to
 
 ## 🚀 Step-by-step installation guide
 
-### 1. Run the script
+### 1. Prepare credentials
+
+Before running the script, make sure your DB and SMTP credentials are ready.
+You can either:
+
+- **Pre-fill** `deploy.secrets.json` with your real values (copy from `deploy.secrets.example.json`)
+- **Or let the script prompt you** — it will ask for credentials at the start of the deployment
+
+> The script never blocks — if you skip entering credentials, it uses defaults that you can update later.
+
+### 2. Run the script
 
 Open **PowerShell as Administrator** and run:
 
@@ -62,11 +71,11 @@ If execution policy blocks it:
 powershell -ExecutionPolicy Bypass -File "filepath\deploy.ps1"
 ```
 
-### 2. Set install location (first run only)
+### 3. Set install location (first run only)
 
 You'll be asked to pick a **drive** (e.g. `C:`, `D:`). The script creates `Ess_Mo` folder there (`C:\Ess_Mo`).
 
-### 3. Use the main menu
+### 4. Use the main menu
 
 ```
  1) Check prerequisites
@@ -76,8 +85,7 @@ You'll be asked to pick a **drive** (e.g. `C:`, `D:`). The script creates `Ess_M
  5) Start services
  6) Stop services
  7) Caddy network config
- 8) Public network config (Cloudflare / URL)
- 9) Open logs folder
+ 8) Open logs folder
  Q) Quit
 ```
 
@@ -94,48 +102,10 @@ The script will:
    - **Frontend** — clones repo, `npm install`, builds, registers as Windows service
    - **Backend** — clones repo, creates venv, `pip install`, generates `.env`, registers as service
    - **Caddy** — downloads Caddy, creates `Caddyfile`, registers as service
-   - **Cloudflare** — installs `cloudflared`, creates tunnel, registers as service
 4. Optionally start all services and verify health
 
 ---
-
-## 🌐 Setting up your public URL (after installation)
-
-Use **option 8** from the main menu to manage your network URLs:
-
-```
- Current URLs:
-   Public URL    : http://localhost:8089
-   Local URL     : http://localhost:8089
-   Cloudflare    : (not started)
-
- 1) Public URL
- 2) Local URL
- 3) Cloudflare tunnel
- B) Back
-```
-
-### Option 1 — Public URL
-
-This is the URL users type in their browser. You can set it to:
-
-- **Keep current** — use whatever is already set
-- **Use Cloudflare tunnel URL** — auto-detects the live tunnel URL (only appears if Cloudflare tunnel is running)
-- **Enter custom URL / domain** — type your own (e.g. `https://yourdomain.com`)
-
-> The backend `.env` file's `FRONTEND_URL` is updated automatically when you change the public URL.
-
-### Option 2 — Local URL
-
-For local network access (e.g. `http://192.168.1.100:8089`). Change it to your server's local IP or hostname.
-
-### Option 3 — Cloudflare tunnel
-
-Shows the auto-generated Cloudflare tunnel URL (e.g. `https://xxxx.trycloudflare.com`). Read-only — starts working once the Cloudflare service is running.
-
----
-
-## 🔧 Caddy routes (option 7)
+## 🔧 Caddy network config (option 7)
 
 Use **option 7** to manage which services Caddy proxies to:
 
@@ -166,14 +136,13 @@ Use **option 7** to manage which services Caddy proxies to:
 | Option | What it does |
 |--------|-------------|
 | **1** | Check & install prerequisites (Git, Node.js, Python) |
-| **2** | Install components — pick **A** (all), **1** (Frontend), **2** (Backend), **3** (Caddy), **4** (Cloudflare), or **B** (back) |
+| **2** | Install components — pick **A** (all), **1** (Frontend), **2** (Backend), **3** (Caddy), or **B** (back) |
 | **3** | Uninstall components — same submenu, with status indicators |
 | **4** | Show service status table + run health checks |
-| **5** | Start services — **A** (all), **1-4** (individual), **B** (back) |
+| **5** | Start services — **A** (all), **1-3** (individual), **B** (back) |
 | **6** | Stop services — same submenu |
 | **7** | Caddy proxy config — add/remove routes, change port |
-| **8** | Public network config — set Public URL, Local URL, view Cloudflare tunnel |
-| **9** | Open logs folder in File Explorer |
+| **8** | Open logs folder in File Explorer |
 | **Q** | Quit |
 
 ---
@@ -191,7 +160,7 @@ Use **option 7** to manage which services Caddy proxies to:
 .\deploy.ps1 -DryRun
 
 # Preview specific components
-.\deploy.ps1 -DryRun -Components caddy,cloudflare
+.\deploy.ps1 -DryRun -Components frontend,backend
 ```
 
 > Make sure `deploy.config.json` and `deploy.secrets.json` exist and are configured before running headless.
@@ -205,10 +174,8 @@ Use **option 7** to manage which services Caddy proxies to:
 | **Script won't run** | Use `powershell -ExecutionPolicy Bypass -File .\deploy.ps1` |
 | **Service won't uninstall** | Restart Windows, then re-run uninstall |
 | **Port conflict** | Change Caddy port in option 7 (option 3) or edit `deploy.config.json` |
-| **cloudflared missing** | Run: `winget install Cloudflare.cloudflared` or let prerequisites handle it |
 | **Frontend build fails** | Check `logs/frontend_build.log` in the install directory |
 | **Backend won't start** | Check `logs/backend_pip.log` and verify `.env` has correct DB credentials |
-| **No Cloudflare URL** | Start the Cloudflare service (option 5 → 4), then wait ~10 seconds for the tunnel to connect |
 | **Logs location** | `<InstallRoot>\logs\deploy-YYYYMMDD-HHmmss.log` |
 
 ---

@@ -57,8 +57,6 @@ $DefaultConfig = @{
     FrontendPort = 3009
     BackendPort  = 8009
     CaddyPort    = 8089
-    PublicUrl    = "http://localhost:8089"
-    LocalUrl     = "http://localhost:8089"
     ApiPrefix    = "/api/v1"
     InstallRoot  = $null
 }
@@ -264,7 +262,7 @@ function Get-DeployConfig {
     if (Test-Path $ConfigPath) {
         $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
         # Ensure all fields exist (may be missing from older config files)
-        @('InstallRoot', 'LocalUrl') | ForEach-Object {
+        @('InstallRoot') | ForEach-Object {
             if (-not ($cfg | Get-Member -Name $_ -ErrorAction SilentlyContinue)) {
                 Add-Member -InputObject $cfg -NotePropertyName $_ -NotePropertyValue $DefaultConfig[$_]
             }
@@ -456,68 +454,208 @@ function Protect-SecretsFile {
     }
 }
 
+function Get-SecretsDefaults {
+    <#
+    .SYNOPSIS
+      Returns a secrets object with sensible default/example values.
+      These let the install proceed without real credentials;
+      the user can update them later in deploy.secrets.json or the generated .env.
+    #>
+    Write-Log "Using default secrets (not production-ready)" -Level "WARN"
+    return [PSCustomObject]@{
+        db = [PSCustomObject]@{
+            host     = "192.168.1.172"
+            port     = 3306
+            name     = "ess"
+            user     = "root"
+            password = ""
+        }
+        smtp = [PSCustomObject]@{
+            host = "smtp.gmail.com"
+            port = 587
+            user = ""
+            pass = ""
+            from = ""
+        }
+    }
+}
+
+function Invoke-SecretsPrompt {
+    <#
+    .SYNOPSIS
+      Interactively prompt the user for each field in deploy.secrets.json.
+      Uses plain Read-Host (PSReadLine) so Ctrl+V paste and Ctrl+C work natively.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Secrets,
+        [Parameter(Mandatory)]
+        [string]$SecretsPath
+    )
+
+    function Read-WithDefault {
+        param([string]$Default, [string]$Prompt, [switch]$Mask)
+        $fullPrompt = "$Prompt [$Default]: "
+        if ($Mask) {
+            $raw = Read-Host -Prompt $fullPrompt -AsSecureString
+            if ($null -eq $raw -or $raw.Length -eq 0) { return $Default }
+            $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($raw)
+            $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+            return $plain
+        }
+        $input = Read-Host -Prompt $fullPrompt
+        if ([string]::IsNullOrWhiteSpace($input)) { return $Default }
+        return $input
+    }
+
+    Write-Host ""
+    Write-Host " Enter your credentials. Press Enter to keep the value in [brackets]." -ForegroundColor Cyan
+    Write-Host " You can paste with Ctrl+V (right-click paste also works)." -ForegroundColor Cyan
+    Write-Host ""
+
+    $placeholderPattern = 'REPLACE_WITH_|YOUR_|CHANGE_THIS|PLACEHOLDER'
+
+    # --- DB section ---
+    Write-Host " [Database]" -ForegroundColor Magenta
+    if ($Secrets.db.host -match $placeholderPattern) {
+        $Secrets.db.host = Read-WithDefault -Default "192.168.1.172" -Prompt "  DB host"
+    }
+    if ($Secrets.db.port -match $placeholderPattern) {
+        $val = Read-WithDefault -Default $Secrets.db.port -Prompt "  DB port"
+        $Secrets.db.port = [int]$val
+    }
+    if ($Secrets.db.name -match $placeholderPattern) {
+        $Secrets.db.name = Read-WithDefault -Default "ess" -Prompt "  DB name"
+    }
+    if ($Secrets.db.user -match $placeholderPattern) {
+        $Secrets.db.user = Read-WithDefault -Default "root" -Prompt "  DB user"
+    }
+    if ($Secrets.db.password -match $placeholderPattern) {
+        $Secrets.db.password = Read-WithDefault -Default "" -Prompt "  DB password" -Mask
+    }
+
+    # --- SMTP section ---
+    Write-Host ""
+    Write-Host " [SMTP]" -ForegroundColor Magenta
+    if ($Secrets.smtp.host -match $placeholderPattern) {
+        $Secrets.smtp.host = Read-WithDefault -Default "smtp.gmail.com" -Prompt "  SMTP host"
+    }
+    if ($Secrets.smtp.port -match $placeholderPattern) {
+        $val = Read-WithDefault -Default $Secrets.smtp.port -Prompt "  SMTP port"
+        $Secrets.smtp.port = [int]$val
+    }
+    if ($Secrets.smtp.user -match $placeholderPattern) {
+        $Secrets.smtp.user = Read-WithDefault -Default "" -Prompt "  SMTP user"
+    }
+    if ($Secrets.smtp.pass -match $placeholderPattern) {
+        $Secrets.smtp.pass = Read-WithDefault -Default "" -Prompt "  SMTP app pass" -Mask
+    }
+    if ($Secrets.smtp.from -match $placeholderPattern) {
+        $Secrets.smtp.from = Read-WithDefault -Default "" -Prompt "  SMTP from"
+    }
+
+    # Save back to JSON
+    $json = $Secrets | ConvertTo-Json -Depth 4
+    Set-Content -Path $SecretsPath -Value $json -Force
+    Write-Host ""
+    Write-Success "Credentials saved to $SecretsPath"
+    Write-Host ""
+
+    return $Secrets
+}
+
 function Get-SecretsOrInitialize {
     <#
     .SYNOPSIS
-      Load secrets from deploy.secrets.json, or show a template if missing.
-      Checks for REPLACE_WITH_* / YOUR_* placeholder values and warns if found.
-      No interactive prompts — user edits the JSON file directly.
+      Load secrets from deploy.secrets.json.
+      If missing or placeholders found, offers interactive fill.
+      If declined, creates/overwrites with defaults — install never blocks.
     #>
 
-    if (-not (Test-Path $SecretsPath)) {
-        Write-Host ""
-        Write-Host " [!] deploy.secrets.json not found." -ForegroundColor Yellow
-        Write-Host "     Create it with this structure:" -ForegroundColor Gray
-        Write-Host ""
-        Write-Host '  {' -ForegroundColor Cyan
-        Write-Host '    "db": {' -ForegroundColor Cyan
-        Write-Host '      "host": "192.168.1.172",' -ForegroundColor Cyan
-        Write-Host '      "port": 3306,' -ForegroundColor Cyan
-        Write-Host '      "name": "ess",' -ForegroundColor Cyan
-        Write-Host '      "user": "root",' -ForegroundColor Cyan
-        Write-Host '      "password": "YOUR_DB_PASSWORD"' -ForegroundColor Cyan
-        Write-Host '    },' -ForegroundColor Cyan
-        Write-Host '    "smtp": {' -ForegroundColor Cyan
-        Write-Host '      "host": "smtp.gmail.com",' -ForegroundColor Cyan
-        Write-Host '      "port": 587,' -ForegroundColor Cyan
-        Write-Host '      "user": "YOUR_EMAIL",' -ForegroundColor Cyan
-        Write-Host '      "pass": "YOUR_APP_PASSWORD",' -ForegroundColor Cyan
-        Write-Host '      "from": "YOUR_FROM_EMAIL"' -ForegroundColor Cyan
-        Write-Host '    }' -ForegroundColor Cyan
-        Write-Host '  }' -ForegroundColor Cyan
-        Write-Host ""
-        Write-Log "deploy.secrets.json missing — user must create it first" -Level "WARN"
-        return $null
+    $s = $null
+    if (Test-Path $SecretsPath) {
+        try {
+            $s = Get-Content $SecretsPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        } catch {
+            Write-Warn "Could not read $SecretsPath — will recreate."
+            Write-Log "Failed to read $SecretsPath : $_" -Level "WARN"
+            $s = $null
+        }
     }
-
-    # File exists — check for placeholder values
-    $s = Get-Content $SecretsPath -Raw -ErrorAction Stop | ConvertFrom-Json
 
     $placeholderPattern = 'REPLACE_WITH_|YOUR_|CHANGE_THIS|PLACEHOLDER'
-    $placeholders = @()
-    if ($s.db.host     -match $placeholderPattern) { $placeholders += '  db.host (e.g. "192.168.1.172")' }
-    if ($s.db.user     -match $placeholderPattern) { $placeholders += '  db.user (e.g. "root")' }
-    if ($s.db.name     -match $placeholderPattern) { $placeholders += '  db.name (e.g. "ess")' }
-    if ($s.db.password -match $placeholderPattern) { $placeholders += '  db.password (your MySQL password)' }
-    if ($s.smtp.user   -match $placeholderPattern) { $placeholders += '  smtp.user (your email)' }
-    if ($s.smtp.pass   -match $placeholderPattern) { $placeholders += '  smtp.pass (app password)' }
-    if ($s.smtp.from   -match $placeholderPattern) { $placeholders += '  smtp.from (from address)' }
 
-    if ($placeholders.Count -gt 0) {
-        Write-Host ""
-        Write-Host " [!] deploy.secrets.json still has placeholder values:" -ForegroundColor Yellow
-        foreach ($p in $placeholders) {
-            Write-Host "    $p" -ForegroundColor Yellow
+    if ($s) {
+        # File exists — check for placeholder values
+        $placeholders = @()
+        if ($s.db.host     -match $placeholderPattern) { $placeholders += '  db.host (e.g. "192.168.1.172")' }
+        if ($s.db.user     -match $placeholderPattern) { $placeholders += '  db.user (e.g. "root")' }
+        if ($s.db.name     -match $placeholderPattern) { $placeholders += '  db.name (e.g. "ess")' }
+        if ($s.db.password -match $placeholderPattern) { $placeholders += '  db.password (your MySQL password)' }
+        if ($s.smtp.user   -match $placeholderPattern) { $placeholders += '  smtp.user (your email)' }
+        if ($s.smtp.pass   -match $placeholderPattern) { $placeholders += '  smtp.pass (app password)' }
+        if ($s.smtp.from   -match $placeholderPattern) { $placeholders += '  smtp.from (from address)' }
+
+        if ($placeholders.Count -gt 0) {
+            Write-Host ""
+            Write-Host " [!] deploy.secrets.json has placeholder values:" -ForegroundColor Yellow
+            foreach ($p in $placeholders) {
+                Write-Host "    $p" -ForegroundColor Yellow
+            }
+            Write-Host ""
+
+            if (-not $script:headless) {
+                if (Confirm-Step "Enter your credentials now?" -DefaultYes:$true) {
+                    try {
+                        $s = Invoke-SecretsPrompt -Secrets $s -SecretsPath $SecretsPath
+                        Write-Log "Secrets updated interactively by user"
+                        Write-Host ""
+                        return $s
+                    } catch {
+                        Write-Warn "Interactive prompt failed: $_"
+                        Write-Log "Interactive secrets prompt failed: $_" -Level "WARN"
+                    }
+                }
+            }
+
+            # Fall back to defaults
+            Write-Warn "Using default credentials — the backend may not connect until you update:"
+            Write-Host "     $SecretsPath" -ForegroundColor Cyan
+            Write-Host "     (or edit the .env file in the install folder after deployment)" -ForegroundColor Gray
+            Write-Host ""
+            $s = Get-SecretsDefaults
+            $json = $s | ConvertTo-Json -Depth 4
+            Set-Content -Path $SecretsPath -Value $json -Force
+            Protect-SecretsFile
+            Write-Log "Secrets initialized with defaults" -Level "WARN"
+            return $s
         }
-        Write-Host ""
-        Write-Host "     Open this file and replace them with your real credentials:" -ForegroundColor Gray
-        Write-Host "     $SecretsPath" -ForegroundColor Cyan
-        Write-Host ""
-        Write-Log "deploy.secrets.json has $($placeholders.Count) placeholder(s) — user must edit first" -Level "WARN"
-        return $null
+
+        # All values are real — happy path
+        Write-Log "Secrets loaded from $SecretsPath"
+        return $s
     }
 
-    Write-Log "Secrets loaded from $SecretsPath"
+    # --- File missing entirely ---
+    if (-not $script:headless) {
+        Write-Host ""
+        Write-Host " [!] deploy.secrets.json not found." -ForegroundColor Yellow
+        if (Confirm-Step "Create it with default values now?" -DefaultYes:$true) {
+            $s = Invoke-SecretsPrompt -Secrets (Get-SecretsDefaults) -SecretsPath $SecretsPath
+            Write-Log "Secrets created interactively by user"
+            Write-Host ""
+            return $s
+        }
+    } else {
+        Write-Warn "deploy.secrets.json not found — creating with defaults."
+    }
+
+    $s = Get-SecretsDefaults
+    $json = $s | ConvertTo-Json -Depth 4
+    Set-Content -Path $SecretsPath -Value $json -Force
+    Protect-SecretsFile
+    Write-Log "Secrets created with defaults" -Level "WARN"
     return $s
 }
 
@@ -815,7 +953,7 @@ function Install-Frontend {
 
         $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$serviceLog`" & cd /d $appDir && npx serve -s `"$curLink`" -l $appPort >> `"$serviceLog`" 2>&1`"`""
 
-        servy-cli uninstall --name="$svcName" --silent 2>&1 | Out-Null
+        servy-cli uninstall --name="$svcName" --quiet 2>&1 | Out-Null
         servy-cli install --name="$svcName" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
 
         if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
@@ -962,7 +1100,7 @@ EMAIL_FROM="$envSmtpFrom"
 
         $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$serviceLog`" & cd /d $repoDir && $pythonExe -m uvicorn app.main:app --host 0.0.0.0 --port $appPort >> `"$serviceLog`" 2>&1`"`""
 
-        servy-cli uninstall --name="$svcName" --silent 2>&1 | Out-Null
+        servy-cli uninstall --name="$svcName" --quiet 2>&1 | Out-Null
         servy-cli install --name="$svcName" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
 
         if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
@@ -1049,7 +1187,7 @@ function Install-Caddy {
         # Wrap in cmd.exe to capture stdout/stderr (consistent with frontend/backend)
         $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$caddyLog`" & cd /d $caddyDir && `"$caddyExe`" run --config `"$caddyfilePath`" >> `"$caddyLog`" 2>&1`"`""
 
-        servy-cli uninstall --name="ess-mo-caddy" --silent 2>&1 | Out-Null
+        servy-cli uninstall --name="ess-mo-caddy" --quiet 2>&1 | Out-Null
         servy-cli install --name="ess-mo-caddy" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
 
         if (-not (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue)) {
@@ -1183,12 +1321,8 @@ function Invoke-ComponentInstall {
     switch ($Key) {
         "frontend"   { $result = Install-Frontend -Config $Config }
         "backend"    {
+            Write-Step "Checking deployment credentials"
             $secrets = Get-SecretsOrInitialize
-            if (-not $secrets) {
-                Write-Warn "Backend install postponed — edit deploy.secrets.json first."
-                Write-Log "Backend install skipped: deploy.secrets.json needs editing" -Level "WARN"
-                return $false
-            }
             $result = Install-Backend -Config $Config -Secrets $secrets
         }
         "caddy"      { $result = Install-Caddy -Config $Config }
@@ -1213,7 +1347,7 @@ function Remove-Component {
 
     if (-not $script:dryRun) {
         Stop-Service -Name $svcName -ErrorAction SilentlyContinue 2>&1 | Add-FileLog -Path $uninstallLog
-        servy-cli uninstall --name="$svcName" --silent 2>&1 | Add-FileLog -Path $uninstallLog
+        servy-cli uninstall --name="$svcName" --quiet 2>&1 | Add-FileLog -Path $uninstallLog
         Start-Sleep -Milliseconds 500
 
         if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
@@ -1350,6 +1484,14 @@ function Invoke-FullDeploy {
     }
     $allSucceeded = $true
 
+    # Resolve secrets upfront (skip if backend not in the list)
+    $secrets = $null
+    if ($targetComponents -contains "backend") {
+        Write-Step "Checking deployment credentials"
+        $secrets = Get-SecretsOrInitialize
+        if (-not $script:headless) { Read-Host "`nPress Enter to continue" | Out-Null }
+    }
+
     if ($targetComponents -contains "frontend") {
         if (Confirm-Step "Install Frontend (port $($Config.FrontendPort))?") {
             Start-Spinner "Installing Frontend ..."
@@ -1368,22 +1510,15 @@ function Invoke-FullDeploy {
 
     if ($targetComponents -contains "backend") {
         if (Confirm-Step "Install Backend (port $($Config.BackendPort))?") {
-            $secrets = Get-SecretsOrInitialize
-            if (-not $secrets) {
-                Write-Warn "Backend install postponed — edit deploy.secrets.json first."
-                Write-Log "Backend install skipped: deploy.secrets.json needs editing" -Level "WARN"
-                $allSucceeded = $false
+            Start-Spinner "Installing Backend ..."
+            $backendOk = Install-Backend -Config $Config -Secrets $secrets
+            Stop-Spinner
+            if ($backendOk) {
+                Write-Success "Backend installed successfully on port $($Config.BackendPort)"
+                Write-Log "Backend installed successfully on port $($Config.BackendPort)"
             } else {
-                Start-Spinner "Installing Backend ..."
-                $backendOk = Install-Backend -Config $Config -Secrets $secrets
-                Stop-Spinner
-                if ($backendOk) {
-                    Write-Success "Backend installed successfully on port $($Config.BackendPort)"
-                    Write-Log "Backend installed successfully on port $($Config.BackendPort)"
-                } else {
-                    Write-Err "Backend installation FAILED - check logs for details"
-                    $allSucceeded = $false
-                }
+                Write-Err "Backend installation FAILED - check logs for details"
+                $allSucceeded = $false
             }
         } else { Write-Warn "Skipped Backend." }
         if (-not $script:headless) { Read-Host "`nPress Enter to continue" | Out-Null }
@@ -1391,8 +1526,6 @@ function Invoke-FullDeploy {
 
     if ($targetComponents -contains "caddy") {
         if (Confirm-Step "Install Caddy reverse proxy (port $($Config.CaddyPort))?") {
-            # Prompt for Caddy port right before installing
-            Select-CaddyPort -Config $Config | Out-Null
             Start-Spinner "Installing Caddy ..."
             $caddyOk = Install-Caddy -Config $Config
             Stop-Spinner
@@ -1413,39 +1546,6 @@ function Invoke-FullDeploy {
             Invoke-Rollback -Config $Config
             Write-Log "Deployment rolled back due to failures" -Level "ERROR"
             return
-        }
-    }
-
-    # IIS warning - port 80 conflicts with Windows web server
-    if ($targetComponents -contains "caddy") {
-        if ($Config.CaddyPort -eq 80) {
-            Write-Host "    [!] Port 80 is used by IIS (Windows web server)." -ForegroundColor Yellow
-            if ($script:headless) {
-                Write-Warn "[HEADLESS] Port 80 conflicts with IIS. Set CaddyPort in config to a different value."
-                Write-Log "Port 80 conflict with IIS in headless mode" -Level "WARN"
-            } elseif (Confirm-Step "Stop IIS to free port 80?") {
-                if ($script:dryRun) {
-                    Write-Warn "[DRY-RUN] Would stop IIS (W3SVC) and set startup to Disabled"
-                } else {
-                    Stop-Service -Name W3SVC -ErrorAction SilentlyContinue
-                    Set-Service  -Name W3SVC -StartupType Disabled -ErrorAction SilentlyContinue
-                    Write-Log "IIS (W3SVC) stopped and disabled"
-                }
-            } else {
-                # User declined to stop IIS - offer alternative port
-                $newPort = Read-Host "Enter a different port for Caddy (e.g. 8080, 443, 8443)"
-                if ($newPort -match '^\d+$') {
-                    $Config.CaddyPort = [int]$newPort
-                    Write-Success "Caddy port changed to $($Config.CaddyPort)"
-                    Write-Log "Caddy port changed to $($Config.CaddyPort) to avoid IIS conflict"
-                } else {
-                    Write-Warn "Invalid port. Caddy will attempt port 80 anyway - may conflict with IIS."
-                    Write-Log "Invalid port entered for Caddy - keeping port 80" -Level "WARN"
-                }
-            }
-        } else {
-            Write-Host "    [i] Caddy uses port $($Config.CaddyPort) - no IIS conflict." -ForegroundColor Gray
-            Write-Log "Caddy port $($Config.CaddyPort) - IIS not affected"
         }
     }
 
