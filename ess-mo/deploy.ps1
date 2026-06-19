@@ -1284,11 +1284,10 @@ $caddyLog = Join-Path $logsDir "caddy_service_${svcTs}.log"
 function Test-PortInUse {
     param([int]$Port)
     try {
-        $conn = [System.Net.Sockets.TcpClient]::new()
-        $conn.ConnectAsync("127.0.0.1", $Port).Wait(1000)
-        if ($conn.Connected) { $conn.Close(); return $true }
-        return $false
-    } catch { return $false }
+        $connections = netstat -an | Select-String "TCP.*:$Port\s"
+        if ($connections) { return $true }
+    } catch { }
+    return $false
 }
 
 "========== Service started at $(Get-Date) ==========" | Out-File -FilePath $caddyLog -Encoding ASCII
@@ -1297,7 +1296,7 @@ function Test-PortInUse {
 $adminPort = 2019
 while ($adminPort -le 2099) {
     if (-not (Test-PortInUse -Port $adminPort)) { break }
-    "    Admin port $adminPort → IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
+    "    Admin port $adminPort -> IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
     $adminPort++
 }
 if ($adminPort -gt 2099) {
@@ -1312,7 +1311,7 @@ $proxyPort = __DEFAULT_PROXY_PORT__
 $proxyMax = $proxyPort + 99
 while ($proxyPort -le $proxyMax) {
     if (-not (Test-PortInUse -Port $proxyPort)) { break }
-    "    Proxy port $proxyPort → IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
+    "    Proxy port $proxyPort -> IN USE (scanning up)" | Out-File -FilePath $caddyLog -Append
     $proxyPort++
 }
 if ($proxyPort -gt $proxyMax) {
