@@ -804,8 +804,8 @@ function Install-Frontend {
         if (Test-Path $curLink) { Remove-Item $curLink -Force }
         New-Item -ItemType SymbolicLink -Path $curLink -Target $releaseDir -Force | Out-Null
         $swapped = $true
-        Write-Success "Symlink swapped: current \u2192 $ts"
-        Write-FileLog -Path $installLog -Text "Symlink: $curLink \u2192 $releaseDir"
+        Write-Success "Symlink swapped: current → $ts"
+        Write-FileLog -Path $installLog -Text "Symlink: $curLink → $releaseDir"
 
         # --- 7. Create / update service (timestamped service log) ---
         $svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
@@ -1095,7 +1095,7 @@ function Show-ReleaseHistory {
     Write-Host "=== $AppName Release History ($($releases.Count) total) ===" -ForegroundColor Cyan
     Write-Host ""
     foreach ($r in $releases) {
-        $marker = if ($currentTarget -and $r.FullName -eq $currentTarget) { "  \u2190 CURRENT" } else { "" }
+        $marker = if ($currentTarget -and $r.FullName -eq $currentTarget) { "  ← CURRENT" } else { "" }
         $color = if ($marker) { 'Green' } else { 'Gray' }
         Write-Host "  $($r.Name)$marker" -ForegroundColor $color
     }
@@ -1133,7 +1133,7 @@ function Invoke-RollbackApp {
         return $false
     }
 
-    Write-Step "Rolling back $AppName: $($(Split-Path $currentTarget -Leaf)) \u2192 $($targetRelease.Name)"
+    Write-Step "Rolling back ${AppName}: $($(Split-Path $currentTarget -Leaf)) \u2192 $($targetRelease.Name)"
 
     if ($script:dryRun) {
         Write-Warn "[DRY-RUN] Would swap symlink back to $($targetRelease.Name)"
