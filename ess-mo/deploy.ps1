@@ -56,7 +56,7 @@ $DefaultConfig = @{
     BackendRepo  = "https://github.com/Posuza/ESS_MO_Backend.git"
     FrontendPort = 3009
     BackendPort  = 8009
-    CaddyPort    = 8089
+    CaddyPort    = 9089
     ApiPrefix    = "/api/v1"
     InstallRoot  = $null
 }
@@ -262,7 +262,7 @@ function Get-DeployConfig {
     if (Test-Path $ConfigPath) {
         $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
         # Ensure all fields exist (may be missing from older config files)
-        @('InstallRoot') | ForEach-Object {
+        @('InstallRoot', 'CaddyPort', 'FrontendPort', 'BackendPort') | ForEach-Object {
             if (-not ($cfg | Get-Member -Name $_ -ErrorAction SilentlyContinue)) {
                 Add-Member -InputObject $cfg -NotePropertyName $_ -NotePropertyValue $DefaultConfig[$_]
             }
@@ -371,7 +371,7 @@ function Select-CaddyPort {
     if ($script:headless) {
         # Headless: use whatever is in config or default
         if (-not $Config.CaddyPort -or $Config.CaddyPort -eq 0) {
-            $Config.CaddyPort = 8089
+            $Config.CaddyPort = 9089
         }
         return $Config.CaddyPort
     }
@@ -396,7 +396,7 @@ function Select-CaddyPort {
         }
     }
 
-    $defaultPort = if ($hasCurrent) { $Config.CaddyPort } else { 8089 }
+    $defaultPort = if ($hasCurrent) { $Config.CaddyPort } else { 9089 }
     $valid = $false
     do {
         $prompt = "Enter new Caddy port [$defaultPort]"
@@ -828,6 +828,24 @@ function Test-Prerequisites {
 }
 
 # ===========================================================
+# PORT AVAILABILITY CHECK
+# ===========================================================
+function Test-PortInUse {
+    param([int]$Port)
+    # Returns $true if the port is already bound (TCP) on any interface
+    try {
+        $connections = netstat -an | Select-String "TCP.*:$Port\s"
+        if ($connections) {
+            return $true
+        }
+    } catch {
+        # netstat might not be available, skip check
+        Write-Log "Could not check port $Port availability: $_" -Level "WARN"
+    }
+    return $false
+}
+
+# ===========================================================
 # HEALTH VERIFICATION
 # ===========================================================
 function Test-Endpoint {
@@ -1137,6 +1155,113 @@ function Install-Caddy {
         $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
         $caddyInstallLog = Join-Path $logsDir "caddy_install_${ts}.log"
 
+        Write-Host "    Target port: $($Config.CaddyPort)" -ForegroundColor Gray
+        Write-Host "    Install log: $caddyInstallLog" -ForegroundColor Gray
+        Write-FileLog -Path $caddyInstallLog -Text "========== Caddy install started =========="
+        Write-FileLog -Path $caddyInstallLog -Text "Target port: $($Config.CaddyPort)"
+        Write-FileLog -Path $caddyInstallLog -Text "Timestamp: $ts"
+
+        # ---- Port availability checks ----
+        # Caddy's admin API always listens on localhost:2019 by default.
+        # If another Caddy instance (from a different deployment) already holds :2019,
+        # our Caddy will fail to start. We detect this and auto-assign a unique admin port.
+        $caddyAdminPort = 2019
+        $caddyAdminEnv = $null  # set to "CADDY_ADMIN=..." if we need a custom port
+
+        Write-Host "    Admin API port scan:" -ForegroundColor Gray
+        Write-FileLog -Path $caddyInstallLog -Text "--- Admin port scan ---"
+
+        if (Test-PortInUse -Port $caddyAdminPort) {
+            # Identify which process holds port 2019
+            $ownerProcess = $null
+            $ownerPid = $null
+            try {
+                $connRow = netstat -ano | Select-String "TCP.*:$caddyAdminPort\s" | Select-Object -First 1
+                if ($connRow) {
+                    $parts = $connRow -split '\s+' | Where-Object { $_ -ne '' }
+                    $ownerPid = $parts[-1]
+                    $ownerProcess = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+                }
+            } catch { }
+
+            $ownerLabel = if ($ownerProcess) { "$($ownerProcess.ProcessName) (PID $ownerPid)" } else { "PID $ownerPid (unknown)" }
+
+            if ($ownerProcess -and $ownerProcess.ProcessName -match '(?i)^caddy') {
+                # Another Caddy instance holds port 2019 - scan upward for a free port
+                Write-Host "      $caddyAdminPort → IN USE (by $ownerLabel)" -ForegroundColor Red
+                Write-FileLog -Path $caddyInstallLog -Text "$caddyAdminPort: IN USE by $ownerLabel"
+
+                $scanStart = $caddyAdminPort + 1
+                $caddyAdminPort = $scanStart
+                while ($caddyAdminPort -le 2099) {
+                    if (Test-PortInUse -Port $caddyAdminPort) {
+                        # Show who holds this port too
+                        $scanOwner = $null
+                        $scanPid = $null
+                        try {
+                            $scanRow = netstat -ano | Select-String "TCP.*:$($caddyAdminPort)\s" | Select-Object -First 1
+                            if ($scanRow) {
+                                $scanParts = $scanRow -split '\s+' | Where-Object { $_ -ne '' }
+                                $scanPid = $scanParts[-1]
+                                $scanOwner = Get-Process -Id $scanPid -ErrorAction SilentlyContinue
+                            }
+                        } catch { }
+                        $scanLabel = if ($scanOwner) { "by $($scanOwner.ProcessName) (PID $scanPid)" } else { "by PID $scanPid (unknown)" }
+                        Write-Host "      $caddyAdminPort → IN USE ($scanLabel)" -ForegroundColor Red
+                        Write-FileLog -Path $caddyInstallLog -Text "$caddyAdminPort: IN USE $scanLabel"
+                        $caddyAdminPort++
+                    } else {
+                        Write-Host "      $caddyAdminPort → FREE" -ForegroundColor Green
+                        Write-FileLog -Path $caddyInstallLog -Text "$caddyAdminPort: FREE"
+                        break
+                    }
+                }
+
+                # If we exhausted the scan range without finding a free port, error out
+                if ($caddyAdminPort -gt 2099) {
+                    throw "No free admin port found in range 2020-2099. All ports are in use."
+                }
+
+                $caddyAdminEnv = "set CADDY_ADMIN=127.0.0.1:$caddyAdminPort && "
+                Write-Host "    Selected: $caddyAdminPort" -ForegroundColor Yellow
+                Write-FileLog -Path $caddyInstallLog -Text "Selected admin port: $caddyAdminPort"
+            } else {
+                # Non-Caddy process holds port 2019 - we cannot work around it
+                Write-Host "      $caddyAdminPort → IN USE (by $ownerLabel)" -ForegroundColor Red
+                Write-FileLog -Path $caddyInstallLog -Text "$caddyAdminPort: IN USE by $ownerLabel (not Caddy)"
+                $msg = "Port $caddyAdminPort (Caddy admin API) is held by $ownerLabel. Caddy cannot start until this is resolved."
+                Write-Err $msg
+                Write-FileLog -Path $caddyInstallLog -Text "ERROR: $msg"
+            }
+        } else {
+            Write-Host "      $caddyAdminPort → FREE" -ForegroundColor Green
+            Write-Host "    Selected: $caddyAdminPort (default)" -ForegroundColor Gray
+            Write-FileLog -Path $caddyInstallLog -Text "$caddyAdminPort: FREE (default)"
+        }
+        Write-FileLog -Path $caddyInstallLog -Text "--- end admin port scan ---"
+
+        if (Test-PortInUse -Port $Config.CaddyPort) {
+            $msg = "Port $($Config.CaddyPort) (Caddy proxy) is ALREADY IN USE. Change the port in config or stop the other process first."
+            Write-Err $msg
+            Write-FileLog -Path $caddyInstallLog -Text "WARN: $msg"
+        } else {
+            Write-Host "    Port $($Config.CaddyPort) (Caddy proxy): free" -ForegroundColor Gray
+            Write-FileLog -Path $caddyInstallLog -Text "Port $($Config.CaddyPort) (proxy): free"
+        }
+        Write-FileLog -Path $caddyInstallLog -Text "Port checks complete"
+
+        # ── Clear port summary for the user ──
+        $adminLabel = if ($caddyAdminEnv) { "auto (2019 was taken)" } else { "default" }
+        Write-Host ""
+        Write-Host "    ┌──────────────────────────────────┐" -ForegroundColor Cyan
+        Write-Host "    │  Caddy service ports:             │" -ForegroundColor Cyan
+        Write-Host "    │    Proxy  (users visit this): $($Config.CaddyPort)" -ForegroundColor $(if ($caddyAdminEnv) { "Yellow" } else { "Green" })
+        Write-Host "    │    Admin  (Caddy internal): $caddyAdminPort" -ForegroundColor $(if ($caddyAdminEnv) { "Yellow" } else { "Gray" })
+        Write-Host "    └──────────────────────────────────┘" -ForegroundColor Cyan
+        Write-Host ""
+        Write-FileLog -Path $caddyInstallLog -Text "Caddy proxy port: $($Config.CaddyPort)"
+        Write-FileLog -Path $caddyInstallLog -Text "Caddy admin port: $caddyAdminPort ($adminLabel)"
+
         $caddyDir = Join-Path $Config.InstallRoot "caddy"
         New-Item -Path $caddyDir -ItemType Directory -Force | Out-Null
         $caddyExe = Join-Path $caddyDir "caddy.exe"
@@ -1179,31 +1304,216 @@ function Install-Caddy {
         $caddyfileLines += "}"
         $caddyfileContent = $caddyfileLines -join "`n"
         Set-Content -Path $caddyfilePath -Value $caddyfileContent -Force
-        Write-FileLog -Path $caddyInstallLog -Text "Caddyfile config written to $caddyfilePath"
+        # Log the full Caddyfile so you can verify port and routes
+        Write-FileLog -Path $caddyInstallLog -Text "Caddyfile written to $caddyfilePath"
+        Write-FileLog -Path $caddyInstallLog -Text "--- Caddyfile content (port: $($Config.CaddyPort)) ---"
+        foreach ($_line in $caddyfileLines) {
+            Write-FileLog -Path $caddyInstallLog -Text $_line
+        }
+        Write-FileLog -Path $caddyInstallLog -Text "--- end Caddyfile ---"
+
+        # Log Caddy version (helps diagnose --admin / admin off support)
+        try {
+            $versionOutput = & $caddyExe version 2>&1 | Out-String
+            Write-FileLog -Path $caddyInstallLog -Text "Caddy version: $versionOutput"
+            Write-Host "    Caddy version: $($versionOutput.Trim())" -ForegroundColor Gray
+        } catch {
+            Write-FileLog -Path $caddyInstallLog -Text "Could not get Caddy version"
+        }
+
+        # ---- Validate Caddyfile syntax BEFORE creating the service ----
+        Write-Host "    Validating Caddyfile syntax..." -ForegroundColor Gray
+        Write-FileLog -Path $caddyInstallLog -Text "--- Caddyfile validation ---"
+        try {
+            $validationOutput = & $caddyExe validate --config "$caddyfilePath" 2>&1 | Out-String
+            Write-FileLog -Path $caddyInstallLog -Text "Validation result: $validationOutput"
+            Write-Host "    Caddyfile validation: OK" -ForegroundColor Green
+        } catch {
+            $validationError = $_
+            $validationDetail = & $caddyExe validate --config "$caddyfilePath" 2>&1 | Out-String
+            Write-FileLog -Path $caddyInstallLog -Text "VALIDATION FAILED: $validationError"
+            Write-FileLog -Path $caddyInstallLog -Text "Validation stderr: $validationDetail"
+            Write-Err "Caddyfile validation FAILED:"
+            Write-Host "    $validationDetail" -ForegroundColor Red
+        }
+        Write-FileLog -Path $caddyInstallLog -Text "--- end validation ---"
 
         # Stop only OUR Caddy service to release its ports (admin:2019, proxy:$($Config.CaddyPort))
         # This does NOT affect other Caddy instances from other deployments/apps
+        Write-Host "    Stopping old ess-mo-caddy service (if any)..." -ForegroundColor Gray
+        Write-FileLog -Path $caddyInstallLog -Text "Stopping old ess-mo-caddy service..."
         Stop-Service -Name "ess-mo-caddy" -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
+        # Verify it stopped
+        $oldSvc = Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue
+        if ($oldSvc -and $oldSvc.Status -ne 'Stopped') {
+            Write-Warn "Old ess-mo-caddy service did not stop gracefully. Forcing..."
+            Write-FileLog -Path $caddyInstallLog -Text "WARN: Old service not stopped, status=$($oldSvc.Status)"
+            Stop-Service -Name "ess-mo-caddy" -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+        }
+        Write-FileLog -Path $caddyInstallLog -Text "Old service stopped."
+
+        # ---- Check if CaddyPort is STILL in use after stopping the service ----
+        Start-Sleep -Seconds 1
+        if (Test-PortInUse -Port $Config.CaddyPort) {
+            $msg = "Port $($Config.CaddyPort) is STILL in use after stopping our service. Another process may be holding it."
+            Write-Err $msg
+            Write-FileLog -Path $caddyInstallLog -Text "ERROR: $msg"
+            # Identify the process holding the port
+            try {
+                $holder = netstat -ano | Select-String "TCP.*:$($Config.CaddyPort)\s" | ForEach-Object {
+                    $parts = $_ -split '\s+'
+                    $pid = $parts[-1]
+                    $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+                    if ($proc) { "PID $pid ($($proc.ProcessName))" } else { "PID $pid (unknown)" }
+                }
+                Write-Host "    Port owner: $holder" -ForegroundColor Yellow
+                Write-FileLog -Path $caddyInstallLog -Text "Port owner: $holder"
+            } catch { }
+        }
 
         # Runtime log: capture Caddy access/error logs
         $svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
         $caddyLog = Join-Path $logsDir "caddy_service_${svcTs}.log"
         Write-Host "    Service log: $caddyLog" -ForegroundColor Gray
+        Write-FileLog -Path $caddyInstallLog -Text "Caddy runtime log: $caddyLog"
 
-        # Wrap in cmd.exe to capture stdout/stderr (consistent with frontend/backend)
-        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$caddyLog`" & cd /d $caddyDir && `"$caddyExe`" run --config `"$caddyfilePath`" --admin off >> `"$caddyLog`" 2>&1`"`""
+        # Build the cmd.exe wrapper command that:
+        # 1. Writes a start timestamp to the log
+        # 2. cd's to the caddy dir
+        # 3. Sets CADDY_ADMIN env var if port 2019 was taken by another Caddy
+        # 4. Runs caddy run --config pointing to our isolated Caddyfile
+        # 5. Redirects ALL output (stdout+stderr) to the runtime log
+        #
+        # Note: The Caddyfile at $caddyfilePath defines proxy port $($Config.CaddyPort).
+        # Admin API port: $caddyAdminPort (2019 by default, unique if another Caddy holds 2019).
+        $adminEnvPrefix = if ($caddyAdminEnv) { $caddyAdminEnv } else { "" }
+        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$caddyLog`" & cd /d $caddyDir && ${adminEnvPrefix}`"$caddyExe`" run --config `"$caddyfilePath`" >> `"$caddyLog`" 2>&1`"`""
+
+        # Log the FULL service command for debugging
+        Write-FileLog -Path $caddyInstallLog -Text "--- Service creation ---"
+        Write-FileLog -Path $caddyInstallLog -Text "Service name: ess-mo-caddy"
+        Write-FileLog -Path $caddyInstallLog -Text "Executable: C:\Windows\System32\cmd.exe"
+        Write-FileLog -Path $caddyInstallLog -Text "Parameters: $paramStr"
+        Write-FileLog -Path $caddyInstallLog -Text "Caddyfile: $caddyfilePath"
+        Write-FileLog -Path $caddyInstallLog -Text "Runtime log: $caddyLog"
 
         # Unregister old service (process already stopped above)
-        servy-cli uninstall --name="ess-mo-caddy" --quiet 2>&1 | Out-Null
-        servy-cli install --name="ess-mo-caddy" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
+        Write-Host "    Unregistering old service definition..." -ForegroundColor Gray
+        $uninstallResult = servy-cli uninstall --name="ess-mo-caddy" --quiet 2>&1
+        if ($uninstallResult) {
+            Write-FileLog -Path $caddyInstallLog -Text "Uninstall output: $uninstallResult"
+        }
+        Start-Sleep -Milliseconds 500
+
+        Write-Host "    Registering new Caddy service on port $($Config.CaddyPort)..." -ForegroundColor Gray
+        $installResult = servy-cli install --name="ess-mo-caddy" --path="C:\Windows\System32\cmd.exe" --params="$paramStr" 2>&1
+        Write-FileLog -Path $caddyInstallLog -Text "servy-cli install output: $installResult"
 
         if (-not (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue)) {
+            # servy-cli failed silently - try to get more info
+            Write-FileLog -Path $caddyInstallLog -Text "ERROR: servy-cli did not create the service"
+            $svcCheck = sc.exe query ess-mo-caddy 2>&1 | Out-String
+            Write-FileLog -Path $caddyInstallLog -Text "sc query result: $svcCheck"
             throw "Service 'ess-mo-caddy' was not created by servy-cli"
         }
         Write-Success "Caddy service installed."
+        Write-FileLog -Path $caddyInstallLog -Text "Service created successfully by servy-cli"
+
+        # ---- Start the Caddy service and verify it runs ----
+        Write-Host "    Starting Caddy service..." -ForegroundColor Gray
+        Write-FileLog -Path $caddyInstallLog -Text "Starting Caddy service..."
+        try {
+            Start-Service -Name ess-mo-caddy -ErrorAction Stop
+            Write-Host "    Caddy service start command issued, waiting 5s for startup..." -ForegroundColor Gray
+            Write-FileLog -Path $caddyInstallLog -Text "Start-Service command issued"
+            Start-Sleep -Seconds 5
+
+            $svcStatus = Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue
+            Write-FileLog -Path $caddyInstallLog -Text "Service status after 5s: $($svcStatus.Status)"
+
+            if ($svcStatus.Status -eq 'Running') {
+                Write-Success "Caddy service is RUNNING"
+                Write-FileLog -Path $caddyInstallLog -Text "Caddy service is RUNNING"
+            } else {
+                Write-Warn "Caddy service status: $($svcStatus.Status) (not Running yet)"
+                Write-FileLog -Path $caddyInstallLog -Text "WARN: Service status is $($svcStatus.Status)"
+            }
+
+            # ---- Check the runtime log for startup errors ----
+            if (Test-Path $caddyLog) {
+                Start-Sleep -Seconds 2  # Give Caddy time to write to log
+                $logContent = Get-Content $caddyLog -ErrorAction SilentlyContinue
+                Write-FileLog -Path $caddyInstallLog -Text "--- Runtime log content (first 30 lines) ---"
+                $lineCount = 0
+                foreach ($_logLine in $logContent) {
+                    $lineCount++
+                    if ($lineCount -gt 30) {
+                        Write-FileLog -Path $caddyInstallLog -Text "... (truncated, full log at $caddyLog)"
+                        break
+                    }
+                    Write-FileLog -Path $caddyInstallLog -Text $_logLine
+                    # Highlight errors in console
+                    if ($_logLine -match '(?i)(error|fail|panic|refused|cannot|unable|conflict|bind)') {
+                        Write-Host "    [LOG] $_logLine" -ForegroundColor Red
+                    }
+                }
+                Write-FileLog -Path $caddyInstallLog -Text "--- end runtime log ---"
+            } else {
+                # Log file doesn't exist yet - Caddy may not have started
+                Write-Warn "Caddy runtime log not found yet - service may not have started"
+                Write-FileLog -Path $caddyInstallLog -Text "WARN: Runtime log not found at $caddyLog"
+            }
+
+            # ---- Final port check: is Caddy actually listening? ----
+            Start-Sleep -Seconds 3
+            if (Test-PortInUse -Port $Config.CaddyPort) {
+                Write-Success "Caddy is listening on port $($Config.CaddyPort)"
+                Write-FileLog -Path $caddyInstallLog -Text "VERIFIED: Caddy listening on port $($Config.CaddyPort)"
+            } else {
+                Write-Err "Caddy is NOT listening on port $($Config.CaddyPort) after startup"
+                Write-FileLog -Path $caddyInstallLog -Text "FAILED: Caddy not listening on port $($Config.CaddyPort)"
+                # Try netstat to see what's on the port
+                try {
+                    $netstatOutput = netstat -an | Select-String ":$($Config.CaddyPort)" | Out-String
+                    Write-FileLog -Path $caddyInstallLog -Text "Netstat for port $($Config.CaddyPort): $netstatOutput"
+                } catch { }
+            }
+
+            # Also verify the admin API port is now in use (means Caddy is alive)
+            Start-Sleep -Seconds 1
+            if (Test-PortInUse -Port $caddyAdminPort) {
+                Write-Host "    Admin API port $caddyAdminPort: in use (Caddy is alive)" -ForegroundColor Gray
+                Write-FileLog -Path $caddyInstallLog -Text "Caddy admin API ($caddyAdminPort): active"
+            } else {
+                Write-Warn "Admin API port $caddyAdminPort is NOT in use - Caddy may have crashed"
+                Write-FileLog -Path $caddyInstallLog -Text "WARN: Admin port $caddyAdminPort not in use - Caddy may have crashed"
+            }
+        } catch {
+            $startError = $_
+            Write-Err "Failed to start Caddy service: $startError"
+            Write-FileLog -Path $caddyInstallLog -Text "ERROR starting service: $startError"
+            # Try to dump service status
+            try {
+                $svcInfo = sc.exe query ess-mo-caddy 2>&1 | Out-String
+                Write-FileLog -Path $caddyInstallLog -Text "Service query: $svcInfo"
+            } catch { }
+            # Try to dump runtime log if it exists
+            if (Test-Path $caddyLog) {
+                $errLog = Get-Content $caddyLog -ErrorAction SilentlyContinue | Select-Object -Last 20
+                Write-FileLog -Path $caddyInstallLog -Text "--- Last 20 lines of runtime log ---"
+                foreach ($_errLine in $errLog) {
+                    Write-FileLog -Path $caddyInstallLog -Text $_errLine
+                }
+                Write-FileLog -Path $caddyInstallLog -Text "--- end ---"
+            }
+        }
+
         $script:installedComponents += "caddy"
-        Write-Log "Caddy installed successfully on port $($Config.CaddyPort)"
+        $adminLabel = if ($caddyAdminEnv) { "auto (2019 was taken)" } else { "default" }
+        Write-Success "Caddy installed: proxy=$($Config.CaddyPort), admin=$caddyAdminPort ($adminLabel)"
+        Write-Log "Caddy installed successfully: proxy=$($Config.CaddyPort), admin=$caddyAdminPort ($adminLabel)"
         return $true
     } catch {
         Write-Err "Caddy setup failed: $_"

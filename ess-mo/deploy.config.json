@@ -3,6 +3,6 @@
   "BackendRepo": "https://github.com/Posuza/ESS_MO_Backend.git",
   "FrontendPort": 3009,
   "BackendPort": 8009,
-  "CaddyPort": 8089,
+  "CaddyPort": 9089,
   "ApiPrefix": "/api/v1"
 }
