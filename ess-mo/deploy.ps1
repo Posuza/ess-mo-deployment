@@ -1043,7 +1043,7 @@ function Install-Frontend {
         Write-Host "    Service log: $serviceLog" -ForegroundColor Gray
         Write-FileLog -Path $installLog -Text "Service log: $serviceLog"
 
-        $paramStr = '/c "(echo ========== Service started at %DATE% %TIME% ========== & cd /d ' + $appDir + ' & npx --yes serve -s "' + $curLink + '" -l ' + $appPort + ' & echo ========== Service STOPPED at %DATE% %TIME% ==========) >> ' + $serviceLog + ' 2>&1"'
+        $paramStr = '/c "echo ========== Service started at %DATE% %TIME% ========== >> "' + $serviceLog + '" & cd /d ' + $appDir + ' & npx --yes serve -s "' + $curLink + '" -l ' + $appPort + ' >> "' + $serviceLog + '" 2>&1 & echo ========== Service STOPPED at %DATE% %TIME% ========== >> "' + $serviceLog + '"'
 
         servy-cli uninstall --name="$svcName" --quiet 2>&1 | Add-FileLog -Path $installLog
         servy-cli install --name="$svcName" --path="C:\Windows\System32\cmd.exe" --params="$paramStr" 2>&1 | Add-FileLog -Path $installLog
@@ -1191,7 +1191,7 @@ EMAIL_FROM="$envSmtpFrom"
         Write-Host "    Service log: $serviceLog" -ForegroundColor Gray
         Write-FileLog -Path $installLog -Text "Service log: $serviceLog"
 
-        $paramStr = '/c "(echo ========== Service started at %DATE% %TIME% ========== & cd /d ' + $repoDir + ' & ' + $pythonExe + ' -u -m uvicorn app.main:app --host 0.0.0.0 --port ' + $appPort + ' & echo ========== Service STOPPED at %DATE% %TIME% ==========) >> ' + $serviceLog + ' 2>&1"'
+        $paramStr = '/c "echo ========== Service started at %DATE% %TIME% ========== >> "' + $serviceLog + '" & cd /d ' + $repoDir + ' & ' + $pythonExe + ' -u -m uvicorn app.main:app --host 0.0.0.0 --port ' + $appPort + ' >> "' + $serviceLog + '" 2>&1 & echo ========== Service STOPPED at %DATE% %TIME% ========== >> "' + $serviceLog + '"'
 
         servy-cli uninstall --name="$svcName" --quiet 2>&1 | Add-FileLog -Path $installLog
         servy-cli install --name="$svcName" --path="C:\Windows\System32\cmd.exe" --params="$paramStr" 2>&1 | Add-FileLog -Path $installLog
@@ -2295,7 +2295,7 @@ function Show-CaddyConfig {
                 }
 
                 $caddyfileLines = @()
-                $caddyfileLines += ":{\$CADDY_PORT} {"
+                $caddyfileLines += ":`{`$CADDY_PORT`} {"
                 foreach ($r in $finalRoutes) {
                     $caddyfileLines += "    handle $($r.Path) {"
                     $caddyfileLines += "        reverse_proxy $($r.Target)"
