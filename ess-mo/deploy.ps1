@@ -1191,7 +1191,7 @@ EMAIL_FROM="$envSmtpFrom"
         Write-Host "    Service log: $serviceLog" -ForegroundColor Gray
         Write-FileLog -Path $installLog -Text "Service log: $serviceLog"
 
-        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$serviceLog`" & cd /d $repoDir && $pythonExe -m uvicorn app.main:app --host 0.0.0.0 --port $appPort >> `"$serviceLog`" 2>&1`"`""
+        $paramStr = "/c `"echo ========== Service started at %DATE% %TIME% ========== >> `"$serviceLog`" & cd /d $repoDir & $pythonExe -u -m uvicorn app.main:app --host 0.0.0.0 --port $appPort >> `"$serviceLog`" 2>&1`"
 
         servy-cli uninstall --name="$svcName" --quiet 2>&1 | Out-Null
         servy-cli install --name="$svcName" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
