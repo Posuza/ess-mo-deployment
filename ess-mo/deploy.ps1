@@ -1043,7 +1043,7 @@ function Install-Frontend {
         Write-Host "    Service log: $serviceLog" -ForegroundColor Gray
         Write-FileLog -Path $installLog -Text "Service log: $serviceLog"
 
-        $paramStr = "/c `"`"echo ========== Service started at %DATE% %TIME% ========== >> `"$serviceLog`" & cd /d $appDir && npx --yes serve -s `"$curLink`" -l $appPort >> `"$serviceLog`" 2>&1`"`""
+        $paramStr = '/c "echo ========== Service started at %DATE% %TIME% ========== >> "' + $serviceLog + '" & cd /d ' + $appDir + ' & npx --yes serve -s "' + $curLink + '" -l ' + $appPort + ' >> "' + $serviceLog + '" 2>&1 & echo ========== Service STOPPED at %DATE% %TIME% ========== >> "' + $serviceLog + '"'
 
         servy-cli uninstall --name="$svcName" --quiet 2>&1 | Out-Null
         servy-cli install --name="$svcName" --path="C:\Windows\System32\cmd.exe" --params="$paramStr"
@@ -1398,6 +1398,7 @@ $statusFile = Join-Path $caddyDir "caddy-ports.json"
 
 "    Starting Caddy..." | Out-File -FilePath $caddyLog -Append
 & $caddyExe run --config $caddyfile 2>&1 | Out-File -FilePath $caddyLog -Append
+"========== Service STOPPED at $(Get-Date) ==========" | Out-File -FilePath $caddyLog -Append
 '@
         $runnerContent = $runnerContent.Replace('__DEFAULT_PROXY_PORT__', $defaultProxyPort)
         Set-Content -Path $runnerScript -Value $runnerContent -Force
@@ -2378,6 +2379,7 @@ $statusFile = Join-Path $caddyDir "caddy-ports.json"
 
 "    Starting Caddy..." | Out-File -FilePath $caddyLog -Append
 & $caddyExe run --config $caddyfile 2>&1 | Out-File -FilePath $caddyLog -Append
+"========== Service STOPPED at $(Get-Date) ==========" | Out-File -FilePath $caddyLog -Append
 '@
                 $runnerContent = $runnerContent.Replace('__DEFAULT_PROXY_PORT__', $defaultProxyPort)
                 Set-Content -Path $runnerScript -Value $runnerContent -Force
