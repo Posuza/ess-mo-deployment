@@ -1055,7 +1055,7 @@ Set-Location -Path $frontendDir
 "    Working directory: $(Get-Location)" | Out-File -FilePath $serviceLog -Append
 "    Starting serve: npx --yes serve -s $curLink -l __FRONTEND_PORT__" | Out-File -FilePath $serviceLog -Append
 
-npx --yes serve -s "$curLink" -l __FRONTEND_PORT__ 2>&1 | Out-File -FilePath $serviceLog -Append
+npx --yes serve -s "$curLink" -l __FRONTEND_PORT__ 2>&1 >> $serviceLog
 
 "========== Service STOPPED at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Append
 '@
@@ -1231,7 +1231,7 @@ Set-Location -Path $repoDir
 "    Starting Python: $pythonExe" | Out-File -FilePath $serviceLog -Append
 "    Uvicorn: app.main:app --host 0.0.0.0 --port __BACKEND_PORT__" | Out-File -FilePath $serviceLog -Append
 
-& $pythonExe -u -m uvicorn app.main:app --host 0.0.0.0 --port __BACKEND_PORT__ 2>&1 | Out-File -FilePath $serviceLog -Append
+& $pythonExe -u -m uvicorn app.main:app --host 0.0.0.0 --port __BACKEND_PORT__ 2>&1 >> $serviceLog
 
 "========== Service STOPPED at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Append
 '@
