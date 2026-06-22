@@ -1037,16 +1037,42 @@ function Install-Frontend {
         Write-Success "Symlink swapped: current → $ts"
         Write-FileLog -Path $installLog -Text "Symlink: $curLink → $releaseDir"
 
-        # --- 7. Create / update service (timestamped service log) ---
-        $svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
-        $serviceLog = Join-Path $logsDir "frontend_service_${svcTs}.log"
-        Write-Host "    Service log: $serviceLog" -ForegroundColor Gray
-        Write-FileLog -Path $installLog -Text "Service log: $serviceLog"
+        # --- 7. Create / update service (PowerShell runner) ---
+        $runnerScript = Join-Path $appDir "frontend-run.ps1"
+        $runnerContent = @'
+$frontendDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$webRoot     = Join-Path $frontendDir "webroot"
+$curLink     = Join-Path $webRoot "current"
+$logsDir     = Join-Path (Join-Path (Split-Path $frontendDir -Parent) "logs") "frontend"
+if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
 
-        $paramStr = '/c "echo ========== Service started at %DATE% %TIME% ========== >> "' + $serviceLog + '" & cd /d ' + $appDir + ' & npx --yes serve -s "' + $curLink + '" -l ' + $appPort + ' >> "' + $serviceLog + '" 2>&1 & echo ========== Service STOPPED at %DATE% %TIME% ========== >> "' + $serviceLog + '"'
+$svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
+$serviceLog = Join-Path $logsDir "frontend_service_${svcTs}.log"
+
+"========== Service started at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Encoding ASCII
+
+Set-Location -Path $frontendDir
+"    Working directory: $(Get-Location)" | Out-File -FilePath $serviceLog -Append
+"    Starting serve: npx --yes serve -s $curLink -l __FRONTEND_PORT__" | Out-File -FilePath $serviceLog -Append
+
+npx --yes serve -s "$curLink" -l __FRONTEND_PORT__ 2>&1 | Out-File -FilePath $serviceLog -Append
+
+"========== Service STOPPED at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Append
+'@
+        $runnerContent = $runnerContent.Replace('__FRONTEND_PORT__', $appPort)
+        Set-Content -Path $runnerScript -Value $runnerContent -Force
+        Write-FileLog -Path $installLog -Text "Runner script written to $runnerScript"
+
+        $powershellExe = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        $paramStr = "-ExecutionPolicy Bypass -File `"$runnerScript`""
+
+        Write-FileLog -Path $installLog -Text "--- Service creation ---"
+        Write-FileLog -Path $installLog -Text "Service name: $svcName"
+        Write-FileLog -Path $installLog -Text "Executable: $powershellExe"
+        Write-FileLog -Path $installLog -Text "Parameters: $paramStr"
 
         servy-cli uninstall --name="$svcName" --quiet 2>&1 | Add-FileLog -Path $installLog
-        servy-cli install --name="$svcName" --path="C:\Windows\System32\cmd.exe" --params="$paramStr" 2>&1 | Add-FileLog -Path $installLog
+        servy-cli install --name="$svcName" --path="$powershellExe" --params="$paramStr" 2>&1 | Add-FileLog -Path $installLog
 
         if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
             throw "Service '$svcName' was not created by servy-cli"
@@ -1185,16 +1211,44 @@ EMAIL_FROM="$envSmtpFrom"
         Set-Content -Path (Join-Path $repoDir ".env") -Value $envContent -Force
         Write-FileLog -Path $installLog -Text ".env generated with SECRET_KEY ($($generatedKey.Length) chars)"
 
-        # --- 5. Create / update service (timestamped service log) ---
-        $svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
-        $serviceLog = Join-Path $logsDir "backend_service_${svcTs}.log"
-        Write-Host "    Service log: $serviceLog" -ForegroundColor Gray
-        Write-FileLog -Path $installLog -Text "Service log: $serviceLog"
+        # --- 5. Create / update service (PowerShell runner) ---
+        $runnerScript = Join-Path $appDir "backend-run.ps1"
+        $runnerContent = @'
+$backendDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoDir    = Join-Path $backendDir "repo"
+$venvDir    = Join-Path $repoDir "venv"
+$pythonExe  = Join-Path $venvDir "Scripts\python.exe"
+$logsDir    = Join-Path (Join-Path (Split-Path $backendDir -Parent) "logs") "backend"
+if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
 
-        $paramStr = '/c "echo ========== Service started at %DATE% %TIME% ========== >> "' + $serviceLog + '" & cd /d ' + $repoDir + ' & ' + $pythonExe + ' -u -m uvicorn app.main:app --host 0.0.0.0 --port ' + $appPort + ' >> "' + $serviceLog + '" 2>&1 & echo ========== Service STOPPED at %DATE% %TIME% ========== >> "' + $serviceLog + '"'
+$svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
+$serviceLog = Join-Path $logsDir "backend_service_${svcTs}.log"
+
+"========== Service started at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Encoding ASCII
+
+Set-Location -Path $repoDir
+"    Working directory: $(Get-Location)" | Out-File -FilePath $serviceLog -Append
+"    Starting Python: $pythonExe" | Out-File -FilePath $serviceLog -Append
+"    Uvicorn: app.main:app --host 0.0.0.0 --port __BACKEND_PORT__" | Out-File -FilePath $serviceLog -Append
+
+& $pythonExe -u -m uvicorn app.main:app --host 0.0.0.0 --port __BACKEND_PORT__ 2>&1 | Out-File -FilePath $serviceLog -Append
+
+"========== Service STOPPED at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Append
+'@
+        $runnerContent = $runnerContent.Replace('__BACKEND_PORT__', $appPort)
+        Set-Content -Path $runnerScript -Value $runnerContent -Force
+        Write-FileLog -Path $installLog -Text "Runner script written to $runnerScript"
+
+        $powershellExe = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        $paramStr = "-ExecutionPolicy Bypass -File `"$runnerScript`""
+
+        Write-FileLog -Path $installLog -Text "--- Service creation ---"
+        Write-FileLog -Path $installLog -Text "Service name: $svcName"
+        Write-FileLog -Path $installLog -Text "Executable: $powershellExe"
+        Write-FileLog -Path $installLog -Text "Parameters: $paramStr"
 
         servy-cli uninstall --name="$svcName" --quiet 2>&1 | Add-FileLog -Path $installLog
-        servy-cli install --name="$svcName" --path="C:\Windows\System32\cmd.exe" --params="$paramStr" 2>&1 | Add-FileLog -Path $installLog
+        servy-cli install --name="$svcName" --path="$powershellExe" --params="$paramStr" 2>&1 | Add-FileLog -Path $installLog
 
         if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
             throw "Service '$svcName' was not created by servy-cli"
@@ -1994,12 +2048,12 @@ function Invoke-FullDeploy {
             Write-Success "Frontend installed on port $($Config.FrontendPort)"
             Write-Log "Frontend installed on port $($Config.FrontendPort)"
         } else {
-            Write-Err "Frontend installation FAILED"
+            Write-Err "Frontend installation FAILED — skipping remaining components"
             $allSucceeded = $false
         }
     }
 
-    if ($targetComponents -contains "backend") {
+    if ($allSucceeded -and $targetComponents -contains "backend") {
         Write-Host "  Backend (port $($Config.BackendPort))..." -ForegroundColor Gray
         Start-Spinner "Installing Backend ..."
         $backendOk = Install-Backend -Config $Config -Secrets $secrets
@@ -2008,12 +2062,12 @@ function Invoke-FullDeploy {
             Write-Success "Backend installed on port $($Config.BackendPort)"
             Write-Log "Backend installed on port $($Config.BackendPort)"
         } else {
-            Write-Err "Backend installation FAILED"
+            Write-Err "Backend installation FAILED — skipping remaining components"
             $allSucceeded = $false
         }
     }
 
-    if ($targetComponents -contains "caddy") {
+    if ($allSucceeded -and $targetComponents -contains "caddy") {
         Write-Host "  Caddy reverse proxy (port $($Config.CaddyPort))..." -ForegroundColor Gray
         Start-Spinner "Installing Caddy ..."
         $caddyOk = Install-Caddy -Config $Config
@@ -2022,7 +2076,7 @@ function Invoke-FullDeploy {
             Write-Success "Caddy installed on port $($Config.CaddyPort)"
             Write-Log "Caddy installed on port $($Config.CaddyPort)"
         } else {
-            Write-Err "Caddy installation FAILED"
+            Write-Err "Caddy installation FAILED — skipping remaining components"
             $allSucceeded = $false
         }
     }
