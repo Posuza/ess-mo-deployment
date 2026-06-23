@@ -1164,6 +1164,27 @@ function Install-Backend {
             Write-Host "    Virtual environment exists (skipping)" -ForegroundColor Gray
         }
 
+        # --- 2b. Verify venv python.exe works ---
+        Write-Host "    Verifying venv python.exe..." -ForegroundColor Gray
+        $venvCheck = & $pythonExe -c "print('OK')" 2>&1
+        if ($venvCheck -notmatch "OK") {
+            Write-FileLog -Path $installLog -Text "Venv check failed: $venvCheck"
+            # Recreate venv if broken
+            Write-Host "    Venv python.exe is broken, recreating..." -ForegroundColor Yellow
+            Remove-Item $venvDir -Recurse -Force -ErrorAction SilentlyContinue
+            Push-Location $repoDir
+            python -m venv venv 2>&1 | Add-FileLog -Path $installLog
+            Pop-Location
+            if (-not (Test-Path $pythonExe)) {
+                throw "Virtual environment recreation failed"
+            }
+            $venvCheck2 = & $pythonExe -c "print('OK')" 2>&1
+            if ($venvCheck2 -notmatch "OK") {
+                throw "Venv python.exe still broken after recreation: $venvCheck2"
+            }
+            Write-Host "    Venv recreated successfully" -ForegroundColor Green
+        }
+
         # --- 3. Install / update dependencies (pip is smart — only delta) ---
         Write-Host "    Installing dependencies..." -ForegroundColor Gray
         & $pythonExe -m pip install -r (Join-Path $repoDir "requirements.txt") 2>&1 | Add-FileLog -Path $installLog
@@ -1214,6 +1235,10 @@ EMAIL_FROM="$envSmtpFrom"
         # --- 5. Create / update service (PowerShell runner) ---
         $runnerScript = Join-Path $appDir "backend-run.ps1"
         $runnerContent = @'
+$ErrorActionPreference = "Continue"
+$ProgressPreference = "SilentlyContinue"
+$env:PYTHONUNBUFFERED = "1"
+
 $backendDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoDir    = Join-Path $backendDir "repo"
 $venvDir    = Join-Path $repoDir "venv"
@@ -1226,12 +1251,29 @@ $serviceLog = Join-Path $logsDir "backend_service_${svcTs}.log"
 
 "========== Service started at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Encoding ASCII
 
-Set-Location -Path $repoDir
+if (-not (Test-Path $pythonExe)) {
+    "FATAL: python.exe not found at $pythonExe" | Out-File -FilePath $serviceLog -Append
+    Start-Sleep -Seconds 5
+    exit 1
+}
+
+try {
+    Set-Location -Path $repoDir -ErrorAction Stop
+} catch {
+    "FATAL: could not cd to $repoDir : $_" | Out-File -FilePath $serviceLog -Append
+    exit 1
+}
+
 "    Working directory: $(Get-Location)" | Out-File -FilePath $serviceLog -Append
 "    Starting Python: $pythonExe" | Out-File -FilePath $serviceLog -Append
 "    Uvicorn: app.main:app --host 0.0.0.0 --port __BACKEND_PORT__" | Out-File -FilePath $serviceLog -Append
 
-& $pythonExe -u -m uvicorn app.main:app --host 0.0.0.0 --port __BACKEND_PORT__ 2>&1 >> $serviceLog
+try {
+    & $pythonExe -m uvicorn app.main:app --host 0.0.0.0 --port __BACKEND_PORT__ 1>> $serviceLog 2>> $serviceLog
+}
+catch {
+    "FATAL: uvicorn launch threw: $_" | Out-File -FilePath $serviceLog -Append
+}
 
 "========== Service STOPPED at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Append
 '@
@@ -1255,6 +1297,88 @@ Set-Location -Path $repoDir
         }
         Write-FileLog -Path $installLog -Text "Service $svcName installed/updated"
         Write-Success "Service updated: $svcName"
+
+        # ---- Start the service and verify it runs (same pattern as Install-Caddy) ----
+        Write-Host "    Starting backend service to verify..." -ForegroundColor Gray
+        Write-FileLog -Path $installLog -Text "Starting backend service..."
+        try {
+            Start-Service -Name $svcName -ErrorAction Stop
+            Write-Host "    Backend service start command issued, waiting 6s for startup..." -ForegroundColor Gray
+            Write-FileLog -Path $installLog -Text "Start-Service command issued"
+            Start-Sleep -Seconds 6
+
+            $svcStatus = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            Write-FileLog -Path $installLog -Text "Service status after 6s: $($svcStatus.Status)"
+
+            if ($svcStatus.Status -eq 'Running') {
+                Write-Success "Backend service is RUNNING"
+                Write-FileLog -Path $installLog -Text "Backend service is RUNNING"
+            } else {
+                Write-Warn "Backend service status: $($svcStatus.Status) (not Running yet)"
+                Write-FileLog -Path $installLog -Text "WARN: Service status is $($svcStatus.Status)"
+            }
+
+            # ---- Check the runtime log for startup errors ----
+            Start-Sleep -Seconds 2
+            $latestLog = Get-ChildItem -Path $logsDir -Filter "backend_service_*.log" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($latestLog) {
+                $logContent = Get-Content $latestLog.FullName -ErrorAction SilentlyContinue
+                Write-FileLog -Path $installLog -Text "--- Runtime log content (first 40 lines) ---"
+                $lineCount = 0
+                foreach ($_logLine in $logContent) {
+                    $lineCount++
+                    if ($lineCount -gt 40) {
+                        Write-FileLog -Path $installLog -Text "... (truncated, full log at $($latestLog.FullName))"
+                        break
+                    }
+                    Write-FileLog -Path $installLog -Text $_logLine
+                    if ($_logLine -match '(?i)(error|fail|panic|fatal|traceback|exception|cannot|unable|refused)') {
+                        Write-Host "    [LOG] $_logLine" -ForegroundColor Red
+                    }
+                }
+                Write-FileLog -Path $installLog -Text "--- end runtime log ---"
+            } else {
+                Write-Warn "Backend runtime log not found yet"
+                Write-FileLog -Path $installLog -Text "WARN: No runtime log found in $logsDir"
+            }
+
+            # ---- Quick health check ----
+            try {
+                $healthUrl = "http://127.0.0.1:$appPort/api/v1/health"
+                Write-FileLog -Path $installLog -Text "Running health check against $healthUrl"
+                $healthResponse = Invoke-WebRequest -Uri $healthUrl -TimeoutSec 5 -UseBasicParsing -ErrorAction SilentlyContinue
+                if ($healthResponse.StatusCode -eq 200) {
+                    Write-Success "Backend health check passed (HTTP 200)"
+                    Write-FileLog -Path $installLog -Text "Health check OK: status=$($healthResponse.StatusCode)"
+                } else {
+                    Write-Warn "Backend health check returned HTTP $($healthResponse.StatusCode)"
+                    Write-FileLog -Path $installLog -Text "Health check returned HTTP $($healthResponse.StatusCode)"
+                }
+            } catch {
+                Write-Warn "Backend health check failed (service may still be starting): $_"
+                Write-FileLog -Path $installLog -Text "Health check failed: $_"
+            }
+
+            Write-Host "    Backend service verified" -ForegroundColor Gray
+            Write-FileLog -Path $installLog -Text "Backend verification complete"
+        } catch {
+            $startError = $_
+            Write-Err "Failed to start backend service: $startError"
+            Write-FileLog -Path $installLog -Text "ERROR starting service: $startError"
+            # Dump runtime log if it exists
+            $latestErrLog = Get-ChildItem -Path $logsDir -Filter "backend_service_*.log" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($latestErrLog) {
+                $errLog = Get-Content $latestErrLog.FullName -ErrorAction SilentlyContinue | Select-Object -Last 30
+                Write-FileLog -Path $installLog -Text "--- Last 30 lines of runtime log ($($latestErrLog.Name)) ---"
+                foreach ($_errLine in $errLog) {
+                    Write-FileLog -Path $installLog -Text $_errLine
+                }
+                Write-FileLog -Path $installLog -Text "--- end ---"
+            }
+            return $false
+        }
 
         $script:installedComponents += "backend"
         Write-Log "Backend installed/updated successfully on port $appPort"
