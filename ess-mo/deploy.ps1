@@ -1133,37 +1133,16 @@ function Install-Backend {
         $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
         $installLog = Join-Path $logsDir "backend_install_${ts}.log"
 
-        # --- 0. Stop the existing service FIRST so its venv DLLs/log files aren't locked ---
-        Write-Host "    Stopping existing backend service (if running)..." -ForegroundColor Gray
-        Write-FileLog -Path $installLog -Text "Stopping ess-mo-backend before touching files"
+        # --- 0. Check if service already exists (install should never stop/uninstall — that's uninstall's job) ---
+        Write-Host "    Checking for existing service..." -ForegroundColor Gray
         $existingSvc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-        if ($existingSvc -and $existingSvc.Status -eq 'Running') {
-            Stop-Service -Name $svcName -ErrorAction SilentlyContinue
-            Write-Host "    Waiting for service to fully stop..." -ForegroundColor Gray
-            $waited = 0
-            while ($waited -lt 15) {
-                Start-Sleep -Seconds 1
-                $waited++
-                $check = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-                if (-not $check -or $check.Status -eq 'Stopped') { break }
-            }
-            $finalCheck = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-            if ($finalCheck -and $finalCheck.Status -ne 'Stopped') {
-                Write-Warn "Service did not stop cleanly after ${waited}s, forcing process kill..."
-                Write-FileLog -Path $installLog -Text "WARN: service still $($finalCheck.Status) after ${waited}s, force-killing python.exe under repo path"
-                Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
-                    Where-Object { $_.ExecutablePath -like "$repoDir*" } |
-                    ForEach-Object {
-                        Write-Host "    Force-killing PID $($_.ProcessId) ($($_.ExecutablePath))" -ForegroundColor Yellow
-                        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-                    }
-                Start-Sleep -Seconds 2
-            }
-            Write-Success "Backend service stopped"
-            Write-FileLog -Path $installLog -Text "Backend service stopped before file operations"
-        } else {
-            Write-Host "    Service not running, nothing to stop" -ForegroundColor Gray
+        if ($existingSvc) {
+            Write-Err "Service '$svcName' already exists (status: $($existingSvc.Status))."
+            Write-Err "Cannot install while service is registered. Please uninstall first (option 3)."
+            Write-FileLog -Path $installLog -Text "Refusing install: service $svcName already exists (status: $($existingSvc.Status))"
+            throw "Service '$svcName' already exists. Uninstall first (option 3), then install again."
         }
+        Write-FileLog -Path $installLog -Text "No existing service found, proceeding"
 
         # --- 1. Persistent repo ---
         if (Test-Path (Join-Path $repoDir ".git")) {
@@ -1336,7 +1315,10 @@ catch {
         Write-FileLog -Path $installLog -Text "Executable: $powershellExe"
         Write-FileLog -Path $installLog -Text "Parameters: $paramStr"
 
-        servy-cli uninstall --name="$svcName" --quiet 2>&1 | Add-FileLog -Path $installLog
+        # Check if service name is still free (Step 0 already checked, but double-check after long install)
+        if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
+            throw "Service '$svcName' was created by another process during install. Please uninstall first (option 3)."
+        }
         servy-cli install --name="$svcName" --path="$powershellExe" --params="$paramStr" 2>&1 | Add-FileLog -Path $installLog
 
         if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
@@ -2019,51 +2001,79 @@ function Remove-Component {
     Write-FileLog -Path $uninstallLog -Text "========== Uninstalling $Key =========="
 
     if (-not $script:dryRun) {
-        # --- Stop the service and wait for process to fully exit ---
-        Write-Host "    Stopping service $svcName..." -ForegroundColor Gray
-        Stop-Service -Name $svcName -ErrorAction SilentlyContinue 2>&1 | Add-FileLog -Path $uninstallLog
-        Write-Host "    Waiting for service to fully stop..." -ForegroundColor Gray
-        $waited = 0
-        while ($waited -lt 15) {
-            Start-Sleep -Seconds 1
-            $waited++
-            $check = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-            if (-not $check -or $check.Status -eq 'Stopped') { break }
-        }
-        # Force-kill any remaining python.exe from this component's directory
-        $compDir = Join-Path $Config.InstallRoot $Key
-        $finalCheck = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-        if ($finalCheck -and $finalCheck.Status -ne 'Stopped') {
-            Write-Warn "Service did not stop after ${waited}s, force-killing lingering processes..."
-            Write-FileLog -Path $uninstallLog -Text "WARN: service still $($finalCheck.Status) after ${waited}s, force-killing"
-        }
-        Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.ExecutablePath -like "$compDir*" } |
-            ForEach-Object {
-                Write-Host "    Force-killing lingering PID $($_.ProcessId)" -ForegroundColor Yellow
-                Write-FileLog -Path $uninstallLog -Text "Force-kill PID $($_.ProcessId): $($_.ExecutablePath)"
-                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        # --- Step 1: Stop the service (if running) — no force-kill, no silent skip ---
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($svc) {
+            if ($svc.Status -eq 'Running') {
+                Write-Host "    Stopping service $svcName..." -ForegroundColor Gray
+                Write-FileLog -Path $uninstallLog -Text "Stopping service $svcName (status: Running)"
+                try {
+                    Stop-Service -Name $svcName -ErrorAction Stop 2>&1 | Add-FileLog -Path $uninstallLog
+                } catch {
+                    Write-Err "Failed to stop service '$svcName': $_"
+                    Write-FileLog -Path $uninstallLog -Text "ERROR: Stop-Service failed: $_"
+                    throw "Cannot stop service '$svcName'. Please stop it manually or restart the computer, then run uninstall again."
+                }
+                Write-Host "    Waiting for service to fully stop (checking every 3s)..." -ForegroundColor Gray
+                $waited = 0
+                $maxChecks = 10
+                $stopped = $false
+                while ($waited -lt $maxChecks) {
+                    Start-Sleep -Seconds 3
+                    $waited++
+                    $check = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                    if (-not $check -or $check.Status -eq 'Stopped') {
+                        $stopped = $true
+                        break
+                    }
+                    Write-Host "      Check $waited/$maxChecks — service still $($check.Status)..." -ForegroundColor Gray
+                }
+                if (-not $stopped) {
+                    Write-Err "Service '$svcName' did not stop after $($maxChecks) checks (approx. 30s)."
+                    Write-Err "Please stop it manually or restart your computer, then run uninstall again."
+                    Write-FileLog -Path $uninstallLog -Text "ERROR: Service $svcName still running after $($maxChecks) checks — aborting uninstall"
+                    throw "Service '$svcName' refused to stop. Cannot proceed."
+                }
+                Write-Success "Service stopped"
+                Write-FileLog -Path $uninstallLog -Text "Service stopped successfully"
+            } else {
+                Write-Host "    Service already stopped (status: $($svc.Status))" -ForegroundColor Gray
+                Write-FileLog -Path $uninstallLog -Text "Service already stopped (status: $($svc.Status))"
             }
-        Start-Sleep -Seconds 1
+        } else {
+            Write-Host "    Service not found, nothing to stop" -ForegroundColor Gray
+            Write-FileLog -Path $uninstallLog -Text "Service not found, nothing to stop"
+        }
 
+        # --- Step 2: Unregister service ---
+        Write-Host "    Unregistering service..." -ForegroundColor Gray
+        Write-FileLog -Path $uninstallLog -Text "Unregistering service via servy-cli"
         servy-cli uninstall --name="$svcName" --quiet 2>&1 | Add-FileLog -Path $uninstallLog
         Start-Sleep -Milliseconds 500
 
         if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
-            Write-Warn "$svcName is still registered - restart your computer and re-run uninstall."
-            Write-FileLog -Path $uninstallLog -Text "WARN: $svcName still registered"
+            Write-Warn "$svcName is still registered — restart your computer and re-run uninstall."
+            Write-FileLog -Path $uninstallLog -Text "WARN: $svcName still registered after servy-cli uninstall"
         } else {
             Write-Success "$svcName service removed."
             Write-FileLog -Path $uninstallLog -Text "OK: $svcName removed"
         }
 
+        # --- Step 3: Delete files (only after service is confirmed stopped) ---
         if ($DeleteFiles) {
             $path = Join-Path $Config.InstallRoot $Key
             if (Test-Path $path) {
                 Write-Host "    Deleting $path..." -ForegroundColor Gray
-                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop 2>&1 | Add-FileLog -Path $uninstallLog
-                Write-Success "Deleted $path"
-                Write-FileLog -Path $uninstallLog -Text "OK: Deleted $path"
+                Write-FileLog -Path $uninstallLog -Text "Deleting $path"
+                try {
+                    Remove-Item -Path $path -Recurse -Force -ErrorAction Stop 2>&1 | Add-FileLog -Path $uninstallLog
+                    Write-Success "Deleted $path"
+                    Write-FileLog -Path $uninstallLog -Text "OK: Deleted $path"
+                } catch {
+                    Write-Err "Failed to delete $path"
+                    Write-FileLog -Path $uninstallLog -Text "ERROR deleting $path`: $_"
+                    throw "Could not delete '$path'. A process may have files locked there. Please restart and try again."
+                }
             }
             # Also remove this component's log subfolder
             $logSubDir = Join-Path (Join-Path $Config.InstallRoot "logs") $Key
