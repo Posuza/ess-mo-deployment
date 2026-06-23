@@ -1133,6 +1133,38 @@ function Install-Backend {
         $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
         $installLog = Join-Path $logsDir "backend_install_${ts}.log"
 
+        # --- 0. Stop the existing service FIRST so its venv DLLs/log files aren't locked ---
+        Write-Host "    Stopping existing backend service (if running)..." -ForegroundColor Gray
+        Write-FileLog -Path $installLog -Text "Stopping ess-mo-backend before touching files"
+        $existingSvc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($existingSvc -and $existingSvc.Status -eq 'Running') {
+            Stop-Service -Name $svcName -ErrorAction SilentlyContinue
+            Write-Host "    Waiting for service to fully stop..." -ForegroundColor Gray
+            $waited = 0
+            while ($waited -lt 15) {
+                Start-Sleep -Seconds 1
+                $waited++
+                $check = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                if (-not $check -or $check.Status -eq 'Stopped') { break }
+            }
+            $finalCheck = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if ($finalCheck -and $finalCheck.Status -ne 'Stopped') {
+                Write-Warn "Service did not stop cleanly after ${waited}s, forcing process kill..."
+                Write-FileLog -Path $installLog -Text "WARN: service still $($finalCheck.Status) after ${waited}s, force-killing python.exe under repo path"
+                Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.ExecutablePath -like "$repoDir*" } |
+                    ForEach-Object {
+                        Write-Host "    Force-killing PID $($_.ProcessId) ($($_.ExecutablePath))" -ForegroundColor Yellow
+                        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+                    }
+                Start-Sleep -Seconds 2
+            }
+            Write-Success "Backend service stopped"
+            Write-FileLog -Path $installLog -Text "Backend service stopped before file operations"
+        } else {
+            Write-Host "    Service not running, nothing to stop" -ForegroundColor Gray
+        }
+
         # --- 1. Persistent repo ---
         if (Test-Path (Join-Path $repoDir ".git")) {
             Write-Host "    Updating repo..." -ForegroundColor Gray
@@ -1248,6 +1280,9 @@ if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Fo
 
 $svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $serviceLog = Join-Path $logsDir "backend_service_${svcTs}.log"
+# Separate stdout/stderr files to avoid PowerShell 5.1 handle-lock on restart
+$stdoutLog = Join-Path $logsDir "backend_stdout_${svcTs}.log"
+$stderrLog = Join-Path $logsDir "backend_stderr_${svcTs}.log"
 
 "========== Service started at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Encoding ASCII
 
@@ -1267,9 +1302,21 @@ try {
 "    Working directory: $(Get-Location)" | Out-File -FilePath $serviceLog -Append
 "    Starting Python: $pythonExe" | Out-File -FilePath $serviceLog -Append
 "    Uvicorn: app.main:app --host 0.0.0.0 --port __BACKEND_PORT__" | Out-File -FilePath $serviceLog -Append
+"    Stdout log: $stdoutLog" | Out-File -FilePath $serviceLog -Append
+"    Stderr log: $stderrLog" | Out-File -FilePath $serviceLog -Append
 
 try {
-    & $pythonExe -m uvicorn app.main:app --host 0.0.0.0 --port __BACKEND_PORT__ 1>> $serviceLog 2>> $serviceLog
+    # Use Start-Process instead of direct & call with >> redirect.
+    # PowerShell 5.1 >> holds file handle open across process lifetime;
+    # Start-Process -RedirectStandard* writes via .NET handles that
+    # release immediately on crash, preventing "file in use" on restart.
+    $p = Start-Process -FilePath $pythonExe `
+        -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "__BACKEND_PORT__") `
+        -WorkingDirectory $repoDir `
+        -RedirectStandardOutput $stdoutLog `
+        -RedirectStandardError $stderrLog `
+        -NoNewWindow -Wait -PassThru
+    "    Uvicorn exit code: $($p.ExitCode)" | Out-File -FilePath $serviceLog -Append
 }
 catch {
     "FATAL: uvicorn launch threw: $_" | Out-File -FilePath $serviceLog -Append
@@ -1972,7 +2019,33 @@ function Remove-Component {
     Write-FileLog -Path $uninstallLog -Text "========== Uninstalling $Key =========="
 
     if (-not $script:dryRun) {
+        # --- Stop the service and wait for process to fully exit ---
+        Write-Host "    Stopping service $svcName..." -ForegroundColor Gray
         Stop-Service -Name $svcName -ErrorAction SilentlyContinue 2>&1 | Add-FileLog -Path $uninstallLog
+        Write-Host "    Waiting for service to fully stop..." -ForegroundColor Gray
+        $waited = 0
+        while ($waited -lt 15) {
+            Start-Sleep -Seconds 1
+            $waited++
+            $check = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if (-not $check -or $check.Status -eq 'Stopped') { break }
+        }
+        # Force-kill any remaining python.exe from this component's directory
+        $compDir = Join-Path $Config.InstallRoot $Key
+        $finalCheck = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($finalCheck -and $finalCheck.Status -ne 'Stopped') {
+            Write-Warn "Service did not stop after ${waited}s, force-killing lingering processes..."
+            Write-FileLog -Path $uninstallLog -Text "WARN: service still $($finalCheck.Status) after ${waited}s, force-killing"
+        }
+        Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -like "$compDir*" } |
+            ForEach-Object {
+                Write-Host "    Force-killing lingering PID $($_.ProcessId)" -ForegroundColor Yellow
+                Write-FileLog -Path $uninstallLog -Text "Force-kill PID $($_.ProcessId): $($_.ExecutablePath)"
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+        Start-Sleep -Seconds 1
+
         servy-cli uninstall --name="$svcName" --quiet 2>&1 | Add-FileLog -Path $uninstallLog
         Start-Sleep -Milliseconds 500
 
@@ -1987,7 +2060,8 @@ function Remove-Component {
         if ($DeleteFiles) {
             $path = Join-Path $Config.InstallRoot $Key
             if (Test-Path $path) {
-                Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue 2>&1 | Add-FileLog -Path $uninstallLog
+                Write-Host "    Deleting $path..." -ForegroundColor Gray
+                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop 2>&1 | Add-FileLog -Path $uninstallLog
                 Write-Success "Deleted $path"
                 Write-FileLog -Path $uninstallLog -Text "OK: Deleted $path"
             }
