@@ -1137,10 +1137,11 @@ function Install-Backend {
         Write-Host "    Checking for existing service..." -ForegroundColor Gray
         $existingSvc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
         if ($existingSvc) {
-            Write-Err "Service '$svcName' already exists (status: $($existingSvc.Status))."
-            Write-Err "Cannot install while service is registered. Please uninstall first (option 3)."
+            Write-Warn "Service '$svcName' already exists (status: $($existingSvc.Status))."
+            Write-Warn "Cannot install while service is registered. Uninstall first (option 3)."
             Write-FileLog -Path $installLog -Text "Refusing install: service $svcName already exists (status: $($existingSvc.Status))"
-            throw "Service '$svcName' already exists. Uninstall first (option 3), then install again."
+            Read-Host "`nPress Enter to go back to main menu"
+            return $false
         }
         Write-FileLog -Path $installLog -Text "No existing service found, proceeding"
 
