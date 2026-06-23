@@ -2263,6 +2263,14 @@ function Invoke-FullDeploy {
     }
 
     if ($allSucceeded -and $targetComponents -contains "backend") {
+        # Check if backend service already exists before attempting install
+        $existingBackendSvc = Get-Service -Name "ess-mo-backend" -ErrorAction SilentlyContinue
+        if ($existingBackendSvc) {
+            Write-Warn "Backend service 'ess-mo-backend' already exists (status: $($existingBackendSvc.Status))."
+            Write-Warn "Cannot install while service is registered. Uninstall first (option 3)."
+            Read-Host "`nPress Enter to go back to main menu"
+            return
+        }
         Write-Host "  Backend (port $($Config.BackendPort))..." -ForegroundColor Gray
         Start-Spinner "Installing Backend ..."
         $backendOk = Install-Backend -Config $Config -Secrets $secrets
