@@ -1151,7 +1151,7 @@ function Install-Backend {
             if ($finalCheck -and $finalCheck.Status -ne 'Stopped') {
                 Write-Warn "Service did not stop cleanly after ${waited}s, forcing process kill..."
                 Write-FileLog -Path $installLog -Text "WARN: service still $($finalCheck.Status) after ${waited}s, force-killing python.exe under repo path"
-                Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+                Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
                     Where-Object { $_.ExecutablePath -like "$repoDir*" } |
                     ForEach-Object {
                         Write-Host "    Force-killing PID $($_.ProcessId) ($($_.ExecutablePath))" -ForegroundColor Yellow
@@ -2037,7 +2037,7 @@ function Remove-Component {
             Write-Warn "Service did not stop after ${waited}s, force-killing lingering processes..."
             Write-FileLog -Path $uninstallLog -Text "WARN: service still $($finalCheck.Status) after ${waited}s, force-killing"
         }
-        Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+        Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
             Where-Object { $_.ExecutablePath -like "$compDir*" } |
             ForEach-Object {
                 Write-Host "    Force-killing lingering PID $($_.ProcessId)" -ForegroundColor Yellow
