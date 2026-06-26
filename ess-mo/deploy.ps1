@@ -991,25 +991,31 @@ function Install-Frontend {
             Write-FileLog -Path $installLog -Text "Repo exists, updating via git fetch + reset"
             Push-Location $repoDir
             git fetch --depth 1 origin main 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "git fetch failed with exit code $LASTEXITCODE" }
             git reset --hard origin/main 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "git reset failed with exit code $LASTEXITCODE" }
             Pop-Location
         } else {
             Write-Host "    Cloning repo (first time)..." -ForegroundColor Gray
             Write-FileLog -Path $installLog -Text "First-time clone"
             if (Test-Path $repoDir) { Remove-Item $repoDir -Recurse -Force }
             git clone $Config.FrontendRepo $repoDir 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "git clone failed with exit code $LASTEXITCODE" }
         }
 
         # --- 2. npm install ---
         Write-Host "    Installing dependencies..." -ForegroundColor Gray
         Push-Location $repoDir
         npm install 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) { throw "npm install failed with exit code $LASTEXITCODE" }
         npm install serve 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) { throw "npm install serve failed with exit code $LASTEXITCODE" }
 
         # --- 3. Build ---
         Write-Host "    Building..." -ForegroundColor Gray
         $env:VITE_API_URL = $Config.ApiPrefix
         npm run build 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) { throw "npm run build failed with exit code $LASTEXITCODE" }
         Pop-Location
 
         $distDir = Join-Path $repoDir "dist"
