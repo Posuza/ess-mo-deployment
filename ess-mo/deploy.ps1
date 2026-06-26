@@ -1040,24 +1040,73 @@ function Install-Frontend {
         # --- 7. Create / update service (PowerShell runner) ---
         $runnerScript = Join-Path $appDir "frontend-run.ps1"
         $runnerContent = @'
+$ErrorActionPreference = "Stop"
+
 $frontendDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoDir     = Join-Path $frontendDir "repo"
 $webRoot     = Join-Path $frontendDir "webroot"
 $curLink     = Join-Path $webRoot "current"
 $logsDir     = Join-Path (Join-Path (Split-Path $frontendDir -Parent) "logs") "frontend"
-if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
+
+if (-not (Test-Path $logsDir)) {
+    New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
+}
 
 $svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $serviceLog = Join-Path $logsDir "frontend_service_${svcTs}.log"
 
-"========== Service started at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Encoding ASCII
+function Write-ServiceLog {
+    param([string]$Text)
+    $line = "[{0}] {1}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"), $Text
+    Add-Content -Path $serviceLog -Value $line -Encoding UTF8
+}
 
-Set-Location -Path $frontendDir
-"    Working directory: $(Get-Location)" | Out-File -FilePath $serviceLog -Append
-"    Starting serve: npx --yes serve -s $curLink -l __FRONTEND_PORT__" | Out-File -FilePath $serviceLog -Append
+try {
+    Write-ServiceLog "========== Service started =========="
+    Write-ServiceLog "Frontend directory: $frontendDir"
+    Write-ServiceLog "Repo directory: $repoDir"
+    Write-ServiceLog "Webroot current: $curLink"
 
-npx --yes serve -s "$curLink" -l __FRONTEND_PORT__ 2>&1 >> $serviceLog
+    if (-not (Test-Path $curLink)) {
+        throw "Webroot current path not found: $curLink"
+    }
 
-"========== Service STOPPED at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Append
+    $nodeCmd = Get-Command node.exe -ErrorAction SilentlyContinue
+    if (-not $nodeCmd) {
+        throw "node.exe not found in PATH. Please install Node.js or add node.exe to system PATH."
+    }
+
+    $nodeExe = $nodeCmd.Source
+    Write-ServiceLog "Node executable: $nodeExe"
+
+    $serveMain = Join-Path $repoDir "node_modules\serve\build\main.js"
+
+    if (-not (Test-Path $serveMain)) {
+        throw "Local serve package not found: $serveMain. Run npm install serve in $repoDir or rerun deploy."
+    }
+
+    Write-ServiceLog "Starting frontend server:"
+    Write-ServiceLog "`"$nodeExe`" `"$serveMain`" -s `"$curLink`" -l __FRONTEND_PORT__"
+
+    Set-Location -Path $frontendDir
+
+    & $nodeExe $serveMain -s $curLink -l __FRONTEND_PORT__ 2>&1 |
+        ForEach-Object {
+            Write-ServiceLog $_
+        }
+
+    $exitCode = $LASTEXITCODE
+    Write-ServiceLog "Frontend server process exited with code: $exitCode"
+    exit $exitCode
+}
+catch {
+    Write-ServiceLog "ERROR: $($_.Exception.Message)"
+    Write-ServiceLog "========== Service STOPPED WITH ERROR =========="
+    exit 1
+}
+finally {
+    Write-ServiceLog "========== Service stopped =========="
+}
 '@
         $runnerContent = $runnerContent.Replace('__FRONTEND_PORT__', $appPort)
         Set-Content -Path $runnerScript -Value $runnerContent -Force
@@ -1129,81 +1178,210 @@ function Install-Backend {
     $svcName  = "ess-mo-backend"
     $appPort  = $Config.BackendPort
 
+    function Invoke-BackendLoggedCommand {
+        param(
+            [Parameter(Mandatory=$true)][string]$LogPath,
+            [Parameter(Mandatory=$true)][string]$StepName,
+            [Parameter(Mandatory=$true)][scriptblock]$Command
+        )
+
+        Write-FileLog -Path $LogPath -Text "--- $StepName ---"
+        & $Command 2>&1 | Add-FileLog -Path $LogPath
+        $exitCode = $LASTEXITCODE
+        Write-FileLog -Path $LogPath -Text "$StepName exit code: $exitCode"
+        if ($exitCode -ne 0) {
+            throw "$StepName failed with exit code $exitCode"
+        }
+    }
+
+    function Stop-BackendRuntime {
+        param(
+            [Parameter(Mandatory=$true)][string]$ServiceName,
+            [Parameter(Mandatory=$true)][string]$AppDir,
+            [Parameter(Mandatory=$true)][string]$RepoDir,
+            [Parameter(Mandatory=$true)][string]$LogPath
+        )
+
+        $runnerScript = Join-Path $AppDir "backend-run.ps1"
+
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($svc) {
+            Write-Host "    Existing backend service found: $ServiceName ($($svc.Status))" -ForegroundColor Gray
+            Write-FileLog -Path $LogPath -Text "Existing service found: $ServiceName status=$($svc.Status)"
+
+            if ($svc.Status -ne 'Stopped') {
+                Write-Host "    Stopping backend service..." -ForegroundColor Gray
+                Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 3
+            }
+
+            Write-Host "    Uninstalling existing backend service registration..." -ForegroundColor Gray
+            servy-cli uninstall --name="$ServiceName" --quiet 2>&1 | Add-FileLog -Path $LogPath
+            Start-Sleep -Seconds 2
+
+            $svcAfter = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+            if ($svcAfter) {
+                throw "Existing service '$ServiceName' could not be uninstalled. Stop/uninstall it first, then rerun deploy."
+            }
+        }
+
+        Write-Host "    Checking for stale backend processes that may lock venv files..." -ForegroundColor Gray
+        $staleProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.CommandLine -and
+                ($_.ProcessId -ne $PID) -and
+                (
+                    $_.CommandLine -like "*$RepoDir*" -or
+                    $_.CommandLine -like "*$runnerScript*"
+                )
+            }
+
+        foreach ($proc in $staleProcesses) {
+            Write-Host "    Killing stale process PID $($proc.ProcessId): $($proc.Name)" -ForegroundColor Yellow
+            Write-FileLog -Path $LogPath -Text "Killing stale process PID $($proc.ProcessId): $($proc.Name) :: $($proc.CommandLine)"
+            Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    function Remove-PathStrict {
+        param(
+            [Parameter(Mandatory=$true)][string]$Path,
+            [Parameter(Mandatory=$true)][string]$LogPath,
+            [int]$Attempts = 5
+        )
+
+        if (-not (Test-Path $Path)) { return }
+
+        for ($i = 1; $i -le $Attempts; $i++) {
+            try {
+                Write-FileLog -Path $LogPath -Text "Removing path attempt $i/${Attempts}: $Path"
+                Remove-Item $Path -Recurse -Force -ErrorAction Stop
+                Start-Sleep -Milliseconds 500
+                if (-not (Test-Path $Path)) {
+                    Write-FileLog -Path $LogPath -Text "Removed path successfully: $Path"
+                    return
+                }
+            } catch {
+                Write-FileLog -Path $LogPath -Text "Remove path failed attempt $i/${Attempts}: $Path :: $_"
+                Start-Sleep -Seconds 2
+            }
+        }
+
+        throw "Failed to remove path after $Attempts attempts: $Path. A service/process may still be locking files."
+    }
+
+    function Get-BackendPythonCreator {
+        param([Parameter(Mandatory=$true)][string]$LogPath)
+
+        $py = Get-Command py -ErrorAction SilentlyContinue
+        if ($py) {
+            $check311 = & py -3.11 -c "import sys; print(sys.version)" 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-FileLog -Path $LogPath -Text "Using Python launcher: py -3.11 ($check311)"
+                return @{ File = "py"; Args = @("-3.11") }
+            }
+
+            $check3 = & py -3 -c "import sys; print(sys.version)" 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-FileLog -Path $LogPath -Text "Using Python launcher: py -3 ($check3)"
+                return @{ File = "py"; Args = @("-3") }
+            }
+        }
+
+        $python = Get-Command python -ErrorAction SilentlyContinue
+        if ($python) {
+            $checkPython = & $python.Source -c "import sys; print(sys.version)" 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-FileLog -Path $LogPath -Text "Using python executable: $($python.Source) ($checkPython)"
+                return @{ File = $python.Source; Args = @() }
+            }
+        }
+
+        throw "No usable Python interpreter found. Install Python 3.11+ and ensure 'py' or 'python' is in PATH."
+    }
+
     try {
         $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
         $installLog = Join-Path $logsDir "backend_install_${ts}.log"
+        Write-FileLog -Path $installLog -Text "========== Backend install/update started =========="
+        Write-FileLog -Path $installLog -Text "Repo: $($Config.BackendRepo)"
+        Write-FileLog -Path $installLog -Text "RepoDir: $repoDir"
+        Write-FileLog -Path $installLog -Text "Port: $appPort"
 
-        # --- 0. Check if service already exists (install should never stop/uninstall — that's uninstall's job) ---
-        Write-Host "    Checking for existing service..." -ForegroundColor Gray
-        $existingSvc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-        if ($existingSvc) {
-            Write-Warn "Service '$svcName' already exists (status: $($existingSvc.Status))."
-            Write-Warn "Cannot install while service is registered. Uninstall first (option 3)."
-            Write-FileLog -Path $installLog -Text "Refusing install: service $svcName already exists (status: $($existingSvc.Status))"
-            Read-Host "`nPress Enter to go back to main menu"
-            return $false
-        }
-        Write-FileLog -Path $installLog -Text "No existing service found, proceeding"
+        # --- 0. Stop/uninstall existing backend service and kill stale processes before touching repo/venv ---
+        Stop-BackendRuntime -ServiceName $svcName -AppDir $appDir -RepoDir $repoDir -LogPath $installLog
 
-        # --- 1. Persistent repo ---
+        # --- 1. Clone or hard-reset backend repo ---
         if (Test-Path (Join-Path $repoDir ".git")) {
             Write-Host "    Updating repo..." -ForegroundColor Gray
             Write-FileLog -Path $installLog -Text "Repo exists, updating via git fetch + reset"
             Push-Location $repoDir
-            git fetch --depth 1 origin main 2>&1 | Add-FileLog -Path $installLog
-            git reset --hard origin/main 2>&1 | Add-FileLog -Path $installLog
-            Pop-Location
+            try {
+                Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git fetch" -Command { git fetch --prune origin main }
+                Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git reset" -Command { git reset --hard origin/main }
+            } finally {
+                Pop-Location
+            }
         } else {
-            Write-Host "    Cloning repo (first time)..." -ForegroundColor Gray
-            Write-FileLog -Path $installLog -Text "First-time clone"
-            if (Test-Path $repoDir) { Remove-Item $repoDir -Recurse -Force }
-            git clone $Config.BackendRepo $repoDir 2>&1 | Add-FileLog -Path $installLog
+            Write-Host "    Cloning repo..." -ForegroundColor Gray
+            Write-FileLog -Path $installLog -Text "Repo missing or incomplete, cloning fresh"
+            if (Test-Path $repoDir) {
+                Remove-PathStrict -Path $repoDir -LogPath $installLog
+            }
+            New-Item -Path $appDir -ItemType Directory -Force | Out-Null
+            Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git clone" -Command { git clone --depth 1 $Config.BackendRepo $repoDir }
+            if (-not (Test-Path (Join-Path $repoDir ".git"))) {
+                throw "Git clone completed but .git folder is missing: $repoDir"
+            }
         }
 
-        # --- 2. Virtual environment (create once, reuse) ---
+        # --- 2. Recreate virtual environment every backend deployment to avoid partially deleted/broken venv ---
         $venvDir = Join-Path $repoDir "venv"
         $pythonExe = Join-Path $venvDir "Scripts\python.exe"
+
+        if (Test-Path $venvDir) {
+            Write-Host "    Removing existing virtual environment..." -ForegroundColor Gray
+            Remove-PathStrict -Path $venvDir -LogPath $installLog
+        }
+
+        Write-Host "    Creating virtual environment..." -ForegroundColor Gray
+        $creator = Get-BackendPythonCreator -LogPath $installLog
+        Push-Location $repoDir
+        try {
+            $creatorFile = $creator.File
+            $creatorArgs = @()
+            $creatorArgs += $creator.Args
+            $creatorArgs += @("-m", "venv", "venv")
+            Write-FileLog -Path $installLog -Text "Creating venv command: $creatorFile $($creatorArgs -join ' ')"
+            & $creatorFile @creatorArgs 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) {
+                throw "Virtual environment creation failed with exit code $LASTEXITCODE"
+            }
+        } finally {
+            Pop-Location
+        }
+
         if (-not (Test-Path $pythonExe)) {
-            Write-Host "    Creating virtual environment..." -ForegroundColor Gray
-            Write-FileLog -Path $installLog -Text "Creating venv"
-            Push-Location $repoDir
-            python -m venv venv 2>&1 | Add-FileLog -Path $installLog
-            Pop-Location
-            if (-not (Test-Path $pythonExe)) {
-                throw "Virtual environment was not created"
-            }
-        } else {
-            Write-Host "    Virtual environment exists (skipping)" -ForegroundColor Gray
+            throw "Virtual environment was not created: $pythonExe"
         }
 
-        # --- 2b. Verify venv python.exe works ---
+        # --- 3. Verify venv python and install dependencies ---
         Write-Host "    Verifying venv python.exe..." -ForegroundColor Gray
-        $venvCheck = & $pythonExe -c "print('OK')" 2>&1
-        if ($venvCheck -notmatch "OK") {
-            Write-FileLog -Path $installLog -Text "Venv check failed: $venvCheck"
-            # Recreate venv if broken
-            Write-Host "    Venv python.exe is broken, recreating..." -ForegroundColor Yellow
-            Remove-Item $venvDir -Recurse -Force -ErrorAction SilentlyContinue
-            Push-Location $repoDir
-            python -m venv venv 2>&1 | Add-FileLog -Path $installLog
-            Pop-Location
-            if (-not (Test-Path $pythonExe)) {
-                throw "Virtual environment recreation failed"
-            }
-            $venvCheck2 = & $pythonExe -c "print('OK')" 2>&1
-            if ($venvCheck2 -notmatch "OK") {
-                throw "Venv python.exe still broken after recreation: $venvCheck2"
-            }
-            Write-Host "    Venv recreated successfully" -ForegroundColor Green
+        $venvCheck = & $pythonExe -c "import sys; print('VENV_OK'); print(sys.executable); print(sys.version)" 2>&1
+        Write-FileLog -Path $installLog -Text "Venv check output: $($venvCheck -join ' | ')"
+        $venvCheckText = $venvCheck -join " | "
+        if ($LASTEXITCODE -ne 0 -or $venvCheckText -notmatch "VENV_OK") {
+            throw "Venv python.exe check failed: $venvCheckText"
         }
 
-        # --- 3. Install / update dependencies (pip is smart — only delta) ---
         Write-Host "    Installing dependencies..." -ForegroundColor Gray
-        & $pythonExe -m pip install -r (Join-Path $repoDir "requirements.txt") 2>&1 | Add-FileLog -Path $installLog
+        Invoke-BackendLoggedCommand -LogPath $installLog -StepName "pip bootstrap" -Command { & $pythonExe -m pip install --upgrade pip setuptools wheel }
+        Invoke-BackendLoggedCommand -LogPath $installLog -StepName "pip install requirements" -Command { & $pythonExe -m pip install --no-cache-dir -r (Join-Path $repoDir "requirements.txt") }
 
-        # --- 4. Generate .env file ---
+        # --- 4. Generate .env file before app import verification ---
         Write-Host "    Generating .env file..." -ForegroundColor Gray
-        # Capture raw output, trim it, validate it
         $rawKey = & $pythonExe -c "import secrets; print(secrets.token_hex(32))" 2>&1
         $generatedKey = ($rawKey | Select-Object -Last 1).Trim()
         if ([string]::IsNullOrWhiteSpace($generatedKey) -or $generatedKey.Length -lt 16) {
@@ -1213,15 +1391,13 @@ function Install-Backend {
         }
         Write-FileLog -Path $installLog -Text "SECRET_KEY generated ($($generatedKey.Length) chars)"
 
-        # Escape values for .env: backslash first, then double-quote
-        # python-dotenv parses "key=\"val\"" as literal "val"
-        $envDbUser   = $Secrets.db.user.Replace('\', '\\').Replace('"', '\\"')
-        $envDbPass   = $Secrets.db.password.Replace('\', '\\').Replace('"', '\\"')
-        $envDbHost   = $Secrets.db.host.Replace('\', '\\').Replace('"', '\\"')
-        $envDbName   = $Secrets.db.name.Replace('\', '\\').Replace('"', '\\"')
-        $envSmtpUser = $Secrets.smtp.user.Replace('\', '\\').Replace('"', '\\"')
-        $envSmtpPass = $Secrets.smtp.pass.Replace('\', '\\').Replace('"', '\\"')
-        $envSmtpFrom = $Secrets.smtp.from.Replace('\', '\\').Replace('"', '\\"')
+        $envDbUser   = $Secrets.db.user.Replace('\', '\\').Replace('"', '\"')
+        $envDbPass   = $Secrets.db.password.Replace('\', '\\').Replace('"', '\"')
+        $envDbHost   = $Secrets.db.host.Replace('\', '\\').Replace('"', '\"')
+        $envDbName   = $Secrets.db.name.Replace('\', '\\').Replace('"', '\"')
+        $envSmtpUser = $Secrets.smtp.user.Replace('\', '\\').Replace('"', '\"')
+        $envSmtpPass = $Secrets.smtp.pass.Replace('\', '\\').Replace('"', '\"')
+        $envSmtpFrom = $Secrets.smtp.from.Replace('\', '\\').Replace('"', '\"')
 
         $envContent = @"
 DB_ENGINE=mysql
@@ -1241,15 +1417,38 @@ SMTP_USER="$envSmtpUser"
 SMTP_PASS="$envSmtpPass"
 EMAIL_FROM="$envSmtpFrom"
 "@
-        Set-Content -Path (Join-Path $repoDir ".env") -Value $envContent -Force
+        Set-Content -Path (Join-Path $repoDir ".env") -Value $envContent -Force -Encoding UTF8
         Write-FileLog -Path $installLog -Text ".env generated with SECRET_KEY ($($generatedKey.Length) chars)"
 
-        # --- 5. Create / update service (PowerShell runner) ---
+        # --- 5. Verify dependencies and app import before creating service ---
+        Write-Host "    Verifying backend dependencies..." -ForegroundColor Gray
+        $dependencyCheck = & $pythonExe -X faulthandler -c "import fastapi, uvicorn, sqlalchemy, pymysql; print('BACKEND_DEPS_OK')" 2>&1
+        Write-FileLog -Path $installLog -Text "Dependency check output: $($dependencyCheck -join ' | ')"
+        $dependencyCheckText = $dependencyCheck -join " | "
+        if ($LASTEXITCODE -ne 0 -or $dependencyCheckText -notmatch "BACKEND_DEPS_OK") {
+            throw "Backend dependency verification failed: $dependencyCheckText"
+        }
+
+        Write-Host "    Verifying FastAPI app import..." -ForegroundColor Gray
+        Push-Location $repoDir
+        try {
+            $appImportCheck = & $pythonExe -X faulthandler -c "import app.main; print('APP_IMPORT_OK')" 2>&1
+            Write-FileLog -Path $installLog -Text "App import check output: $($appImportCheck -join ' | ')"
+            $appImportCheckText = $appImportCheck -join " | "
+            if ($LASTEXITCODE -ne 0 -or $appImportCheckText -notmatch "APP_IMPORT_OK") {
+                throw "FastAPI app import verification failed: $appImportCheckText"
+            }
+        } finally {
+            Pop-Location
+        }
+
+        # --- 6. Create service runner ---
         $runnerScript = Join-Path $appDir "backend-run.ps1"
         $runnerContent = @'
 $ErrorActionPreference = "Continue"
 $ProgressPreference = "SilentlyContinue"
 $env:PYTHONUNBUFFERED = "1"
+$env:PYTHONFAULTHANDLER = "1"
 
 $backendDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoDir    = Join-Path $backendDir "repo"
@@ -1260,7 +1459,6 @@ if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Fo
 
 $svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $serviceLog = Join-Path $logsDir "backend_service_${svcTs}.log"
-# Separate stdout/stderr files to avoid PowerShell 5.1 handle-lock on restart
 $stdoutLog = Join-Path $logsDir "backend_stdout_${svcTs}.log"
 $stderrLog = Join-Path $logsDir "backend_stderr_${svcTs}.log"
 
@@ -1276,22 +1474,28 @@ try {
     Set-Location -Path $repoDir -ErrorAction Stop
 } catch {
     "FATAL: could not cd to $repoDir : $_" | Out-File -FilePath $serviceLog -Append
+    Start-Sleep -Seconds 5
     exit 1
 }
 
 "    Working directory: $(Get-Location)" | Out-File -FilePath $serviceLog -Append
 "    Starting Python: $pythonExe" | Out-File -FilePath $serviceLog -Append
-"    Uvicorn: app.main:app --host 0.0.0.0 --port __BACKEND_PORT__" | Out-File -FilePath $serviceLog -Append
+"    Uvicorn: -X faulthandler -u -m uvicorn app.main:app --host 0.0.0.0 --port __BACKEND_PORT__ --no-use-colors" | Out-File -FilePath $serviceLog -Append
 "    Stdout log: $stdoutLog" | Out-File -FilePath $serviceLog -Append
 "    Stderr log: $stderrLog" | Out-File -FilePath $serviceLog -Append
 
+$importCheck = & $pythonExe -X faulthandler -c "import uvicorn; print('UVICORN_OK')" 2>&1
+"    Import check: $($importCheck -join ' | ')" | Out-File -FilePath $serviceLog -Append
+$importCheckText = $importCheck -join " | "
+if ($LASTEXITCODE -ne 0 -or $importCheckText -notmatch "UVICORN_OK") {
+    "FATAL: uvicorn import failed: $importCheckText" | Out-File -FilePath $serviceLog -Append
+    Start-Sleep -Seconds 5
+    exit 1
+}
+
 try {
-    # Use Start-Process instead of direct & call with >> redirect.
-    # PowerShell 5.1 >> holds file handle open across process lifetime;
-    # Start-Process -RedirectStandard* writes via .NET handles that
-    # release immediately on crash, preventing "file in use" on restart.
     $p = Start-Process -FilePath $pythonExe `
-        -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "__BACKEND_PORT__") `
+        -ArgumentList @("-X", "faulthandler", "-u", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "__BACKEND_PORT__", "--no-use-colors") `
         -WorkingDirectory $repoDir `
         -RedirectStandardOutput $stdoutLog `
         -RedirectStandardError $stderrLog `
@@ -1305,9 +1509,10 @@ catch {
 "========== Service STOPPED at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Append
 '@
         $runnerContent = $runnerContent.Replace('__BACKEND_PORT__', $appPort)
-        Set-Content -Path $runnerScript -Value $runnerContent -Force
+        Set-Content -Path $runnerScript -Value $runnerContent -Force -Encoding UTF8
         Write-FileLog -Path $installLog -Text "Runner script written to $runnerScript"
 
+        # --- 7. Create backend service ---
         $powershellExe = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
         $paramStr = "-ExecutionPolicy Bypass -File `"$runnerScript`""
 
@@ -1316,11 +1521,10 @@ catch {
         Write-FileLog -Path $installLog -Text "Executable: $powershellExe"
         Write-FileLog -Path $installLog -Text "Parameters: $paramStr"
 
-        # Check if service name is still free (Step 0 already checked, but double-check after long install)
-        if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
-            throw "Service '$svcName' was created by another process during install. Please uninstall first (option 3)."
-        }
         servy-cli install --name="$svcName" --path="$powershellExe" --params="$paramStr" 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) {
+            throw "servy-cli install failed with exit code $LASTEXITCODE"
+        }
 
         if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
             throw "Service '$svcName' was not created by servy-cli"
@@ -1328,87 +1532,56 @@ catch {
         Write-FileLog -Path $installLog -Text "Service $svcName installed/updated"
         Write-Success "Service updated: $svcName"
 
-        # ---- Start the service and verify it runs (same pattern as Install-Caddy) ----
+        # --- 8. Start service and verify health endpoint ---
         Write-Host "    Starting backend service to verify..." -ForegroundColor Gray
         Write-FileLog -Path $installLog -Text "Starting backend service..."
-        try {
-            Start-Service -Name $svcName -ErrorAction Stop
-            Write-Host "    Backend service start command issued, waiting 6s for startup..." -ForegroundColor Gray
-            Write-FileLog -Path $installLog -Text "Start-Service command issued"
-            Start-Sleep -Seconds 6
+        Start-Service -Name $svcName -ErrorAction Stop
+        Write-FileLog -Path $installLog -Text "Start-Service command issued"
 
-            $svcStatus = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-            Write-FileLog -Path $installLog -Text "Service status after 6s: $($svcStatus.Status)"
-
-            if ($svcStatus.Status -eq 'Running') {
-                Write-Success "Backend service is RUNNING"
-                Write-FileLog -Path $installLog -Text "Backend service is RUNNING"
-            } else {
-                Write-Warn "Backend service status: $($svcStatus.Status) (not Running yet)"
-                Write-FileLog -Path $installLog -Text "WARN: Service status is $($svcStatus.Status)"
-            }
-
-            # ---- Check the runtime log for startup errors ----
+        $healthUrl = "http://127.0.0.1:$appPort/api/v1/health"
+        $healthOk = $false
+        for ($i = 1; $i -le 15; $i++) {
             Start-Sleep -Seconds 2
-            $latestLog = Get-ChildItem -Path $logsDir -Filter "backend_service_*.log" -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if ($latestLog) {
-                $logContent = Get-Content $latestLog.FullName -ErrorAction SilentlyContinue
-                Write-FileLog -Path $installLog -Text "--- Runtime log content (first 40 lines) ---"
-                $lineCount = 0
-                foreach ($_logLine in $logContent) {
-                    $lineCount++
-                    if ($lineCount -gt 40) {
-                        Write-FileLog -Path $installLog -Text "... (truncated, full log at $($latestLog.FullName))"
-                        break
-                    }
-                    Write-FileLog -Path $installLog -Text $_logLine
-                    if ($_logLine -match '(?i)(error|fail|panic|fatal|traceback|exception|cannot|unable|refused)') {
-                        Write-Host "    [LOG] $_logLine" -ForegroundColor Red
-                    }
-                }
-                Write-FileLog -Path $installLog -Text "--- end runtime log ---"
-            } else {
-                Write-Warn "Backend runtime log not found yet"
-                Write-FileLog -Path $installLog -Text "WARN: No runtime log found in $logsDir"
+            $svcStatus = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            Write-FileLog -Path $installLog -Text "Health poll $i/15: service status=$($svcStatus.Status) url=$healthUrl"
+
+            if (-not $svcStatus -or $svcStatus.Status -ne 'Running') {
+                continue
             }
 
-            # ---- Quick health check ----
             try {
-                $healthUrl = "http://127.0.0.1:$appPort/api/v1/health"
-                Write-FileLog -Path $installLog -Text "Running health check against $healthUrl"
-                $healthResponse = Invoke-WebRequest -Uri $healthUrl -TimeoutSec 5 -UseBasicParsing -ErrorAction SilentlyContinue
+                $healthResponse = Invoke-WebRequest -Uri $healthUrl -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
                 if ($healthResponse.StatusCode -eq 200) {
+                    $healthOk = $true
                     Write-Success "Backend health check passed (HTTP 200)"
-                    Write-FileLog -Path $installLog -Text "Health check OK: status=$($healthResponse.StatusCode)"
-                } else {
-                    Write-Warn "Backend health check returned HTTP $($healthResponse.StatusCode)"
-                    Write-FileLog -Path $installLog -Text "Health check returned HTTP $($healthResponse.StatusCode)"
+                    Write-FileLog -Path $installLog -Text "Health check OK: status=$($healthResponse.StatusCode) body=$($healthResponse.Content)"
+                    break
                 }
             } catch {
-                Write-Warn "Backend health check failed (service may still be starting): $_"
-                Write-FileLog -Path $installLog -Text "Health check failed: $_"
+                Write-FileLog -Path $installLog -Text "Health poll $i failed: $_"
+            }
+        }
+
+        if (-not $healthOk) {
+            Write-FileLog -Path $installLog -Text "Backend health check failed after polling"
+
+            foreach ($pattern in @("backend_service_*.log", "backend_stdout_*.log", "backend_stderr_*.log")) {
+                $latest = Get-ChildItem -Path $logsDir -Filter $pattern -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                if ($latest) {
+                    Write-FileLog -Path $installLog -Text "--- Last 80 lines of $($latest.Name) ---"
+                    Get-Content $latest.FullName -ErrorAction SilentlyContinue | Select-Object -Last 80 | ForEach-Object {
+                        Write-FileLog -Path $installLog -Text $_
+                    }
+                    Write-FileLog -Path $installLog -Text "--- end $($latest.Name) ---"
+                }
             }
 
-            Write-Host "    Backend service verified" -ForegroundColor Gray
-            Write-FileLog -Path $installLog -Text "Backend verification complete"
-        } catch {
-            $startError = $_
-            Write-Err "Failed to start backend service: $startError"
-            Write-FileLog -Path $installLog -Text "ERROR starting service: $startError"
-            # Dump runtime log if it exists
-            $latestErrLog = Get-ChildItem -Path $logsDir -Filter "backend_service_*.log" -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if ($latestErrLog) {
-                $errLog = Get-Content $latestErrLog.FullName -ErrorAction SilentlyContinue | Select-Object -Last 30
-                Write-FileLog -Path $installLog -Text "--- Last 30 lines of runtime log ($($latestErrLog.Name)) ---"
-                foreach ($_errLine in $errLog) {
-                    Write-FileLog -Path $installLog -Text $_errLine
-                }
-                Write-FileLog -Path $installLog -Text "--- end ---"
-            }
-            return $false
+            throw "Backend service did not pass health check: $healthUrl"
         }
+
+        Write-Host "    Backend service verified" -ForegroundColor Gray
+        Write-FileLog -Path $installLog -Text "Backend verification complete"
 
         $script:installedComponents += "backend"
         Write-Log "Backend installed/updated successfully on port $appPort"
@@ -2263,14 +2436,8 @@ function Invoke-FullDeploy {
     }
 
     if ($allSucceeded -and $targetComponents -contains "backend") {
-        # Check if backend service already exists before attempting install
-        $existingBackendSvc = Get-Service -Name "ess-mo-backend" -ErrorAction SilentlyContinue
-        if ($existingBackendSvc) {
-            Write-Warn "Backend service 'ess-mo-backend' already exists (status: $($existingBackendSvc.Status))."
-            Write-Warn "Cannot install while service is registered. Uninstall first (option 3)."
-            Read-Host "`nPress Enter to go back to main menu"
-            return
-        }
+        # Backend install function now safely stops/uninstalls any existing backend service
+        # and kills stale backend Python processes before replacing repo/venv.
         Write-Host "  Backend (port $($Config.BackendPort))..." -ForegroundColor Gray
         Start-Spinner "Installing Backend ..."
         $backendOk = Install-Backend -Config $Config -Secrets $secrets
