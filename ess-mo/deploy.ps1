@@ -1126,7 +1126,44 @@ finally {
         Write-FileLog -Path $installLog -Text "Executable: $powershellExe"
         Write-FileLog -Path $installLog -Text "Parameters: $paramStr"
 
-        servy-cli uninstall --name="$svcName" --quiet 2>&1 | Add-FileLog -Path $installLog
+        $existingSvc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($existingSvc) {
+            Write-Host "    Existing frontend service found: $svcName ($($existingSvc.Status))" -ForegroundColor Gray
+            Write-FileLog -Path $installLog -Text "Existing service found: $svcName status=$($existingSvc.Status)"
+
+            if ($existingSvc.Status -ne 'Stopped') {
+                Write-Host "    Stopping frontend service..." -ForegroundColor Gray
+                Write-FileLog -Path $installLog -Text "Stopping existing frontend service"
+                Stop-Service -Name $svcName -ErrorAction Stop
+
+                $stopped = $false
+                for ($i = 1; $i -le 10; $i++) {
+                    Start-Sleep -Seconds 2
+                    $checkSvc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                    if (-not $checkSvc -or $checkSvc.Status -eq 'Stopped') {
+                        $stopped = $true
+                        break
+                    }
+                    Write-FileLog -Path $installLog -Text "Stop wait $i/10: status=$($checkSvc.Status)"
+                }
+
+                if (-not $stopped) {
+                    throw "Existing service '$svcName' did not stop. Stop it manually, then rerun deploy."
+                }
+                Write-Success "Frontend service stopped"
+                Write-FileLog -Path $installLog -Text "Existing frontend service stopped"
+            }
+
+            Write-Host "    Unregistering existing frontend service..." -ForegroundColor Gray
+            servy-cli uninstall --name="$svcName" --quiet 2>&1 | Add-FileLog -Path $installLog
+            Start-Sleep -Seconds 2
+
+            if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
+                throw "Existing service '$svcName' could not be uninstalled. Uninstall it manually, then rerun deploy."
+            }
+            Write-FileLog -Path $installLog -Text "Existing frontend service unregistered"
+        }
+
         servy-cli install --name="$svcName" --path="$powershellExe" --params="$paramStr" 2>&1 | Add-FileLog -Path $installLog
 
         if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
@@ -1135,7 +1172,53 @@ finally {
         Write-FileLog -Path $installLog -Text "Service $svcName installed/updated"
         Write-Success "Service updated: $svcName"
 
-        # --- 8. Auto-cleanup: keep last 3 releases ---
+        # --- 8. Start service and verify frontend endpoint ---
+        Write-Host "    Starting frontend service to verify..." -ForegroundColor Gray
+        Write-FileLog -Path $installLog -Text "Starting frontend service..."
+        Start-Service -Name $svcName -ErrorAction Stop
+        Write-FileLog -Path $installLog -Text "Start-Service command issued"
+
+        $healthUrl = "http://127.0.0.1:$appPort"
+        $healthOk = $false
+        for ($i = 1; $i -le 15; $i++) {
+            Start-Sleep -Seconds 2
+            $svcStatus = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            Write-FileLog -Path $installLog -Text "Frontend poll $i/15: service status=$($svcStatus.Status) url=$healthUrl"
+
+            if (-not $svcStatus -or $svcStatus.Status -ne 'Running') {
+                continue
+            }
+
+            try {
+                $healthResponse = Invoke-WebRequest -Uri $healthUrl -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+                if ($healthResponse.StatusCode -ge 200 -and $healthResponse.StatusCode -lt 400) {
+                    $healthOk = $true
+                    Write-Success "Frontend health check passed (HTTP $($healthResponse.StatusCode))"
+                    Write-FileLog -Path $installLog -Text "Frontend health check OK: status=$($healthResponse.StatusCode)"
+                    break
+                }
+            } catch {
+                Write-FileLog -Path $installLog -Text "Frontend poll $i failed: $_"
+            }
+        }
+
+        if (-not $healthOk) {
+            $latestServiceLog = Get-ChildItem -Path $logsDir -Filter "frontend_service_*.log" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($latestServiceLog) {
+                Write-FileLog -Path $installLog -Text "--- Last 80 lines of $($latestServiceLog.Name) ---"
+                Get-Content $latestServiceLog.FullName -ErrorAction SilentlyContinue | Select-Object -Last 80 | ForEach-Object {
+                    Write-FileLog -Path $installLog -Text $_
+                }
+                Write-FileLog -Path $installLog -Text "--- end $($latestServiceLog.Name) ---"
+            }
+            throw "Frontend service did not pass health check: $healthUrl"
+        }
+
+        Write-Host "    Frontend service verified" -ForegroundColor Gray
+        Write-FileLog -Path $installLog -Text "Frontend verification complete"
+
+        # --- 9. Auto-cleanup: keep last 3 releases ---
         $keepCount = 3
         $releases = Get-ChildItem -Path $relDir -Directory | Sort-Object Name -Descending
         if ($releases.Count -gt $keepCount) {
