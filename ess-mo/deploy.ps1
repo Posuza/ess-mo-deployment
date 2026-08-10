@@ -2464,6 +2464,24 @@ function Get-Components {
     )
 }
 
+function Get-WorkerComponent {
+    param($Config)
+    return [PSCustomObject]@{
+        Num = 4
+        Key = "report-worker"
+        Service = (Get-DeployServiceName -Config $Config -Component "report-worker")
+        Display = "MO Report Worker"
+    }
+}
+
+function Get-ServiceComponents {
+    param($Config)
+    return @(
+        Get-Components -Config $Config
+        Get-WorkerComponent -Config $Config
+    )
+}
+
 function Invoke-ComponentInstall {
     param($Key, $Config)
     $result = $false
@@ -3276,6 +3294,10 @@ do {
                     Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor DarkGray
                 }
             }
+            $workerEntry = Get-WorkerComponent -Config $Config
+            $workerSvc = Get-Service -Name $workerEntry.Service -ErrorAction SilentlyContinue
+            $workerState = if ($workerSvc) { $workerSvc.Status } else { "NOT INSTALLED" }
+            Write-Host "    + $($workerEntry.Display) [$workerState; managed with Backend]" -ForegroundColor Gray
             Write-Host "  B) Back" -ForegroundColor Gray
             $sub = Read-Host "`nSelect to install"
             if ($sub -match '^[Aa]$') {
@@ -3310,6 +3332,10 @@ do {
                     Write-Host "  [NOT INSTALLED]" -ForegroundColor DarkGray
                 }
             }
+            $workerEntry = Get-WorkerComponent -Config $Config
+            $workerSvc = Get-Service -Name $workerEntry.Service -ErrorAction SilentlyContinue
+            $workerState = if ($workerSvc) { $workerSvc.Status } else { "NOT INSTALLED" }
+            Write-Host "    + $($workerEntry.Display) [$workerState; removed with Backend]" -ForegroundColor Gray
             Write-Host " B) Back" -ForegroundColor Gray
             $sub = Read-Host "`nSelect to uninstall"
             if ($sub -match '^[Aa]$') {
@@ -3370,7 +3396,7 @@ do {
             Initialize-Logger -Config $Config
             Write-Host ""
             Write-Host " A) Start all services" -ForegroundColor White
-            foreach ($c in Get-Components -Config $Config) {
+            foreach ($c in Get-ServiceComponents -Config $Config) {
                 $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
                 if ($svc -and $svc.Status -eq 'Running') {
                     Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Green -NoNewline
@@ -3388,7 +3414,7 @@ do {
             if ($sub -match '^[Aa]$') {
                 Start-AllServices -Config $Config
             } elseif ($sub -match '^\d+$') {
-                $c = Get-Components -Config $Config | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
+                $c = Get-ServiceComponents -Config $Config | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
                 if ($c) {
                     $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
                     if (-not $svc) {
@@ -3431,7 +3457,7 @@ do {
             Initialize-Logger -Config $Config
             Write-Host ""
             Write-Host " A) Stop all services" -ForegroundColor White
-            foreach ($c in Get-Components -Config $Config) {
+            foreach ($c in Get-ServiceComponents -Config $Config) {
                 $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
                 if ($svc -and $svc.Status -eq 'Running') {
                     Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Green -NoNewline
@@ -3449,7 +3475,7 @@ do {
             if ($sub -match '^[Aa]$') {
                 Stop-AllServices -Config $Config
             } elseif ($sub -match '^\d+$') {
-                $c = Get-Components -Config $Config | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
+                $c = Get-ServiceComponents -Config $Config | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
                 if ($c) {
                     $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
                     if (-not $svc) {

@@ -116,7 +116,7 @@ The script will:
 2. Ask for DB/SMTP credentials (if not pre-filled)
 3. Install each component:
    - **Frontend** — clones repo, `npm install`, builds, registers as Windows service
-   - **Backend** — clones repo, creates venv, `pip install`, generates `.env`, and registers the API plus `ess-mo-report-worker` services
+   - **Backend** — clones repo, creates venv, `pip install`, generates `.env`, and registers both the API and environment-specific MO report worker services
    - **Caddy** — downloads Caddy, creates `Caddyfile`, registers as service
 4. Optionally start all services and verify health
 
@@ -155,8 +155,8 @@ Use **option 7** to manage which services Caddy proxies to:
 | **2** | Install components — pick **A** (all), **1** (Frontend), **2** (Backend), **3** (Caddy), or **B** (back) |
 | **3** | Uninstall components — same submenu, with status indicators |
 | **4** | Show service status table + run health checks |
-| **5** | Start services — **A** (all), **1-3** (individual), **B** (back) |
-| **6** | Stop services — same submenu |
+| **5** | Start services — **A** (all), **1-4** (including MO Report Worker), **B** (back) |
+| **6** | Stop services — same submenu; the worker is service **4** |
 | **7** | Caddy proxy config — add/remove routes, change port |
 | **8** | Open logs folder in File Explorer |
 | **Q** | Quit |
