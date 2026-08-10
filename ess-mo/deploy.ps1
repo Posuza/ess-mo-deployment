@@ -58,6 +58,9 @@ $DefaultConfig = @{
     BackendPort  = 8009
     CaddyPort    = 9089
     ApiPrefix    = "/api/v1"
+    MoReportWorkerPollSeconds = 5
+    MoReportRetentionMinutes  = 1
+    MoReportSweepMinutes      = 0.1
     InstallRoot  = $null
 }
 
@@ -262,7 +265,15 @@ function Get-DeployConfig {
     if (Test-Path $ConfigPath) {
         $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
         # Ensure all fields exist (may be missing from older config files)
-        @('InstallRoot', 'CaddyPort', 'FrontendPort', 'BackendPort') | ForEach-Object {
+        @(
+            'InstallRoot',
+            'CaddyPort',
+            'FrontendPort',
+            'BackendPort',
+            'MoReportWorkerPollSeconds',
+            'MoReportRetentionMinutes',
+            'MoReportSweepMinutes'
+        ) | ForEach-Object {
             if (-not ($cfg | Get-Member -Name $_ -ErrorAction SilentlyContinue)) {
                 Add-Member -InputObject $cfg -NotePropertyName $_ -NotePropertyValue $DefaultConfig[$_]
             }
@@ -923,6 +934,12 @@ function Verify-Health {
     if (Get-Service -Name ess-mo-backend -ErrorAction SilentlyContinue) {
         if (-not (Test-Endpoint -Url "http://localhost:$($Config.BackendPort)$($Config.ApiPrefix)/health" -Name "Backend API")) { $allOk = $false }
     }
+    $workerSvc = Get-Service -Name ess-mo-report-worker -ErrorAction SilentlyContinue
+    if ($workerSvc -and $workerSvc.Status -ne 'Running') {
+        Write-Err "MO report worker: not running"
+        Write-Log "Health check failed: ess-mo-report-worker status=$($workerSvc.Status)" -Level "ERROR"
+        $allOk = $false
+    }
     if (Get-Service -Name ess-mo-frontend -ErrorAction SilentlyContinue) {
         if (-not (Test-Endpoint -Url "http://localhost:$($Config.FrontendPort)" -Name "Frontend")) { $allOk = $false }
     }
@@ -1169,6 +1186,16 @@ finally {
         if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
             throw "Service '$svcName' was not created by servy-cli"
         }
+        sc.exe config "$svcName" start= delayed-auto 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to configure service '$svcName' for automatic startup"
+        }
+        sc.exe failure "$svcName" reset= 86400 actions= restart/5000/restart/15000/restart/60000 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) { throw "Failed to configure recovery actions for service '$svcName'" }
+        sc.exe failureflag "$svcName" 1 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) { throw "Failed to enable non-crash recovery for service '$svcName'" }
+        Write-FileLog -Path $installLog -Text "Service $svcName startup type set to Automatic (Delayed Start)"
+        Write-FileLog -Path $installLog -Text "Service $svcName recovery actions configured"
         Write-FileLog -Path $installLog -Text "Service $svcName installed/updated"
         Write-Success "Service updated: $svcName"
 
@@ -1265,6 +1292,7 @@ function Install-Backend {
     $appDir   = Join-Path $Config.InstallRoot "backend"
     $repoDir  = Join-Path $appDir "repo"
     $svcName  = "ess-mo-backend"
+    $workerSvcName = "ess-mo-report-worker"
     $appPort  = $Config.BackendPort
 
     function Invoke-BackendLoggedCommand {
@@ -1285,7 +1313,7 @@ function Install-Backend {
 
     function Stop-BackendRuntime {
         param(
-            [Parameter(Mandatory=$true)][string]$ServiceName,
+            [Parameter(Mandatory=$true)][string[]]$ServiceNames,
             [Parameter(Mandatory=$true)][string]$AppDir,
             [Parameter(Mandatory=$true)][string]$RepoDir,
             [Parameter(Mandatory=$true)][string]$LogPath
@@ -1293,24 +1321,26 @@ function Install-Backend {
 
         $runnerScript = Join-Path $AppDir "backend-run.ps1"
 
-        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-        if ($svc) {
-            Write-Host "    Existing backend service found: $ServiceName ($($svc.Status))" -ForegroundColor Gray
-            Write-FileLog -Path $LogPath -Text "Existing service found: $ServiceName status=$($svc.Status)"
+        foreach ($serviceName in $ServiceNames) {
+            $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            if ($svc) {
+                Write-Host "    Existing service found: $serviceName ($($svc.Status))" -ForegroundColor Gray
+                Write-FileLog -Path $LogPath -Text "Existing service found: $serviceName status=$($svc.Status)"
 
-            if ($svc.Status -ne 'Stopped') {
-                Write-Host "    Stopping backend service..." -ForegroundColor Gray
-                Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 3
-            }
+                if ($svc.Status -ne 'Stopped') {
+                    Write-Host "    Stopping service $serviceName..." -ForegroundColor Gray
+                    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 3
+                }
 
-            Write-Host "    Uninstalling existing backend service registration..." -ForegroundColor Gray
-            servy-cli uninstall --name="$ServiceName" --quiet 2>&1 | Add-FileLog -Path $LogPath
-            Start-Sleep -Seconds 2
+                Write-Host "    Uninstalling service registration: $serviceName..." -ForegroundColor Gray
+                servy-cli uninstall --name="$serviceName" --quiet 2>&1 | Add-FileLog -Path $LogPath
+                Start-Sleep -Seconds 2
 
-            $svcAfter = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-            if ($svcAfter) {
-                throw "Existing service '$ServiceName' could not be uninstalled. Stop/uninstall it first, then rerun deploy."
+                $svcAfter = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+                if ($svcAfter) {
+                    throw "Existing service '$serviceName' could not be uninstalled. Stop/uninstall it first, then rerun deploy."
+                }
             }
         }
 
@@ -1399,8 +1429,8 @@ function Install-Backend {
         Write-FileLog -Path $installLog -Text "RepoDir: $repoDir"
         Write-FileLog -Path $installLog -Text "Port: $appPort"
 
-        # --- 0. Stop/uninstall existing backend service and kill stale processes before touching repo/venv ---
-        Stop-BackendRuntime -ServiceName $svcName -AppDir $appDir -RepoDir $repoDir -LogPath $installLog
+        # --- 0. Stop/uninstall API and worker services before touching repo/venv ---
+        Stop-BackendRuntime -ServiceNames @($svcName, $workerSvcName) -AppDir $appDir -RepoDir $repoDir -LogPath $installLog
 
         # --- 1. Clone or hard-reset backend repo ---
         if (Test-Path (Join-Path $repoDir ".git")) {
@@ -1505,6 +1535,11 @@ SMTP_PORT=587
 SMTP_USER="$envSmtpUser"
 SMTP_PASS="$envSmtpPass"
 EMAIL_FROM="$envSmtpFrom"
+
+MO_REPORT_EXPORT_WORKER_POLL_SECONDS=$($Config.MoReportWorkerPollSeconds)
+MO_REPORT_EXPORT_RETENTION_MINUTES=$($Config.MoReportRetentionMinutes)
+MO_REPORT_EXPORT_SWEEP_INTERVAL_MINUTES=$($Config.MoReportSweepMinutes)
+MO_REPORT_EXPORT_WORKER_LOG_LEVEL=INFO
 "@
         Set-Content -Path (Join-Path $repoDir ".env") -Value $envContent -Force -Encoding UTF8
         Write-FileLog -Path $installLog -Text ".env generated with SECRET_KEY ($($generatedKey.Length) chars)"
@@ -1526,6 +1561,19 @@ EMAIL_FROM="$envSmtpFrom"
             $appImportCheckText = $appImportCheck -join " | "
             if ($LASTEXITCODE -ne 0 -or $appImportCheckText -notmatch "APP_IMPORT_OK") {
                 throw "FastAPI app import verification failed: $appImportCheckText"
+            }
+        } finally {
+            Pop-Location
+        }
+
+        Write-Host "    Verifying MO report worker import..." -ForegroundColor Gray
+        Push-Location $repoDir
+        try {
+            $workerImportCheck = & $pythonExe -X faulthandler -c "import app.workers.mo_report_export_worker; print('WORKER_IMPORT_OK')" 2>&1
+            Write-FileLog -Path $installLog -Text "Worker import check output: $($workerImportCheck -join ' | ')"
+            $workerImportCheckText = $workerImportCheck -join " | "
+            if ($LASTEXITCODE -ne 0 -or $workerImportCheckText -notmatch "WORKER_IMPORT_OK") {
+                throw "MO report worker import verification failed: $workerImportCheckText"
             }
         } finally {
             Pop-Location
@@ -1601,9 +1649,78 @@ catch {
         Set-Content -Path $runnerScript -Value $runnerContent -Force -Encoding UTF8
         Write-FileLog -Path $installLog -Text "Runner script written to $runnerScript"
 
+        $workerRunnerScript = Join-Path $appDir "mo-report-worker-run.ps1"
+        $workerRunnerContent = @'
+$ErrorActionPreference = "Continue"
+$ProgressPreference = "SilentlyContinue"
+$env:PYTHONUNBUFFERED = "1"
+$env:PYTHONFAULTHANDLER = "1"
+
+$backendDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoDir    = Join-Path $backendDir "repo"
+$venvDir    = Join-Path $repoDir "venv"
+$pythonExe  = Join-Path $venvDir "Scripts\python.exe"
+$logsDir    = Join-Path (Join-Path (Split-Path $backendDir -Parent) "logs") "backend"
+if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
+
+$svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
+$serviceLog = Join-Path $logsDir "mo_report_worker_service_${svcTs}.log"
+$stdoutLog = Join-Path $logsDir "mo_report_worker_stdout_${svcTs}.log"
+$stderrLog = Join-Path $logsDir "mo_report_worker_stderr_${svcTs}.log"
+
+"========== Worker service started at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Encoding ASCII
+
+if (-not (Test-Path $pythonExe)) {
+    "FATAL: python.exe not found at $pythonExe" | Out-File -FilePath $serviceLog -Append
+    exit 1
+}
+
+try {
+    Set-Location -Path $repoDir -ErrorAction Stop
+} catch {
+    "FATAL: could not cd to $repoDir : $_" | Out-File -FilePath $serviceLog -Append
+    exit 1
+}
+
+"    Working directory: $(Get-Location)" | Out-File -FilePath $serviceLog -Append
+"    Worker: -X faulthandler -u -m app.workers.mo_report_export_worker" | Out-File -FilePath $serviceLog -Append
+"    Stdout log: $stdoutLog" | Out-File -FilePath $serviceLog -Append
+"    Stderr log: $stderrLog" | Out-File -FilePath $serviceLog -Append
+
+$importCheck = & $pythonExe -X faulthandler -c "import app.workers.mo_report_export_worker; print('WORKER_RUNTIME_OK')" 2>&1
+"    Import check: $($importCheck -join ' | ')" | Out-File -FilePath $serviceLog -Append
+$importCheckText = $importCheck -join " | "
+if ($LASTEXITCODE -ne 0 -or $importCheckText -notmatch "WORKER_RUNTIME_OK") {
+    "FATAL: worker import failed: $importCheckText" | Out-File -FilePath $serviceLog -Append
+    exit 1
+}
+
+$workerExitCode = 1
+try {
+    $p = Start-Process -FilePath $pythonExe `
+        -ArgumentList @("-X", "faulthandler", "-u", "-m", "app.workers.mo_report_export_worker") `
+        -WorkingDirectory $repoDir `
+        -RedirectStandardOutput $stdoutLog `
+        -RedirectStandardError $stderrLog `
+        -NoNewWindow -Wait -PassThru
+    $workerExitCode = $p.ExitCode
+    "    Worker exit code: $workerExitCode" | Out-File -FilePath $serviceLog -Append
+}
+catch {
+    "FATAL: worker launch threw: $_" | Out-File -FilePath $serviceLog -Append
+    $workerExitCode = 1
+}
+
+"========== Worker service STOPPED at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Append
+exit $workerExitCode
+'@
+        Set-Content -Path $workerRunnerScript -Value $workerRunnerContent -Force -Encoding UTF8
+        Write-FileLog -Path $installLog -Text "Worker runner script written to $workerRunnerScript"
+
         # --- 7. Create backend service ---
         $powershellExe = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
         $paramStr = "-ExecutionPolicy Bypass -File `"$runnerScript`""
+        $workerParamStr = "-ExecutionPolicy Bypass -File `"$workerRunnerScript`""
 
         Write-FileLog -Path $installLog -Text "--- Service creation ---"
         Write-FileLog -Path $installLog -Text "Service name: $svcName"
@@ -1618,14 +1735,68 @@ catch {
         if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
             throw "Service '$svcName' was not created by servy-cli"
         }
+        sc.exe config "$svcName" start= delayed-auto 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to configure service '$svcName' for automatic startup"
+        }
+        sc.exe failure "$svcName" reset= 86400 actions= restart/5000/restart/15000/restart/60000 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) { throw "Failed to configure recovery actions for service '$svcName'" }
+        sc.exe failureflag "$svcName" 1 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) { throw "Failed to enable non-crash recovery for service '$svcName'" }
+        Write-FileLog -Path $installLog -Text "Service $svcName startup type set to Automatic (Delayed Start)"
+        Write-FileLog -Path $installLog -Text "Service $svcName recovery actions configured"
         Write-FileLog -Path $installLog -Text "Service $svcName installed/updated"
         Write-Success "Service updated: $svcName"
+
+        Write-FileLog -Path $installLog -Text "--- Worker service creation ---"
+        Write-FileLog -Path $installLog -Text "Service name: $workerSvcName"
+        Write-FileLog -Path $installLog -Text "Parameters: $workerParamStr"
+        servy-cli install --name="$workerSvcName" --path="$powershellExe" --params="$workerParamStr" 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) {
+            throw "Worker servy-cli install failed with exit code $LASTEXITCODE"
+        }
+        if (-not (Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue)) {
+            throw "Service '$workerSvcName' was not created by servy-cli"
+        }
+        sc.exe config "$workerSvcName" start= delayed-auto 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to configure service '$workerSvcName' for delayed automatic startup"
+        }
+        sc.exe failure "$workerSvcName" reset= 86400 actions= restart/5000/restart/15000/restart/60000 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) { throw "Failed to configure recovery actions for service '$workerSvcName'" }
+        sc.exe failureflag "$workerSvcName" 1 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) { throw "Failed to enable non-crash recovery for service '$workerSvcName'" }
+        Write-FileLog -Path $installLog -Text "Service $workerSvcName startup type set to Automatic (Delayed Start)"
+        Write-FileLog -Path $installLog -Text "Service $workerSvcName recovery actions configured"
+        Write-Success "Service updated: $workerSvcName"
 
         # --- 8. Start service and verify health endpoint ---
         Write-Host "    Starting backend service to verify..." -ForegroundColor Gray
         Write-FileLog -Path $installLog -Text "Starting backend service..."
         Start-Service -Name $svcName -ErrorAction Stop
         Write-FileLog -Path $installLog -Text "Start-Service command issued"
+
+        Write-Host "    Starting MO report worker service to verify..." -ForegroundColor Gray
+        Start-Service -Name $workerSvcName -ErrorAction Stop
+        Start-Sleep -Seconds 2
+        $workerSvcStatus = Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue
+        if (-not $workerSvcStatus -or $workerSvcStatus.Status -ne 'Running') {
+            foreach ($pattern in @("mo_report_worker_service_*.log", "mo_report_worker_stdout_*.log", "mo_report_worker_stderr_*.log")) {
+                $latestWorkerLog = Get-ChildItem -Path $logsDir -Filter $pattern -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                if ($latestWorkerLog) {
+                    Write-FileLog -Path $installLog -Text "--- Last 80 lines of $($latestWorkerLog.Name) ---"
+                    Get-Content $latestWorkerLog.FullName -ErrorAction SilentlyContinue | Select-Object -Last 80 | ForEach-Object {
+                        Write-FileLog -Path $installLog -Text $_
+                        Write-Host "    [WORKER LOG] $_" -ForegroundColor Red
+                    }
+                    Write-FileLog -Path $installLog -Text "--- end $($latestWorkerLog.Name) ---"
+                }
+            }
+            throw "MO report worker service did not remain running"
+        }
+        Write-Success "MO report worker service is running"
+        Write-FileLog -Path $installLog -Text "Worker service status: $($workerSvcStatus.Status)"
 
         $healthUrl = "http://127.0.0.1:$appPort/api/v1/health"
         $healthOk = $false
@@ -1673,7 +1844,7 @@ catch {
         Write-FileLog -Path $installLog -Text "Backend verification complete"
 
         $script:installedComponents += "backend"
-        Write-Log "Backend installed/updated successfully on port $appPort"
+        Write-Log "Backend and MO report worker installed/updated successfully on port $appPort"
         return $true
 
     } catch {
@@ -1981,6 +2152,17 @@ $statusFile = Join-Path $caddyDir "caddy-ports.json"
             Write-FileLog -Path $caddyInstallLog -Text "sc query result: $svcCheck"
             throw "Service 'ess-mo-caddy' was not created by servy-cli"
         }
+        $scResult = sc.exe config "ess-mo-caddy" start= delayed-auto 2>&1
+        Write-FileLog -Path $caddyInstallLog -Text "sc.exe delayed-auto config: $scResult"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to configure service 'ess-mo-caddy' for automatic startup"
+        }
+        $scRecoveryResult = sc.exe failure "ess-mo-caddy" reset= 86400 actions= restart/5000/restart/15000/restart/60000 2>&1
+        Write-FileLog -Path $caddyInstallLog -Text "sc.exe recovery config: $scRecoveryResult"
+        if ($LASTEXITCODE -ne 0) { throw "Failed to configure recovery actions for service 'ess-mo-caddy'" }
+        $scFailureFlagResult = sc.exe failureflag "ess-mo-caddy" 1 2>&1
+        Write-FileLog -Path $caddyInstallLog -Text "sc.exe failureflag config: $scFailureFlagResult"
+        if ($LASTEXITCODE -ne 0) { throw "Failed to enable non-crash recovery for service 'ess-mo-caddy'" }
         Write-Success "Caddy service installed."
         Write-FileLog -Path $caddyInstallLog -Text "Service created successfully by servy-cli"
 
@@ -2264,6 +2446,26 @@ function Remove-Component {
     Write-FileLog -Path $uninstallLog -Text "========== Uninstalling $Key =========="
 
     if (-not $script:dryRun) {
+        # The MO report worker shares the backend repo and venv, so remove it first.
+        if ($Key -eq "backend") {
+            $workerSvcName = "ess-mo-report-worker"
+            $workerSvc = Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue
+            if ($workerSvc) {
+                if ($workerSvc.Status -ne 'Stopped') {
+                    Write-Host "    Stopping service $workerSvcName..." -ForegroundColor Gray
+                    Stop-Service -Name $workerSvcName -Force -ErrorAction Stop
+                    $workerSvc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+                }
+                servy-cli uninstall --name="$workerSvcName" --quiet 2>&1 | Add-FileLog -Path $uninstallLog
+                Start-Sleep -Milliseconds 500
+                if (Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue) {
+                    throw "Worker service '$workerSvcName' could not be uninstalled."
+                }
+                Write-Success "$workerSvcName service removed."
+                Write-FileLog -Path $uninstallLog -Text "OK: $workerSvcName removed"
+            }
+        }
+
         # --- Step 1: Stop the service (if running) — no force-kill, no silent skip ---
         $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
         if ($svc) {
@@ -2382,6 +2584,16 @@ function Start-AllServices {
             Write-Log "Failed to start $($c.Service): $_" -Level "ERROR"
         }
     }
+    $workerSvc = Get-Service -Name ess-mo-report-worker -ErrorAction SilentlyContinue
+    if ($workerSvc) {
+        try {
+            Start-Service -Name ess-mo-report-worker -ErrorAction Stop
+            Write-Success "Started MO Report Worker"
+            Write-Log "Service started: ess-mo-report-worker"
+        } catch {
+            Write-Err "Failed to start MO Report Worker: $_"
+        }
+    }
     # Show ports after Caddy starts (give runner time to write status file)
     if (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue) {
         Start-Sleep -Seconds 3
@@ -2404,6 +2616,11 @@ function Stop-AllServices {
         Write-Warn "[DRY-RUN] Would stop all running services"
         return
     }
+    if (Get-Service -Name ess-mo-report-worker -ErrorAction SilentlyContinue) {
+        Stop-Service -Name ess-mo-report-worker -ErrorAction SilentlyContinue
+        Write-Success "Stopped MO Report Worker"
+        Write-Log "Service stopped: ess-mo-report-worker"
+    }
     foreach ($c in Get-Components) {
         if (-not (Get-Service -Name $c.Service -ErrorAction SilentlyContinue)) { continue }
         Stop-Service -Name $c.Service -ErrorAction SilentlyContinue
@@ -2422,6 +2639,12 @@ function Show-Status {
             Service   = $c.Service
             State     = if ($svc) { $svc.Status } else { "Not installed" }
         }
+    }
+    $workerSvc = Get-Service -Name ess-mo-report-worker -ErrorAction SilentlyContinue
+    $rows += [PSCustomObject]@{
+        Component = "MO Report Worker"
+        Service   = "ess-mo-report-worker"
+        State     = if ($workerSvc) { $workerSvc.Status } else { "Not installed" }
     }
     $rows | Format-Table -AutoSize | Out-Host
 
@@ -3130,6 +3353,14 @@ do {
                         }
                         Write-Log "Started $($c.Display)"
                     }
+                    if ($c.Key -eq "backend" -and $svc) {
+                        $workerSvc = Get-Service -Name ess-mo-report-worker -ErrorAction SilentlyContinue
+                        if ($workerSvc -and $workerSvc.Status -ne 'Running') {
+                            Start-Service -Name ess-mo-report-worker -ErrorAction Stop
+                            Write-Success "Started MO Report Worker"
+                            Write-Log "Started MO Report Worker"
+                        }
+                    }
                 }
             }
         }
@@ -3169,6 +3400,14 @@ do {
                         Stop-Service -Name $c.Service -ErrorAction Stop
                         Write-Success "Stopped $($c.Display)"
                         Write-Log "Stopped $($c.Display)"
+                    }
+                    if ($c.Key -eq "backend") {
+                        $workerSvc = Get-Service -Name ess-mo-report-worker -ErrorAction SilentlyContinue
+                        if ($workerSvc -and $workerSvc.Status -eq 'Running') {
+                            Stop-Service -Name ess-mo-report-worker -ErrorAction Stop
+                            Write-Success "Stopped MO Report Worker"
+                            Write-Log "Stopped MO Report Worker"
+                        }
                     }
                 }
             }

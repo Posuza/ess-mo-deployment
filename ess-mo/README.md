@@ -2,7 +2,7 @@
 
 # Servy Full-Stack Deployment Manager
 
-Automates installing the **ESS MO** app (Vue frontend + FastAPI backend + Caddy reverse proxy) as Windows services via [Servy](https://github.com/servy-community/servy).
+Automates installing the **ESS MO** app (Vue frontend + FastAPI backend + MO report worker + Caddy reverse proxy) as Windows services via [Servy](https://github.com/servy-community/servy).
 
 ---
 
@@ -26,6 +26,9 @@ Created automatically on first run. Edit it to change:
 | `BackendPort` | `8009` | Port the backend API runs on | ✅ Change if needed |
 | `CaddyPort` | `8089` | Port the reverse proxy listens on | ✅ Change if needed |
 | `ApiPrefix` | `/api/v1` | API path prefix | ✅ Any prefix starting with `/` (e.g. `/api`, `/v2`) |
+| `MoReportWorkerPollSeconds` | `5` | How often the worker checks for queued reports | ✅ Change if needed |
+| `MoReportRetentionMinutes` | `1` | How long completed report PDFs remain downloadable | ✅ Set the required number of minutes |
+| `MoReportSweepMinutes` | `0.1` | How often expired report files are removed (`0.1` = 6 seconds) | ✅ Change if needed |
 | `InstallRoot` | *(set at startup)* | Where files get installed (e.g. `C:\Ess_Mo`) | ✅ Set at startup or edit in config |
 
 ### `deploy.secrets.json` — credentials (DB, SMTP)
@@ -102,7 +105,7 @@ The script will:
 2. Ask for DB/SMTP credentials (if not pre-filled)
 3. Install each component:
    - **Frontend** — clones repo, `npm install`, builds, registers as Windows service
-   - **Backend** — clones repo, creates venv, `pip install`, generates `.env`, registers as service
+   - **Backend** — clones repo, creates venv, `pip install`, generates `.env`, and registers the API plus `ess-mo-report-worker` services
    - **Caddy** — downloads Caddy, creates `Caddyfile`, registers as service
 4. Optionally start all services and verify health
 
@@ -178,6 +181,7 @@ Use **option 7** to manage which services Caddy proxies to:
 | **Port conflict** | Change Caddy port in option 7 (option 3) or edit `deploy.config.json` |
 | **Frontend build fails** | Check `logs/frontend_build.log` in the install directory |
 | **Backend won't start** | Check `logs/backend_pip.log` and verify `.env` has correct DB credentials |
+| **MO report worker won't start** | Check `logs/backend/mo_report_worker_stderr_*.log` and verify MySQL is reachable |
 | **Logs location** | `<InstallRoot>\logs\deploy-YYYYMMDD-HHmmss.log` |
 
 ---
