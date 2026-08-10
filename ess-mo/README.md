@@ -20,16 +20,27 @@ Created automatically on first run. Edit it to change:
 
 | Field | Default | What it does | Can be changed? |
 |---|---|---|---|
+| `Environment` | `production` | Selects isolated install and service names | ✅ Use `production` or `development` |
 | `FrontendRepo` | `Posuza/ESS_MO_Fronend` | Git repo for the Vue frontend | ✅ Replace with your own repo URL |
+| `FrontendBranch` | `main` | Frontend Git branch to deploy | ✅ Use `ver1` for development |
 | `BackendRepo` | `Posuza/ESS_MO_Backend` | Git repo for the FastAPI backend | ✅ Replace with your own repo URL |
+| `BackendBranch` | `main` | Backend Git branch to deploy | ✅ Use `ver1` for development |
 | `FrontendPort` | `3009` | Port the frontend serves on | ✅ Change if needed |
 | `BackendPort` | `8009` | Port the backend API runs on | ✅ Change if needed |
-| `CaddyPort` | `8089` | Port the reverse proxy listens on | ✅ Change if needed |
+| `CaddyPort` | `9089` | Port the reverse proxy listens on | ✅ Change if needed |
 | `ApiPrefix` | `/api/v1` | API path prefix | ✅ Any prefix starting with `/` (e.g. `/api`, `/v2`) |
 | `MoReportWorkerPollSeconds` | `5` | How often the worker checks for queued reports | ✅ Change if needed |
 | `MoReportRetentionMinutes` | `1` | How long completed report PDFs remain downloadable | ✅ Set the required number of minutes |
 | `MoReportSweepMinutes` | `0.1` | How often expired report files are removed (`0.1` = 6 seconds) | ✅ Change if needed |
-| `InstallRoot` | *(set at startup)* | Where files get installed (e.g. `C:\Ess_Mo`) | ✅ Set at startup or edit in config |
+| `InstallRoot` | *(set at startup)* | Derived from the selected drive and environment | ✅ `Ess_Mo` for production, `Ess_MO_dev` for development |
+
+Production services use the `ess-mo-*` prefix. Development services use
+`ess-mo-dev-*`, allowing both environments to run on the same machine when
+their configured ports are different.
+
+Ready-to-use profiles are provided in `deploy.production.config.json` and
+`deploy.development.config.json`. Copy the required profile over
+`deploy.config.json` before running the deployment script.
 
 ### `deploy.secrets.json` — credentials (DB, SMTP)
 

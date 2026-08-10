@@ -52,6 +52,7 @@ $SecretsExamplePath = Join-Path $ScriptRoot "deploy.secrets.example.json"
 
 # ---------- DEFAULT CONFIG ----------
 $DefaultConfig = @{
+    Environment = "production"
     FrontendRepo = "https://github.com/Posuza/ESS_MO_Fronend.git"
     FrontendBranch = "main"
     BackendRepo  = "https://github.com/Posuza/ESS_MO_Backend.git"
@@ -73,6 +74,35 @@ $script:logFile = $null
 $script:dryRun = $DryRun
 $script:hasErrors = $false
 $script:headless = $Force -or ($Components.Count -gt 0)
+
+# ===========================================================
+# ENVIRONMENT-SPECIFIC NAMES
+# ===========================================================
+function Get-DeployEnvironment {
+    param($Config)
+    return ("$($Config.Environment)").Trim().ToLowerInvariant()
+}
+
+function Get-InstallFolderName {
+    param($Config)
+    if ((Get-DeployEnvironment -Config $Config) -eq "development") {
+        return "Ess_MO_dev"
+    }
+    return "Ess_Mo"
+}
+
+function Get-ServicePrefix {
+    param($Config)
+    if ((Get-DeployEnvironment -Config $Config) -eq "development") {
+        return "ess-mo-dev"
+    }
+    return "ess-mo"
+}
+
+function Get-DeployServiceName {
+    param($Config, [Parameter(Mandatory=$true)][string]$Component)
+    return "$(Get-ServicePrefix -Config $Config)-$Component"
+}
 
 # ===========================================================
 # LOGGING
@@ -111,6 +141,7 @@ function Initialize-Logger {
     $timestamp = $script:startTime.ToString("yyyyMMdd-HHmmss")
     $script:logFile = Join-Path $logsDir "deploy-$timestamp.log"
     Write-Log "=== Deployment started ===" -Level "START"
+    Write-Log "Environment: $(Get-DeployEnvironment -Config $Config)" -Level "INFO"
     Write-Log "Config: $ConfigPath" -Level "INFO"
     Write-Log "Install root: $($Config.InstallRoot)" -Level "INFO"
     if ($script:dryRun) {
@@ -268,6 +299,7 @@ function Get-DeployConfig {
         $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
         # Ensure all fields exist (may be missing from older config files)
         @(
+            'Environment',
             'InstallRoot',
             'FrontendBranch',
             'BackendBranch',
@@ -281,6 +313,10 @@ function Get-DeployConfig {
             if (-not ($cfg | Get-Member -Name $_ -ErrorAction SilentlyContinue)) {
                 Add-Member -InputObject $cfg -NotePropertyName $_ -NotePropertyValue $DefaultConfig[$_]
             }
+        }
+        $cfg.Environment = Get-DeployEnvironment -Config $cfg
+        if ($cfg.Environment -notin @('production', 'development')) {
+            throw "Invalid Environment '$($cfg.Environment)'. Use 'production' or 'development'."
         }
         return $cfg
     }
@@ -298,6 +334,8 @@ function Save-DeployConfig {
 
 function Select-InstallDrive {
     param($Config)
+
+    $installFolder = Get-InstallFolderName -Config $Config
 
     # Collect all available drives (any letter that physically exists)
     $availDrives = Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue |
@@ -325,7 +363,12 @@ function Select-InstallDrive {
             Write-Log "Configured drive $drive not found among available drives" -Level "ERROR"
             return $null
         }
-        return $Config.InstallRoot
+        $newRoot = "$driveLetter`:\$installFolder"
+        if ($Config.InstallRoot -ne $newRoot) {
+            $Config.InstallRoot = $newRoot
+            Save-DeployConfig -Config $Config
+        }
+        return $newRoot
     }
 
     # Show what's available
@@ -368,7 +411,7 @@ function Select-InstallDrive {
         $valid = $true
     } while (-not $valid)
 
-    $newRoot = "$choice`:\Ess_Mo"
+    $newRoot = "$choice`:\$installFolder"
 
     if (-not $hasCurrent -or $newRoot -ne $Config.InstallRoot) {
         $Config.InstallRoot = $newRoot
@@ -933,21 +976,25 @@ function Test-Endpoint {
 function Verify-Health {
     param($Config)
     $allOk = $true
+    $backendSvcName = Get-DeployServiceName -Config $Config -Component "backend"
+    $workerSvcName = Get-DeployServiceName -Config $Config -Component "report-worker"
+    $frontendSvcName = Get-DeployServiceName -Config $Config -Component "frontend"
+    $caddySvcName = Get-DeployServiceName -Config $Config -Component "caddy"
     Write-Step "Verifying service health"
 
-    if (Get-Service -Name ess-mo-backend -ErrorAction SilentlyContinue) {
+    if (Get-Service -Name $backendSvcName -ErrorAction SilentlyContinue) {
         if (-not (Test-Endpoint -Url "http://localhost:$($Config.BackendPort)$($Config.ApiPrefix)/health" -Name "Backend API")) { $allOk = $false }
     }
-    $workerSvc = Get-Service -Name ess-mo-report-worker -ErrorAction SilentlyContinue
+    $workerSvc = Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue
     if ($workerSvc -and $workerSvc.Status -ne 'Running') {
         Write-Err "MO report worker: not running"
-        Write-Log "Health check failed: ess-mo-report-worker status=$($workerSvc.Status)" -Level "ERROR"
+        Write-Log "Health check failed: $workerSvcName status=$($workerSvc.Status)" -Level "ERROR"
         $allOk = $false
     }
-    if (Get-Service -Name ess-mo-frontend -ErrorAction SilentlyContinue) {
+    if (Get-Service -Name $frontendSvcName -ErrorAction SilentlyContinue) {
         if (-not (Test-Endpoint -Url "http://localhost:$($Config.FrontendPort)" -Name "Frontend")) { $allOk = $false }
     }
-    if (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue) {
+    if (Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue) {
         $caddyPorts = Get-CaddyActualPorts -Config $Config
         $caddyProxyPort = $caddyPorts.proxy
         if (-not (Test-Endpoint -Url "http://localhost:${caddyProxyPort}$($Config.ApiPrefix)/health" -Name "Caddy proxy")) { $allOk = $false }
@@ -958,7 +1005,7 @@ function Verify-Health {
     Write-Host " ── Ports ──" -ForegroundColor Cyan
     Write-Host "  Frontend : $($Config.FrontendPort)" -ForegroundColor Green
     Write-Host "  Backend  : $($Config.BackendPort)" -ForegroundColor Green
-    if (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue) {
+    if (Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue) {
         $caddyPorts = Get-CaddyActualPorts -Config $Config
         Write-Host "  Caddy proxy : $($caddyPorts.proxy)" -ForegroundColor Green
         if ($caddyPorts.admin) {
@@ -974,7 +1021,7 @@ function Verify-Health {
 
 # ===========================================================
 # COMPONENT INSTALLERS
-# Service name pattern: ess-mo-<key>   Folder pattern: <InstallRoot>\<key>
+# Service names and install root are derived from the configured environment.
 # ===========================================================
 function Install-Frontend {
     param($Config)
@@ -991,7 +1038,7 @@ function Install-Frontend {
     $webRoot  = Join-Path $appDir "webroot"
     $relDir   = Join-Path $webRoot "releases"
     $curLink  = Join-Path $webRoot "current"
-    $svcName  = "ess-mo-frontend"
+    $svcName  = Get-DeployServiceName -Config $Config -Component "frontend"
     $appPort  = $Config.FrontendPort
     $logsDir  = Join-Path (Join-Path $Config.InstallRoot "logs") "frontend"
     New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
@@ -1295,8 +1342,8 @@ function Install-Backend {
     New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
     $appDir   = Join-Path $Config.InstallRoot "backend"
     $repoDir  = Join-Path $appDir "repo"
-    $svcName  = "ess-mo-backend"
-    $workerSvcName = "ess-mo-report-worker"
+    $svcName  = Get-DeployServiceName -Config $Config -Component "backend"
+    $workerSvcName = Get-DeployServiceName -Config $Config -Component "report-worker"
     $appPort  = $Config.BackendPort
 
     function Invoke-BackendLoggedCommand {
@@ -1862,6 +1909,7 @@ exit $workerExitCode
 function Install-Caddy {
     param($Config)
     Initialize-InstallRoot -Config $Config
+    $caddySvcName = Get-DeployServiceName -Config $Config -Component "caddy"
     Write-Step "Installing Caddy"
 
     if ($script:dryRun) {
@@ -2086,16 +2134,16 @@ $statusFile = Join-Path $caddyDir "caddy-ports.json"
 
         # Stop only OUR Caddy service to release its ports (admin:2019, proxy:$($Config.CaddyPort))
         # This does NOT affect other Caddy instances from other deployments/apps
-        Write-Host "    Stopping old ess-mo-caddy service (if any)..." -ForegroundColor Gray
-        Write-FileLog -Path $caddyInstallLog -Text "Stopping old ess-mo-caddy service..."
-        Stop-Service -Name "ess-mo-caddy" -ErrorAction SilentlyContinue
+        Write-Host "    Stopping old $caddySvcName service (if any)..." -ForegroundColor Gray
+        Write-FileLog -Path $caddyInstallLog -Text "Stopping old $caddySvcName service..."
+        Stop-Service -Name $caddySvcName -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
         # Verify it stopped
-        $oldSvc = Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue
+        $oldSvc = Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue
         if ($oldSvc -and $oldSvc.Status -ne 'Stopped') {
-            Write-Warn "Old ess-mo-caddy service did not stop gracefully. Forcing..."
+            Write-Warn "Old $caddySvcName service did not stop gracefully. Forcing..."
             Write-FileLog -Path $caddyInstallLog -Text "WARN: Old service not stopped, status=$($oldSvc.Status)"
-            Stop-Service -Name "ess-mo-caddy" -Force -ErrorAction SilentlyContinue
+            Stop-Service -Name $caddySvcName -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 3
         }
         Write-FileLog -Path $caddyInstallLog -Text "Old service stopped."
@@ -2132,7 +2180,7 @@ $statusFile = Join-Path $caddyDir "caddy-ports.json"
 
         # Log the FULL service command for debugging
         Write-FileLog -Path $caddyInstallLog -Text "--- Service creation ---"
-        Write-FileLog -Path $caddyInstallLog -Text "Service name: ess-mo-caddy"
+        Write-FileLog -Path $caddyInstallLog -Text "Service name: $caddySvcName"
         Write-FileLog -Path $caddyInstallLog -Text "Executable: $powershellExe"
         Write-FileLog -Path $caddyInstallLog -Text "Parameters: $paramStr"
         Write-FileLog -Path $caddyInstallLog -Text "Runner script: $runnerScript"
@@ -2140,34 +2188,34 @@ $statusFile = Join-Path $caddyDir "caddy-ports.json"
 
         # Unregister old service (process already stopped above)
         Write-Host "    Unregistering old service definition..." -ForegroundColor Gray
-        $uninstallResult = servy-cli uninstall --name="ess-mo-caddy" --quiet 2>&1
+        $uninstallResult = servy-cli uninstall --name="$caddySvcName" --quiet 2>&1
         if ($uninstallResult) {
             Write-FileLog -Path $caddyInstallLog -Text "Uninstall output: $uninstallResult"
         }
         Start-Sleep -Milliseconds 500
 
         Write-Host "    Registering new Caddy service..." -ForegroundColor Gray
-        $installResult = servy-cli install --name="ess-mo-caddy" --path="$powershellExe" --params="$paramStr" 2>&1
+        $installResult = servy-cli install --name="$caddySvcName" --path="$powershellExe" --params="$paramStr" 2>&1
         Write-FileLog -Path $caddyInstallLog -Text "servy-cli install output: $installResult"
 
-        if (-not (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue)) {
+        if (-not (Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue)) {
             # servy-cli failed silently - try to get more info
             Write-FileLog -Path $caddyInstallLog -Text "ERROR: servy-cli did not create the service"
-            $svcCheck = sc.exe query ess-mo-caddy 2>&1 | Out-String
+            $svcCheck = sc.exe query $caddySvcName 2>&1 | Out-String
             Write-FileLog -Path $caddyInstallLog -Text "sc query result: $svcCheck"
-            throw "Service 'ess-mo-caddy' was not created by servy-cli"
+            throw "Service '$caddySvcName' was not created by servy-cli"
         }
-        $scResult = sc.exe config "ess-mo-caddy" start= delayed-auto 2>&1
+        $scResult = sc.exe config $caddySvcName start= delayed-auto 2>&1
         Write-FileLog -Path $caddyInstallLog -Text "sc.exe delayed-auto config: $scResult"
         if ($LASTEXITCODE -ne 0) {
-            throw "Failed to configure service 'ess-mo-caddy' for automatic startup"
+            throw "Failed to configure service '$caddySvcName' for automatic startup"
         }
-        $scRecoveryResult = sc.exe failure "ess-mo-caddy" reset= 86400 actions= restart/5000/restart/15000/restart/60000 2>&1
+        $scRecoveryResult = sc.exe failure $caddySvcName reset= 86400 actions= restart/5000/restart/15000/restart/60000 2>&1
         Write-FileLog -Path $caddyInstallLog -Text "sc.exe recovery config: $scRecoveryResult"
-        if ($LASTEXITCODE -ne 0) { throw "Failed to configure recovery actions for service 'ess-mo-caddy'" }
-        $scFailureFlagResult = sc.exe failureflag "ess-mo-caddy" 1 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Failed to configure recovery actions for service '$caddySvcName'" }
+        $scFailureFlagResult = sc.exe failureflag $caddySvcName 1 2>&1
         Write-FileLog -Path $caddyInstallLog -Text "sc.exe failureflag config: $scFailureFlagResult"
-        if ($LASTEXITCODE -ne 0) { throw "Failed to enable non-crash recovery for service 'ess-mo-caddy'" }
+        if ($LASTEXITCODE -ne 0) { throw "Failed to enable non-crash recovery for service '$caddySvcName'" }
         Write-Success "Caddy service installed."
         Write-FileLog -Path $caddyInstallLog -Text "Service created successfully by servy-cli"
 
@@ -2175,12 +2223,12 @@ $statusFile = Join-Path $caddyDir "caddy-ports.json"
         Write-Host "    Starting Caddy service..." -ForegroundColor Gray
         Write-FileLog -Path $caddyInstallLog -Text "Starting Caddy service..."
         try {
-            Start-Service -Name ess-mo-caddy -ErrorAction Stop
+            Start-Service -Name $caddySvcName -ErrorAction Stop
             Write-Host "    Caddy service start command issued, waiting 5s for startup..." -ForegroundColor Gray
             Write-FileLog -Path $caddyInstallLog -Text "Start-Service command issued"
             Start-Sleep -Seconds 5
 
-            $svcStatus = Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue
+            $svcStatus = Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue
             Write-FileLog -Path $caddyInstallLog -Text "Service status after 5s: $($svcStatus.Status)"
 
             if ($svcStatus.Status -eq 'Running') {
@@ -2277,7 +2325,7 @@ $statusFile = Join-Path $caddyDir "caddy-ports.json"
             Write-FileLog -Path $caddyInstallLog -Text "ERROR starting service: $startError"
             # Try to dump service status
             try {
-                $svcInfo = sc.exe query ess-mo-caddy 2>&1 | Out-String
+                $svcInfo = sc.exe query $caddySvcName 2>&1 | Out-String
                 Write-FileLog -Path $caddyInstallLog -Text "Service query: $svcInfo"
             } catch { }
             # Try to dump runtime log if it exists
@@ -2346,7 +2394,7 @@ function Invoke-RollbackApp {
 
     $relDir  = Join-Path (Join-Path (Join-Path $Config.InstallRoot $AppName) "webroot") "releases"
     $curLink = Join-Path (Join-Path (Join-Path $Config.InstallRoot $AppName) "webroot") "current"
-    $svcName = "ess-mo-$AppName"
+    $svcName = Get-DeployServiceName -Config $Config -Component $AppName
 
     if (-not (Test-Path $relDir)) {
         Write-Warn "No releases found for '$AppName'."
@@ -2408,10 +2456,11 @@ function Invoke-Rollback {
 # COMPONENT REGISTRY / DISPATCH
 # ===========================================================
 function Get-Components {
+    param($Config)
     return @(
-        [PSCustomObject]@{ Num = 1; Key = "frontend"; Service = "ess-mo-frontend"; Display = "Frontend (Node / Vite)" }
-        [PSCustomObject]@{ Num = 2; Key = "backend";  Service = "ess-mo-backend";  Display = "Backend (FastAPI)" }
-        [PSCustomObject]@{ Num = 3; Key = "caddy";    Service = "ess-mo-caddy";    Display = "Caddy reverse proxy" }
+        [PSCustomObject]@{ Num = 1; Key = "frontend"; Service = (Get-DeployServiceName -Config $Config -Component "frontend"); Display = "Frontend (Node / Vite)" }
+        [PSCustomObject]@{ Num = 2; Key = "backend";  Service = (Get-DeployServiceName -Config $Config -Component "backend");  Display = "Backend (FastAPI)" }
+        [PSCustomObject]@{ Num = 3; Key = "caddy";    Service = (Get-DeployServiceName -Config $Config -Component "caddy");    Display = "Caddy reverse proxy" }
     )
 }
 
@@ -2442,7 +2491,7 @@ function Invoke-ComponentInstall {
 
 function Remove-Component {
     param($Key, $Config, [switch]$DeleteFiles)
-    $svcName = "ess-mo-$Key"
+    $svcName = Get-DeployServiceName -Config $Config -Component $Key
     Write-Step "Removing $Key"
 
     # Log uninstall actions
@@ -2453,7 +2502,7 @@ function Remove-Component {
     if (-not $script:dryRun) {
         # The MO report worker shares the backend repo and venv, so remove it first.
         if ($Key -eq "backend") {
-            $workerSvcName = "ess-mo-report-worker"
+            $workerSvcName = Get-DeployServiceName -Config $Config -Component "report-worker"
             $workerSvc = Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue
             if ($workerSvc) {
                 if ($workerSvc.Status -ne 'Stopped') {
@@ -2565,12 +2614,14 @@ function Remove-Component {
 # ===========================================================
 function Start-AllServices {
     param($Config)
+    $workerSvcName = Get-DeployServiceName -Config $Config -Component "report-worker"
+    $caddySvcName = Get-DeployServiceName -Config $Config -Component "caddy"
     Write-Step "Starting services"
     if ($script:dryRun) {
         Write-Warn "[DRY-RUN] Would start all installed services"
         return
     }
-    foreach ($c in Get-Components) {
+    foreach ($c in Get-Components -Config $Config) {
         if (-not (Get-Service -Name $c.Service -ErrorAction SilentlyContinue)) {
             Write-Host "    Skipping $($c.Display) (not installed)" -ForegroundColor Gray
             continue
@@ -2589,18 +2640,18 @@ function Start-AllServices {
             Write-Log "Failed to start $($c.Service): $_" -Level "ERROR"
         }
     }
-    $workerSvc = Get-Service -Name ess-mo-report-worker -ErrorAction SilentlyContinue
+    $workerSvc = Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue
     if ($workerSvc) {
         try {
-            Start-Service -Name ess-mo-report-worker -ErrorAction Stop
+            Start-Service -Name $workerSvcName -ErrorAction Stop
             Write-Success "Started MO Report Worker"
-            Write-Log "Service started: ess-mo-report-worker"
+            Write-Log "Service started: $workerSvcName"
         } catch {
             Write-Err "Failed to start MO Report Worker: $_"
         }
     }
     # Show ports after Caddy starts (give runner time to write status file)
-    if (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue) {
+    if (Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue) {
         Start-Sleep -Seconds 3
         $caddyPorts = Get-CaddyActualPorts -Config $Config
         Write-Host ""
@@ -2616,17 +2667,18 @@ function Start-AllServices {
 
 function Stop-AllServices {
     param($Config)
+    $workerSvcName = Get-DeployServiceName -Config $Config -Component "report-worker"
     Write-Step "Stopping services"
     if ($script:dryRun) {
         Write-Warn "[DRY-RUN] Would stop all running services"
         return
     }
-    if (Get-Service -Name ess-mo-report-worker -ErrorAction SilentlyContinue) {
-        Stop-Service -Name ess-mo-report-worker -ErrorAction SilentlyContinue
+    if (Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue) {
+        Stop-Service -Name $workerSvcName -ErrorAction SilentlyContinue
         Write-Success "Stopped MO Report Worker"
-        Write-Log "Service stopped: ess-mo-report-worker"
+        Write-Log "Service stopped: $workerSvcName"
     }
-    foreach ($c in Get-Components) {
+    foreach ($c in Get-Components -Config $Config) {
         if (-not (Get-Service -Name $c.Service -ErrorAction SilentlyContinue)) { continue }
         Stop-Service -Name $c.Service -ErrorAction SilentlyContinue
         Write-Success "Stopped $($c.Display)"
@@ -2636,8 +2688,10 @@ function Stop-AllServices {
 
 function Show-Status {
     param($Config)
+    $workerSvcName = Get-DeployServiceName -Config $Config -Component "report-worker"
+    $caddySvcName = Get-DeployServiceName -Config $Config -Component "caddy"
     Write-Step "Service status"
-    $rows = foreach ($c in Get-Components) {
+    $rows = foreach ($c in Get-Components -Config $Config) {
         $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
         [PSCustomObject]@{
             Component = $c.Display
@@ -2645,10 +2699,10 @@ function Show-Status {
             State     = if ($svc) { $svc.Status } else { "Not installed" }
         }
     }
-    $workerSvc = Get-Service -Name ess-mo-report-worker -ErrorAction SilentlyContinue
+    $workerSvc = Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue
     $rows += [PSCustomObject]@{
         Component = "MO Report Worker"
-        Service   = "ess-mo-report-worker"
+        Service   = $workerSvcName
         State     = if ($workerSvc) { $workerSvc.Status } else { "Not installed" }
     }
     $rows | Format-Table -AutoSize | Out-Host
@@ -2657,7 +2711,7 @@ function Show-Status {
     Write-Host " ── Addresses ──" -ForegroundColor Cyan
     Write-Host "  Frontend : http://localhost:$($Config.FrontendPort)" -ForegroundColor Green
     Write-Host "  Backend  : http://localhost:$($Config.BackendPort)$($Config.ApiPrefix)" -ForegroundColor Green
-    if (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue) {
+    if (Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue) {
         $caddyPorts = Get-CaddyActualPorts -Config $Config
         Write-Host "  Caddy proxy : http://localhost:$($caddyPorts.proxy)" -ForegroundColor Green
         if ($caddyPorts.admin) {
@@ -2852,6 +2906,7 @@ function Show-MainMenu {
     Write-Host "============================================" -ForegroundColor Cyan
     Write-Host " Servy Full-Stack Deployment Manager" -ForegroundColor Cyan
     Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host " Environment: $(Get-DeployEnvironment -Config $Config)" -ForegroundColor Gray
     if ([string]::IsNullOrWhiteSpace($Config.InstallRoot)) {
         Write-Host " [!] Install path: NOT SET - restart the script to set it" -ForegroundColor Red
     } else {
@@ -2872,6 +2927,7 @@ function Show-MainMenu {
 
 function Show-CaddyConfig {
     param($Config)
+    $caddySvcName = Get-DeployServiceName -Config $Config -Component "caddy"
     do {
         $changed = $false
 
@@ -3033,7 +3089,7 @@ function Show-CaddyConfig {
         }
 
         # If Caddy is installed and something changed, regenerate Caddyfile and restart
-        if ($changed -and (Get-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue)) {
+        if ($changed -and (Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue)) {
             if (Confirm-Step "Regenerate Caddyfile and restart Caddy?" -DefaultYes:$true) {
                 $caddyDir = Join-Path $Config.InstallRoot "caddy"
                 $caddyfilePath = Join-Path $caddyDir "Caddyfile"
@@ -3139,7 +3195,7 @@ $statusFile = Join-Path $caddyDir "caddy-ports.json"
                 $runnerContent = $runnerContent.Replace('__DEFAULT_PROXY_PORT__', $defaultProxyPort)
                 Set-Content -Path $runnerScript -Value $runnerContent -Force
 
-                Restart-Service -Name ess-mo-caddy -ErrorAction SilentlyContinue
+                Restart-Service -Name $caddySvcName -ErrorAction SilentlyContinue
                 Write-Success "Caddy restarted with new config"
                 Write-Host "    Caddyfile and runner script regenerated" -ForegroundColor Gray
             }
@@ -3150,8 +3206,8 @@ $statusFile = Join-Path $caddyDir "caddy-ports.json"
 
 
 function Select-Component {
-    param([string]$ActionLabel)
-    $compList = Get-Components
+    param([string]$ActionLabel, $Config)
+    $compList = Get-Components -Config $Config
     Write-Host ""
     foreach ($c in $compList) {
         $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
@@ -3176,6 +3232,7 @@ function Select-Component {
 # ENTRY POINT
 # ===========================================================
 $Config = Get-DeployConfig
+$menuWorkerSvcName = Get-DeployServiceName -Config $Config -Component "report-worker"
 
 if ($script:headless) {
     # Non-interactive mode - validate drive then run
@@ -3204,7 +3261,7 @@ do {
         }
         "^2$" {
             # Install components - sub-prompt
-            $compList = Get-Components
+            $compList = Get-Components -Config $Config
             Write-Host ""
             Write-Host " A) Install everything (full deployment)" -ForegroundColor White
             foreach ($c in $compList) {
@@ -3237,7 +3294,7 @@ do {
         }
         "^3$" {
             # Uninstall components - sub-prompt
-            $compList = Get-Components
+            $compList = Get-Components -Config $Config
             Write-Host ""
             Write-Host " A) Uninstall everything" -ForegroundColor White
             foreach ($c in $compList) {
@@ -3274,7 +3331,7 @@ do {
                             Remove-Component -Key $c.Key -Config $Config -DeleteFiles:$delFiles
                         }
                         # Then ask about logs and root folder
-                        if ($delFiles -and (Confirm-Step "Delete logs/ folder and Ess_Mo root folder too?" -DefaultYes:$false)) {
+                        if ($delFiles -and (Confirm-Step "Delete logs/ folder and $($Config.InstallRoot) root folder too?" -DefaultYes:$false)) {
                             $logsPath = Join-Path $Config.InstallRoot "logs"
                             if (Test-Path $logsPath) {
                                 Remove-Item $logsPath -Recurse -Force -ErrorAction SilentlyContinue
@@ -3313,7 +3370,7 @@ do {
             Initialize-Logger -Config $Config
             Write-Host ""
             Write-Host " A) Start all services" -ForegroundColor White
-            foreach ($c in Get-Components) {
+            foreach ($c in Get-Components -Config $Config) {
                 $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
                 if ($svc -and $svc.Status -eq 'Running') {
                     Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Green -NoNewline
@@ -3331,7 +3388,7 @@ do {
             if ($sub -match '^[Aa]$') {
                 Start-AllServices -Config $Config
             } elseif ($sub -match '^\d+$') {
-                $c = Get-Components | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
+                $c = Get-Components -Config $Config | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
                 if ($c) {
                     $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
                     if (-not $svc) {
@@ -3359,9 +3416,9 @@ do {
                         Write-Log "Started $($c.Display)"
                     }
                     if ($c.Key -eq "backend" -and $svc) {
-                        $workerSvc = Get-Service -Name ess-mo-report-worker -ErrorAction SilentlyContinue
+                        $workerSvc = Get-Service -Name $menuWorkerSvcName -ErrorAction SilentlyContinue
                         if ($workerSvc -and $workerSvc.Status -ne 'Running') {
-                            Start-Service -Name ess-mo-report-worker -ErrorAction Stop
+                            Start-Service -Name $menuWorkerSvcName -ErrorAction Stop
                             Write-Success "Started MO Report Worker"
                             Write-Log "Started MO Report Worker"
                         }
@@ -3374,7 +3431,7 @@ do {
             Initialize-Logger -Config $Config
             Write-Host ""
             Write-Host " A) Stop all services" -ForegroundColor White
-            foreach ($c in Get-Components) {
+            foreach ($c in Get-Components -Config $Config) {
                 $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
                 if ($svc -and $svc.Status -eq 'Running') {
                     Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Green -NoNewline
@@ -3392,7 +3449,7 @@ do {
             if ($sub -match '^[Aa]$') {
                 Stop-AllServices -Config $Config
             } elseif ($sub -match '^\d+$') {
-                $c = Get-Components | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
+                $c = Get-Components -Config $Config | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
                 if ($c) {
                     $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
                     if (-not $svc) {
@@ -3407,9 +3464,9 @@ do {
                         Write-Log "Stopped $($c.Display)"
                     }
                     if ($c.Key -eq "backend") {
-                        $workerSvc = Get-Service -Name ess-mo-report-worker -ErrorAction SilentlyContinue
+                        $workerSvc = Get-Service -Name $menuWorkerSvcName -ErrorAction SilentlyContinue
                         if ($workerSvc -and $workerSvc.Status -eq 'Running') {
-                            Stop-Service -Name ess-mo-report-worker -ErrorAction Stop
+                            Stop-Service -Name $menuWorkerSvcName -ErrorAction Stop
                             Write-Success "Stopped MO Report Worker"
                             Write-Log "Stopped MO Report Worker"
                         }
