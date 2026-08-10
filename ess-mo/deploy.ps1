@@ -53,7 +53,9 @@ $SecretsExamplePath = Join-Path $ScriptRoot "deploy.secrets.example.json"
 # ---------- DEFAULT CONFIG ----------
 $DefaultConfig = @{
     FrontendRepo = "https://github.com/Posuza/ESS_MO_Fronend.git"
+    FrontendBranch = "main"
     BackendRepo  = "https://github.com/Posuza/ESS_MO_Backend.git"
+    BackendBranch = "main"
     FrontendPort = 3009
     BackendPort  = 8009
     CaddyPort    = 9089
@@ -267,6 +269,8 @@ function Get-DeployConfig {
         # Ensure all fields exist (may be missing from older config files)
         @(
             'InstallRoot',
+            'FrontendBranch',
+            'BackendBranch',
             'CaddyPort',
             'FrontendPort',
             'BackendPort',
@@ -978,7 +982,7 @@ function Install-Frontend {
     Write-Step "Installing / Updating Frontend"
 
     if ($script:dryRun) {
-        Write-Warn "[DRY-RUN] Would install Frontend from $($Config.FrontendRepo) on port $($Config.FrontendPort)"
+        Write-Warn "[DRY-RUN] Would install Frontend from $($Config.FrontendRepo), branch $($Config.FrontendBranch), on port $($Config.FrontendPort)"
         return $true
     }
 
@@ -1007,16 +1011,16 @@ function Install-Frontend {
             Write-Host "    Updating repo..." -ForegroundColor Gray
             Write-FileLog -Path $installLog -Text "Repo exists, updating via git fetch + reset"
             Push-Location $repoDir
-            git fetch --depth 1 origin main 2>&1 | Add-FileLog -Path $installLog
+            git fetch --depth 1 origin $Config.FrontendBranch 2>&1 | Add-FileLog -Path $installLog
             if ($LASTEXITCODE -ne 0) { throw "git fetch failed with exit code $LASTEXITCODE" }
-            git reset --hard origin/main 2>&1 | Add-FileLog -Path $installLog
+            git reset --hard "origin/$($Config.FrontendBranch)" 2>&1 | Add-FileLog -Path $installLog
             if ($LASTEXITCODE -ne 0) { throw "git reset failed with exit code $LASTEXITCODE" }
             Pop-Location
         } else {
             Write-Host "    Cloning repo (first time)..." -ForegroundColor Gray
             Write-FileLog -Path $installLog -Text "First-time clone"
             if (Test-Path $repoDir) { Remove-Item $repoDir -Recurse -Force }
-            git clone $Config.FrontendRepo $repoDir 2>&1 | Add-FileLog -Path $installLog
+            git clone --depth 1 --branch $Config.FrontendBranch $Config.FrontendRepo $repoDir 2>&1 | Add-FileLog -Path $installLog
             if ($LASTEXITCODE -ne 0) { throw "git clone failed with exit code $LASTEXITCODE" }
         }
 
@@ -1283,7 +1287,7 @@ function Install-Backend {
     Write-Step "Installing / Updating Backend"
 
     if ($script:dryRun) {
-        Write-Warn "[DRY-RUN] Would install Backend from $($Config.BackendRepo) on port $($Config.BackendPort)"
+        Write-Warn "[DRY-RUN] Would install Backend from $($Config.BackendRepo), branch $($Config.BackendBranch), on port $($Config.BackendPort)"
         return $true
     }
 
@@ -1426,6 +1430,7 @@ function Install-Backend {
         $installLog = Join-Path $logsDir "backend_install_${ts}.log"
         Write-FileLog -Path $installLog -Text "========== Backend install/update started =========="
         Write-FileLog -Path $installLog -Text "Repo: $($Config.BackendRepo)"
+        Write-FileLog -Path $installLog -Text "Branch: $($Config.BackendBranch)"
         Write-FileLog -Path $installLog -Text "RepoDir: $repoDir"
         Write-FileLog -Path $installLog -Text "Port: $appPort"
 
@@ -1438,8 +1443,8 @@ function Install-Backend {
             Write-FileLog -Path $installLog -Text "Repo exists, updating via git fetch + reset"
             Push-Location $repoDir
             try {
-                Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git fetch" -Command { git fetch --prune origin main }
-                Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git reset" -Command { git reset --hard origin/main }
+                Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git fetch" -Command { git fetch --prune origin $Config.BackendBranch }
+                Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git reset" -Command { git reset --hard "origin/$($Config.BackendBranch)" }
             } finally {
                 Pop-Location
             }
@@ -1450,7 +1455,7 @@ function Install-Backend {
                 Remove-PathStrict -Path $repoDir -LogPath $installLog
             }
             New-Item -Path $appDir -ItemType Directory -Force | Out-Null
-            Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git clone" -Command { git clone --depth 1 $Config.BackendRepo $repoDir }
+            Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git clone" -Command { git clone --depth 1 --branch $Config.BackendBranch $Config.BackendRepo $repoDir }
             if (-not (Test-Path (Join-Path $repoDir ".git"))) {
                 throw "Git clone completed but .git folder is missing: $repoDir"
             }
