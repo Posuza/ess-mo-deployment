@@ -143,6 +143,7 @@ function Initialize-Logger {
     $timestamp = $script:startTime.ToString("yyyyMMdd-HHmmss")
     $script:logFile = Join-Path $logsDir "deploy-$timestamp.log"
     Write-Log "=== Deployment started ===" -Level "START"
+    Write-Log "Script: $PSCommandPath" -Level "INFO"
     Write-Log "Environment: $(Get-DeployEnvironment -Config $Config)" -Level "INFO"
     Write-Log "Config: $ConfigPath" -Level "INFO"
     Write-Log "Install root: $($Config.InstallRoot)" -Level "INFO"
@@ -1356,11 +1357,19 @@ function Install-Backend {
         )
 
         Write-FileLog -Path $LogPath -Text "--- $StepName ---"
-        & $Command 2>&1 | Add-FileLog -Path $LogPath
+        $commandOutput = @(& $Command 2>&1)
         $exitCode = $LASTEXITCODE
+        foreach ($line in $commandOutput) {
+            Write-Host "$line"
+            Write-FileLog -Path $LogPath -Text "$line"
+        }
         Write-FileLog -Path $LogPath -Text "$StepName exit code: $exitCode"
         if ($exitCode -ne 0) {
-            throw "$StepName failed with exit code $exitCode"
+            $detail = (($commandOutput | Select-Object -Last 10) -join " | ").Trim()
+            if ([string]::IsNullOrWhiteSpace($detail)) {
+                $detail = "Git returned no error text"
+            }
+            throw "$StepName failed with exit code $exitCode. Detail: $detail"
         }
     }
 
