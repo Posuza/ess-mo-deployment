@@ -124,8 +124,10 @@ function Write-FileLog {
 
 filter Add-FileLog {
     param([string]$Path)
-    $_ # pass through to console
-    if ($_) {
+    # Display command output without returning it to the caller's success stream.
+    # Installer functions must return only their final $true/$false result.
+    Write-Host "$_"
+    if ($null -ne $_ -and "$_" -ne '') {
         $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         "[$ts] $_" | Out-File -FilePath $Path -Append -Encoding utf8
     }
@@ -1058,7 +1060,7 @@ function Install-Frontend {
             Write-Host "    Updating repo..." -ForegroundColor Gray
             Write-FileLog -Path $installLog -Text "Repo exists, updating via git fetch + reset"
             Push-Location $repoDir
-            git fetch --depth 1 origin $Config.FrontendBranch 2>&1 | Add-FileLog -Path $installLog
+            git fetch --depth 1 --prune origin "+refs/heads/$($Config.FrontendBranch):refs/remotes/origin/$($Config.FrontendBranch)" 2>&1 | Add-FileLog -Path $installLog
             if ($LASTEXITCODE -ne 0) { throw "git fetch failed with exit code $LASTEXITCODE" }
             git reset --hard "origin/$($Config.FrontendBranch)" 2>&1 | Add-FileLog -Path $installLog
             if ($LASTEXITCODE -ne 0) { throw "git reset failed with exit code $LASTEXITCODE" }
@@ -1490,7 +1492,7 @@ function Install-Backend {
             Write-FileLog -Path $installLog -Text "Repo exists, updating via git fetch + reset"
             Push-Location $repoDir
             try {
-                Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git fetch" -Command { git fetch --prune origin $Config.BackendBranch }
+                Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git fetch" -Command { git fetch --depth 1 --prune origin "+refs/heads/$($Config.BackendBranch):refs/remotes/origin/$($Config.BackendBranch)" }
                 Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git reset" -Command { git reset --hard "origin/$($Config.BackendBranch)" }
             } finally {
                 Pop-Location
