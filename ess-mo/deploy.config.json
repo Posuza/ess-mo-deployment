@@ -7,6 +7,7 @@
   "FrontendPort": 3009,
   "BackendPort": 8009,
   "CaddyPort": 9089,
+  "CaddyAdminPort": 2019,
   "ApiPrefix": "/api/v1",
   "MoReportWorkerPollSeconds": 5,
   "MoReportRetentionMinutes": 1,
