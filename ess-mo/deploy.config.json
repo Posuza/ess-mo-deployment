@@ -1,9 +1,9 @@
 {
   "Environment": "production",
   "FrontendRepo": "https://github.com/Posuza/ESS_MO_Fronend.git",
-  "FrontendBranch": "main",
+  "FrontendBranch": "ver1",
   "BackendRepo": "https://github.com/Posuza/ESS_MO_Backend.git",
-  "BackendBranch": "main",
+  "BackendBranch": "ver1",
   "FrontendPort": 3009,
   "BackendPort": 8009,
   "CaddyPort": 9089,
