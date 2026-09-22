@@ -122,7 +122,7 @@ The script will:
 2. Ask for DB/SMTP credentials (if not pre-filled)
 3. Install each component:
    - **Frontend** — clones repo, `npm install`, builds, registers as Windows service
-   - **Backend** — clones repo, creates venv, `pip install`, generates `.env`, and registers both the API and environment-specific MO report worker services
+   - **Backend + report worker** — uses one backend clone, creates separate API and worker venvs, generates one shared `.env`, and registers both Windows services. Updating either component updates both to the same commit.
    - **Caddy** — downloads Caddy, creates `Caddyfile`, registers as service
 4. Optionally start all services and verify health
 
@@ -178,6 +178,9 @@ Use **option 7** to manage which services Caddy proxies to:
 # Deploy only specific components
 .\deploy.ps1 -Force -Components frontend,backend
 
+# Update the shared backend source and both Python services
+.\deploy.ps1 -Force -Components backend
+
 # Preview only (dry run)
 .\deploy.ps1 -DryRun
 
@@ -197,8 +200,8 @@ Use **option 7** to manage which services Caddy proxies to:
 | **Service won't uninstall** | Restart Windows, then re-run uninstall |
 | **Port conflict** | Change Caddy port in option 7 (option 3) or edit `deploy.config.json` |
 | **Frontend build fails** | Check `logs/frontend_build.log` in the install directory |
-| **Backend won't start** | Check `logs/backend_pip.log` and verify `.env` has correct DB credentials |
-| **MO report worker won't start** | Check `logs/backend/mo_report_worker_stderr_*.log` and verify MySQL is reachable |
+| **Backend won't start** | Check `logs/backend-stack` and `logs/backend/backend_stderr_*.log`, then verify `.env` has correct DB credentials |
+| **MO report worker won't start** | Check `logs/backend-stack` and `logs/report-worker/worker_stderr_*.log`, then verify MySQL is reachable |
 | **Logs location** | `<InstallRoot>\logs\deploy-YYYYMMDD-HHmmss.log` |
 
 ---

@@ -8,6 +8,8 @@
   "BackendPort": 8009,
   "CaddyPort": 9089,
   "CaddyAdminPort": 2019,
+  "CaddyVersion": "2.11.4",
+  "CaddyWindowsAmd64Sha256": "1708333f79e274c7697285afe6d592ab39314e0b131e9ec6bea08ad27df62ebf",
   "ApiPrefix": "/api/v1",
   "FrontendPublicUrl": null,
   "MediaStoragePath": "E:\\ESS\\storage\\face-images",

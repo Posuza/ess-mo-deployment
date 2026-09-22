@@ -5,11 +5,11 @@
 # Components are independent deployment units:
 #   frontend       -> <InstallRoot>\frontend\repo
 #   backend        -> <InstallRoot>\backend\repo
-#   report-worker  -> <InstallRoot>\report-worker\repo
+#   report-worker  -> shared backend source + <InstallRoot>\report-worker\venv
 #   caddy          -> <InstallRoot>\caddy
 #
-# Backend and report-worker may use the SAME Git remote, but each
-# has its own clone, .git directory, Python venv, runner and service.
+# Backend and report-worker share one backend Git checkout. They keep
+# separate Python virtual environments, runners, logs and services.
 #
 # Usage:
 #   .\deploy.ps1
@@ -65,15 +65,12 @@ $DefaultConfig = [ordered]@{
     BackendRepo = "https://github.com/Posuza/ESS_MO_Backend.git"
     BackendBranch = "main"
 
-    # Worker intentionally defaults to the same remote/branch as backend.
-    # It is still a fully independent local clone + venv + Windows service.
-    ReportWorkerRepo = "https://github.com/Posuza/ESS_MO_Backend.git"
-    ReportWorkerBranch = "main"
-
     FrontendPort = 3009
     BackendPort = 8009
     CaddyPort = 9089
     CaddyAdminPort = 2019
+    CaddyVersion = "2.11.4"
+    CaddyWindowsAmd64Sha256 = "1708333f79e274c7697285afe6d592ab39314e0b131e9ec6bea08ad27df62ebf"
     ApiPrefix = "/api/v1"
     FrontendPublicUrl = $null
     MediaStoragePath = "E:\ESS\storage\face-images"
@@ -589,7 +586,11 @@ function Test-ComponentInstalled {
     switch ($Component) {
         "frontend"      { return [bool]($svc -and (Test-Path (Join-Path $base "repo\\.git"))) }
         "backend"       { return [bool]($svc -and (Test-Path (Join-Path $base "repo\\.git"))) }
-        "report-worker" { return [bool]($svc -and (Test-Path (Join-Path $base "repo\\.git"))) }
+        "report-worker" {
+            $sharedRepo=Join-Path $Config.InstallRoot "backend\repo\.git"
+            $workerPython=Join-Path $base "venv\Scripts\python.exe"
+            return [bool]($svc -and (Test-Path $sharedRepo) -and (Test-Path $workerPython))
+        }
         "caddy"         { return [bool]($svc -and (Test-Path (Join-Path $base "caddy.exe"))) }
     }
     return $false
@@ -811,63 +812,150 @@ try{$node=(Get-Command node.exe -ErrorAction Stop).Source;Log "Serving $dist";& 
 }
 
 # ===========================================================
-# PYTHON COMPONENT: backend / report-worker
-# Each gets its OWN repo + OWN venv + OWN Windows service.
+# PYTHON STACK: backend / report-worker
+# One shared repository, with independent venvs, runners and services.
 # ===========================================================
-function Install-PythonComponent {
-    param(
-        $Config,$Secrets,
-        [ValidateSet("backend","report-worker")][string]$Component
-    )
+function Install-StackRequirements {
+    param($Config,[string]$Python,[string]$Requirements,[string]$LogPath,[string]$Label)
+    if(-not(Test-Path $Requirements)){throw "$Label requirements file not found: $Requirements"}
+    $cache=Join-Path $Config.InstallRoot "pip-cache"
+    New-Item $cache -ItemType Directory -Force|Out-Null
+    & $Python -m pip install --upgrade pip setuptools wheel 2>&1|Add-FileLog -Path $LogPath
+    if($LASTEXITCODE -ne 0){throw "$Label pip bootstrap failed."}
+    & $Python -m pip install --cache-dir $cache -r $Requirements 2>&1|Add-FileLog -Path $LogPath
+    if($LASTEXITCODE -ne 0){throw "$Label dependency install failed."}
+}
+
+function New-StackVenv {
+    param([string]$Path,[string]$LogPath)
+    if(Test-Path $Path){Remove-Item $Path -Recurse -Force -ErrorAction Stop}
+    New-Item (Split-Path $Path -Parent) -ItemType Directory -Force|Out-Null
+    $creator=Get-PythonCreator
+    $args=@();$args+=$creator.Args;$args+=@("-m","venv",$Path)
+    & $creator.File @args 2>&1|Add-FileLog -Path $LogPath
+    $python=Join-Path $Path "Scripts\python.exe"
+    if($LASTEXITCODE -ne 0 -or -not(Test-Path $python)){throw "Python venv was not created: $Path"}
+    return $python
+}
+
+function Get-WorkerRequirementsPath {
+    param([string]$RepoDir)
+    $workerRequirements=Join-Path $RepoDir "requirements-worker.txt"
+    if(Test-Path $workerRequirements){return $workerRequirements}
+    Write-Warn "requirements-worker.txt is unavailable at this commit; using full requirements for compatibility."
+    return (Join-Path $RepoDir "requirements.txt")
+}
+
+function Initialize-BackendStackRuntime {
+    param($Config,$Secrets,[string]$LogPath)
+    $backendDir=Join-Path $Config.InstallRoot "backend"
+    $repoDir=Join-Path $backendDir "repo"
+    $workerDir=Join-Path $Config.InstallRoot "report-worker"
+    $backendVenv=Join-Path $repoDir "venv"
+    $workerVenv=Join-Path $workerDir "venv"
+    $backendSvc=Get-DeployServiceName $Config "backend"
+    $workerSvc=Get-DeployServiceName $Config "report-worker"
+    New-Item $workerDir -ItemType Directory -Force|Out-Null
+
+    $backendPython=New-StackVenv -Path $backendVenv -LogPath $LogPath
+    Install-StackRequirements -Config $Config -Python $backendPython -Requirements (Join-Path $repoDir "requirements.txt") -LogPath $LogPath -Label "Backend"
+    $workerPython=New-StackVenv -Path $workerVenv -LogPath $LogPath
+    Install-StackRequirements -Config $Config -Python $workerPython -Requirements (Get-WorkerRequirementsPath $repoDir) -LogPath $LogPath -Label "Report worker"
+    Write-MoEnvFile -Config $Config -Secrets $Secrets -RepoDir $repoDir
+
+    Push-Location $repoDir
+    try{
+        $backendCheck=& $backendPython -X faulthandler -c "import app.main; print('APP_OK')" 2>&1
+        if($LASTEXITCODE -ne 0 -or ($backendCheck -join ' ') -notmatch 'APP_OK'){throw "Backend import failed: $backendCheck"}
+        $workerCheck=& $workerPython -X faulthandler -c "import app.workers.mo_report_export_worker; print('WORKER_OK')" 2>&1
+        if($LASTEXITCODE -ne 0 -or ($workerCheck -join ' ') -notmatch 'WORKER_OK'){throw "Worker import failed: $workerCheck"}
+    }finally{Pop-Location}
+
+    $backendRunner=Join-Path $backendDir "backend-run.ps1"
+    $backendRunnerContent=@'
+$ErrorActionPreference="Continue";$ProgressPreference="SilentlyContinue";$env:PYTHONUNBUFFERED="1";$env:PYTHONFAULTHANDLER="1"
+$root=Split-Path -Parent $MyInvocation.MyCommand.Path;$repo=Join-Path $root "repo";$python=Join-Path $repo "venv\Scripts\python.exe";$logs=Join-Path (Split-Path $root -Parent) "logs\backend";New-Item $logs -ItemType Directory -Force|Out-Null
+$ts=Get-Date -Format "yyyyMMdd-HHmmss";$out=Join-Path $logs "backend_stdout_$ts.log";$err=Join-Path $logs "backend_stderr_$ts.log"
+Set-Location $repo
+$p=Start-Process -FilePath $python -ArgumentList @("-X","faulthandler","-u","-m","uvicorn","app.main:app","--host","0.0.0.0","--port","__PORT__","--no-use-colors") -WorkingDirectory $repo -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -Wait -PassThru
+exit $p.ExitCode
+'@
+    $backendRunnerContent=$backendRunnerContent.Replace('__PORT__',"$($Config.BackendPort)")
+    Set-Content $backendRunner $backendRunnerContent -Encoding UTF8 -Force
+
+    $workerRunner=Join-Path $workerDir "mo-report-worker-run.ps1"
+    $workerRunnerContent=@'
+$ErrorActionPreference="Continue";$ProgressPreference="SilentlyContinue";$env:PYTHONUNBUFFERED="1";$env:PYTHONFAULTHANDLER="1"
+$root=Split-Path -Parent $MyInvocation.MyCommand.Path;$installRoot=Split-Path $root -Parent;$repo=Join-Path $installRoot "backend\repo";$python=Join-Path $root "venv\Scripts\python.exe";$logs=Join-Path $installRoot "logs\report-worker";New-Item $logs -ItemType Directory -Force|Out-Null
+$ts=Get-Date -Format "yyyyMMdd-HHmmss";$out=Join-Path $logs "worker_stdout_$ts.log";$err=Join-Path $logs "worker_stderr_$ts.log"
+Set-Location $repo
+$p=Start-Process -FilePath $python -ArgumentList @("-X","faulthandler","-u","-m","app.workers.mo_report_export_worker") -WorkingDirectory $repo -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -Wait -PassThru
+exit $p.ExitCode
+'@
+    Set-Content $workerRunner $workerRunnerContent -Encoding UTF8 -Force
+
+    Install-OrKeepService -ServiceName $backendSvc -RunnerScript $backendRunner -LogPath $LogPath
+    Install-OrKeepService -ServiceName $workerSvc -RunnerScript $workerRunner -LogPath $LogPath
+    Start-Service $backendSvc -ErrorAction Stop
+    if(-not(Test-Endpoint -Url "http://127.0.0.1:$($Config.BackendPort)$($Config.ApiPrefix)/health" -Name "Backend API")){throw "Backend health failed."}
+    Start-Service $workerSvc -ErrorAction Stop
+    Start-Sleep -Seconds 2
+    $workerStatus=Get-Service $workerSvc -ErrorAction SilentlyContinue
+    if(-not $workerStatus -or $workerStatus.Status -ne 'Running'){throw "Report worker service did not remain running."}
+    Write-Success "MO report worker: running on shared backend source"
+}
+
+function Install-BackendStack {
+    param($Config,$Secrets)
     Initialize-InstallRoot -Config $Config
-    $isBackend=$Component -eq "backend"
-    $repoUrl=if($isBackend){$Config.BackendRepo}else{$Config.ReportWorkerRepo}
-    $branch=if($isBackend){$Config.BackendBranch}else{$Config.ReportWorkerBranch}
-    $appDir=Join-Path $Config.InstallRoot $Component
-    $repoDir=Join-Path $appDir "repo"
-    $logsDir=Join-Path $Config.InstallRoot "logs\\$Component"
-    New-Item $logsDir -ItemType Directory -Force | Out-Null
-    $log=Join-Path $logsDir ("${Component}_{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
-    $svcName=Get-DeployServiceName -Config $Config -Component $Component
-    $wasInstalled=Test-ComponentInstalled -Config $Config -Component $Component
-    $oldGood=Get-DeploymentComponentCurrent -Config $Config -Component $Component
+    $backendDir=Join-Path $Config.InstallRoot "backend"
+    $repoDir=Join-Path $backendDir "repo"
+    $workerDir=Join-Path $Config.InstallRoot "report-worker"
+    $logsDir=Join-Path $Config.InstallRoot "logs\backend-stack"
+    New-Item $logsDir -ItemType Directory -Force|Out-Null
+    $log=Join-Path $logsDir ("backend-stack_{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+    $backendSvc=Get-DeployServiceName $Config "backend"
+    $workerSvc=Get-DeployServiceName $Config "report-worker"
+    $oldGood=Get-DeploymentComponentCurrent $Config "backend"
     if([string]::IsNullOrWhiteSpace($oldGood)){$oldGood=Get-GitHead $repoDir}
     $liveChanged=$false
-    Write-Step ($(if($wasInstalled){"Updating $Component"}else{"Installing $Component"}))
+    Write-Step "Installing/updating Backend API and MO Report Worker"
     if($script:dryRun){return $true}
 
     try{
-        New-Item $appDir -ItemType Directory -Force | Out-Null
+        New-Item $backendDir -ItemType Directory -Force|Out-Null
+        New-Item $workerDir -ItemType Directory -Force|Out-Null
         if(Test-Path (Join-Path $repoDir ".git")){
-            $remote=Get-RemoteHead -RepoDir $repoDir -Branch $branch -LogPath $log
+            $remote=Get-RemoteHead -RepoDir $repoDir -Branch $Config.BackendBranch -LogPath $log
             $local=Get-GitHead $repoDir
-            if($wasInstalled -and $local -eq $remote){
-                Write-Success "$Component already current: $local"
-                Register-SuccessfulComponentDeployment $Config $Component $local
+            $workerRunner=Join-Path $workerDir "mo-report-worker-run.ps1"
+            $sharedWorkerReady=(Test-ComponentInstalled $Config "report-worker") -and (Test-Path $workerRunner) -and (Select-String -Path $workerRunner -SimpleMatch 'backend\repo' -Quiet -ErrorAction SilentlyContinue)
+            if((Test-ComponentInstalled $Config "backend") -and $sharedWorkerReady -and $local -eq $remote){
+                foreach($svcName in @($backendSvc,$workerSvc)){$svc=Get-Service $svcName -ErrorAction SilentlyContinue;if($svc -and $svc.Status -ne 'Running'){Start-Service $svcName -ErrorAction Stop}}
+                Register-SuccessfulComponentDeployment $Config "backend" $local
+                Register-SuccessfulComponentDeployment $Config "report-worker" $local
+                Write-Success "Backend and report worker already current: $local"
                 return $true
             }
 
-            # Validate remote commit completely in an isolated worktree + isolated venv.
-            if($wasInstalled){
-                $candidateDir=Join-Path $appDir "_candidate"
+            if($local -ne $remote){
+                $candidateDir=Join-Path $backendDir "_candidate"
                 & git -C $repoDir worktree remove --force $candidateDir 2>$null|Out-Null
                 Remove-Item $candidateDir -Recurse -Force -ErrorAction SilentlyContinue
                 & git -C $repoDir worktree prune 2>$null|Out-Null
                 try{
                     git -C $repoDir worktree add --detach $candidateDir $remote 2>&1|Add-FileLog -Path $log
-                    if($LASTEXITCODE -ne 0){throw "Could not create $Component candidate worktree."}
-                    $creator=Get-PythonCreator
-                    $cv=Join-Path $candidateDir ".candidate-venv"
-                    $args=@();$args+=$creator.Args;$args+=@("-m","venv",$cv)
-                    & $creator.File @args 2>&1|Add-FileLog -Path $log
-                    $cp=Join-Path $cv "Scripts\\python.exe"
-                    & $cp -m pip install --upgrade pip setuptools wheel 2>&1|Add-FileLog -Path $log
-                    & $cp -m pip install --no-cache-dir -r (Join-Path $candidateDir "requirements.txt") 2>&1|Add-FileLog -Path $log
-                    if($LASTEXITCODE -ne 0){throw "$Component candidate dependency install failed."}
+                    if($LASTEXITCODE -ne 0){throw "Could not create backend stack candidate worktree."}
+                    $candidateBackendPython=New-StackVenv -Path (Join-Path $candidateDir ".candidate-backend-venv") -LogPath $log
+                    Install-StackRequirements $Config $candidateBackendPython (Join-Path $candidateDir "requirements.txt") $log "Backend candidate"
+                    $candidateWorkerPython=New-StackVenv -Path (Join-Path $candidateDir ".candidate-worker-venv") -LogPath $log
+                    Install-StackRequirements $Config $candidateWorkerPython (Get-WorkerRequirementsPath $candidateDir) $log "Worker candidate"
                     Push-Location $candidateDir
                     try{
-                        if($isBackend){$chk=& $cp -X faulthandler -c "import app.main; print('APP_OK')" 2>&1;if($LASTEXITCODE -ne 0 -or ($chk -join ' ') -notmatch 'APP_OK'){throw "Backend candidate import failed: $chk"}}
-                        else{$chk=& $cp -X faulthandler -c "import app.workers.mo_report_export_worker; print('WORKER_OK')" 2>&1;if($LASTEXITCODE -ne 0 -or ($chk -join ' ') -notmatch 'WORKER_OK'){throw "Worker candidate import failed: $chk"}}
+                        $chk=& $candidateBackendPython -X faulthandler -c "import app.main; print('APP_OK')" 2>&1
+                        if($LASTEXITCODE -ne 0 -or ($chk -join ' ') -notmatch 'APP_OK'){throw "Backend candidate import failed: $chk"}
+                        $chk=& $candidateWorkerPython -X faulthandler -c "import app.workers.mo_report_export_worker; print('WORKER_OK')" 2>&1
+                        if($LASTEXITCODE -ne 0 -or ($chk -join ' ') -notmatch 'WORKER_OK'){throw "Worker candidate import failed: $chk"}
                     }finally{Pop-Location}
                 }finally{
                     & git -C $repoDir worktree remove --force $candidateDir 2>$null|Out-Null
@@ -876,87 +964,49 @@ function Install-PythonComponent {
                 }
             }
 
-            Stop-ServiceIfRunning $svcName
-            $liveChanged=$true;$script:liveComponentsChanged += $Component
-            git -C $repoDir reset --hard "origin/$branch" 2>&1|Add-FileLog -Path $log
-            if($LASTEXITCODE -ne 0){throw "$Component git reset failed."}
+            Stop-ServiceIfRunning $workerSvc
+            Stop-ServiceIfRunning $backendSvc
+            $liveChanged=$true;$script:liveComponentsChanged+=@("backend","report-worker")
+            git -C $repoDir reset --hard "origin/$($Config.BackendBranch)" 2>&1|Add-FileLog -Path $log
+            if($LASTEXITCODE -ne 0){throw "Backend stack git reset failed."}
             git -C $repoDir clean -fd 2>&1|Add-FileLog -Path $log
         }else{
+            Stop-ServiceIfRunning $workerSvc
+            Stop-ServiceIfRunning $backendSvc
             if(Test-Path $repoDir){Remove-Item $repoDir -Recurse -Force}
-            git clone --branch $branch $repoUrl $repoDir 2>&1|Add-FileLog -Path $log
-            if($LASTEXITCODE -ne 0){throw "$Component git clone failed."}
+            git clone --branch $Config.BackendBranch $Config.BackendRepo $repoDir 2>&1|Add-FileLog -Path $log
+            if($LASTEXITCODE -ne 0){throw "Backend stack clone failed."}
+            $liveChanged=$true;$script:liveComponentsChanged+=@("backend","report-worker")
         }
 
-        # Each service owns its venv. Recreate after code promotion.
-        $venv=Join-Path $repoDir "venv"
-        if(Test-Path $venv){Remove-Item $venv -Recurse -Force -ErrorAction Stop}
-        $creator=Get-PythonCreator
-        $args=@();$args+=$creator.Args;$args+=@("-m","venv","venv")
-        Push-Location $repoDir
-        try{& $creator.File @args 2>&1|Add-FileLog -Path $log}finally{Pop-Location}
-        $python=Join-Path $venv "Scripts\\python.exe"
-        if(-not(Test-Path $python)){throw "$Component venv was not created."}
-        & $python -m pip install --upgrade pip setuptools wheel 2>&1|Add-FileLog -Path $log
-        & $python -m pip install --no-cache-dir -r (Join-Path $repoDir "requirements.txt") 2>&1|Add-FileLog -Path $log
-        if($LASTEXITCODE -ne 0){throw "$Component pip install failed."}
-        Write-MoEnvFile -Config $Config -Secrets $Secrets -RepoDir $repoDir
-
-        Push-Location $repoDir
-        try{
-            if($isBackend){$chk=& $python -X faulthandler -c "import app.main; print('APP_OK')" 2>&1;if($LASTEXITCODE -ne 0 -or ($chk -join ' ') -notmatch 'APP_OK'){throw "Backend import failed: $chk"}}
-            else{$chk=& $python -X faulthandler -c "import app.workers.mo_report_export_worker; print('WORKER_OK')" 2>&1;if($LASTEXITCODE -ne 0 -or ($chk -join ' ') -notmatch 'WORKER_OK'){throw "Worker import failed: $chk"}}
-        }finally{Pop-Location}
-
-        $runner=Join-Path $appDir ($(if($isBackend){"backend-run.ps1"}else{"mo-report-worker-run.ps1"}))
-        if($isBackend){
-            $runnerContent=@'
-$ErrorActionPreference="Continue";$ProgressPreference="SilentlyContinue";$env:PYTHONUNBUFFERED="1";$env:PYTHONFAULTHANDLER="1"
-$root=Split-Path -Parent $MyInvocation.MyCommand.Path;$repo=Join-Path $root "repo";$python=Join-Path $repo "venv\Scripts\python.exe";$logs=Join-Path (Split-Path $root -Parent) "logs\backend";New-Item $logs -ItemType Directory -Force|Out-Null
-$ts=Get-Date -Format "yyyyMMdd-HHmmss";$out=Join-Path $logs "backend_stdout_$ts.log";$err=Join-Path $logs "backend_stderr_$ts.log"
-Set-Location $repo
-$p=Start-Process -FilePath $python -ArgumentList @("-X","faulthandler","-u","-m","uvicorn","app.main:app","--host","0.0.0.0","--port","__PORT__","--no-use-colors") -WorkingDirectory $repo -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -Wait -PassThru
-exit $p.ExitCode
-'@
-            $runnerContent=$runnerContent.Replace('__PORT__',"$($Config.BackendPort)")
-        }else{
-            $runnerContent=@'
-$ErrorActionPreference="Continue";$ProgressPreference="SilentlyContinue";$env:PYTHONUNBUFFERED="1";$env:PYTHONFAULTHANDLER="1"
-$root=Split-Path -Parent $MyInvocation.MyCommand.Path;$repo=Join-Path $root "repo";$python=Join-Path $repo "venv\Scripts\python.exe";$logs=Join-Path (Split-Path $root -Parent) "logs\report-worker";New-Item $logs -ItemType Directory -Force|Out-Null
-$ts=Get-Date -Format "yyyyMMdd-HHmmss";$out=Join-Path $logs "worker_stdout_$ts.log";$err=Join-Path $logs "worker_stderr_$ts.log"
-Set-Location $repo
-$p=Start-Process -FilePath $python -ArgumentList @("-X","faulthandler","-u","-m","app.workers.mo_report_export_worker") -WorkingDirectory $repo -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -Wait -PassThru
-exit $p.ExitCode
-'@
-        }
-        Set-Content $runner $runnerContent -Encoding UTF8 -Force
-        Install-OrKeepService -ServiceName $svcName -RunnerScript $runner -LogPath $log
-        Stop-ServiceIfRunning $svcName
-        Start-Service $svcName -ErrorAction Stop
-        if($isBackend){if(-not(Test-Endpoint -Url "http://127.0.0.1:$($Config.BackendPort)$($Config.ApiPrefix)/health" -Name "Backend API")){throw "Backend health failed."}}
-        else{Start-Sleep -Seconds 2;$ss=Get-Service $svcName -ErrorAction SilentlyContinue;if(-not $ss -or $ss.Status -ne 'Running'){throw "Report worker service did not remain running."};Write-Success "MO report worker: running"}
+        Initialize-BackendStackRuntime -Config $Config -Secrets $Secrets -LogPath $log
         $candidate=Get-GitHead $repoDir
-        Register-SuccessfulComponentDeployment $Config $Component $candidate
+        Register-SuccessfulComponentDeployment $Config "backend" $candidate
+        Register-SuccessfulComponentDeployment $Config "report-worker" $candidate
+
+        $legacyWorkerRepo=Join-Path $workerDir "repo"
+        if(Test-Path $legacyWorkerRepo){
+            try{Remove-Item $legacyWorkerRepo -Recurse -Force -ErrorAction Stop;Write-Success "Removed legacy duplicate worker repository"}
+            catch{Write-Warn "Could not remove legacy worker repository: $_"}
+        }
         return $true
     }catch{
-        Write-Err "$Component setup failed: $_"
+        Write-Err "Backend stack setup failed: $_"
         if($liveChanged -and -not[string]::IsNullOrWhiteSpace($oldGood) -and (Ensure-GitCommitAvailable $repoDir $oldGood)){
-            Write-Warn "Restoring $Component known-good commit: $oldGood"
+            Write-Warn "Restoring backend and worker known-good commit: $oldGood"
             try{
-                Stop-ServiceIfRunning $svcName
-                git -C $repoDir reset --hard $oldGood | Out-Null
-                $venv=Join-Path $repoDir "venv";Remove-Item $venv -Recurse -Force -ErrorAction SilentlyContinue
-                $creator=Get-PythonCreator;$args=@();$args+=$creator.Args;$args+=@("-m","venv","venv");Push-Location $repoDir;try{& $creator.File @args|Out-Null}finally{Pop-Location}
-                $python=Join-Path $venv "Scripts\\python.exe";& $python -m pip install --no-cache-dir -r (Join-Path $repoDir "requirements.txt")|Out-Null
-                Write-MoEnvFile -Config $Config -Secrets $Secrets -RepoDir $repoDir
-                Start-Service $svcName -ErrorAction SilentlyContinue
-            }catch{Write-Err "Automatic $Component restore failed: $_"}
+                Stop-ServiceIfRunning $workerSvc
+                Stop-ServiceIfRunning $backendSvc
+                git -C $repoDir reset --hard $oldGood|Out-Null
+                Initialize-BackendStackRuntime -Config $Config -Secrets $Secrets -LogPath $log
+            }catch{Write-Err "Automatic backend stack restore failed: $_"}
         }
         return $false
     }
 }
 
-function Install-Backend { param($Config,$Secrets); return (Install-PythonComponent -Config $Config -Secrets $Secrets -Component "backend") }
-function Install-ReportWorker { param($Config,$Secrets); return (Install-PythonComponent -Config $Config -Secrets $Secrets -Component "report-worker") }
+function Install-Backend { param($Config,$Secrets); return (Install-BackendStack -Config $Config -Secrets $Secrets) }
+function Install-ReportWorker { param($Config,$Secrets); return (Install-BackendStack -Config $Config -Secrets $Secrets) }
 
 # ===========================================================
 # CADDY
@@ -989,11 +1039,47 @@ function Install-Caddy {
         New-Item $dir -ItemType Directory -Force|Out-Null
         $exe=Join-Path $dir "caddy.exe"
         if(-not(Test-Path $exe)){
-            Write-Host "    Downloading Caddy..." -ForegroundColor Gray
             $zip=Join-Path $dir "caddy.zip"
-            Invoke-WebRequest -Uri "https://caddyserver.com/api/download?os=windows&arch=amd64" -OutFile $zip -UseBasicParsing -ErrorAction Stop
-            Expand-Archive $zip -DestinationPath $dir -Force;Remove-Item $zip -Force
-            if(-not(Test-Path $exe)){throw "caddy.exe download failed."}
+            $extractDir=Join-Path $dir "_caddy_extract"
+            $version="$($Config.CaddyVersion)".Trim().TrimStart('v')
+            $expectedHash="$($Config.CaddyWindowsAmd64Sha256)".Trim().ToLowerInvariant()
+            if($version -notmatch '^\d+\.\d+\.\d+$'){throw "Invalid CaddyVersion '$version'."}
+            if($expectedHash -notmatch '^[a-f0-9]{64}$'){throw "Invalid Caddy Windows SHA256 checksum."}
+            $downloadUrl="https://github.com/caddyserver/caddy/releases/download/v$version/caddy_${version}_windows_amd64.zip"
+            $downloaded=$false
+
+            for($attempt=1;$attempt -le 3;$attempt++){
+                Remove-Item $zip -Force -ErrorAction SilentlyContinue
+                Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+                try{
+                    Write-Host "    Downloading Caddy v$version (attempt $attempt/3)..." -ForegroundColor Gray
+                    Invoke-WebRequest -Uri $downloadUrl -OutFile $zip -UseBasicParsing -ErrorAction Stop
+                    $zipInfo=Get-Item $zip -ErrorAction Stop
+                    if($zipInfo.Length -lt 1MB){throw "Downloaded archive is unexpectedly small ($($zipInfo.Length) bytes)."}
+
+                    $actualHash=(Get-FileHash -Path $zip -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+                    if($actualHash -ne $expectedHash){throw "Caddy archive checksum mismatch."}
+
+                    New-Item $extractDir -ItemType Directory -Force|Out-Null
+                    Expand-Archive -Path $zip -DestinationPath $extractDir -Force -ErrorAction Stop
+                    $downloadedExe=Get-ChildItem $extractDir -Filter "caddy.exe" -File -Recurse|Select-Object -First 1
+                    if(-not $downloadedExe){throw "The Caddy archive does not contain caddy.exe."}
+                    Move-Item $downloadedExe.FullName $exe -Force
+                    & $exe version 2>&1|Add-FileLog -Path $log
+                    if($LASTEXITCODE -ne 0){throw "Downloaded caddy.exe could not start."}
+                    $downloaded=$true
+                    break
+                }catch{
+                    Remove-Item $exe -Force -ErrorAction SilentlyContinue
+                    if($attempt -eq 3){throw "Caddy download failed after 3 attempts: $($_.Exception.Message)"}
+                    Write-Warn "Caddy download attempt $attempt failed: $($_.Exception.Message). Retrying..."
+                    Start-Sleep -Seconds (2*$attempt)
+                }finally{
+                    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+                    Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+            if(-not $downloaded -or -not(Test-Path $exe)){throw "caddy.exe download failed."}
         }
         Stop-ServiceIfRunning $svcName
         foreach($p in @($Config.CaddyPort,$Config.CaddyAdminPort)){if(Test-PortInUse ([int]$p)){throw "Port $p is already in use."}}
@@ -1079,18 +1165,21 @@ function Invoke-FrontendRollbackToCommit {
 
 function Invoke-PythonRollbackToCommit {
     param($Config,$Secrets,[string]$Component,[string]$Commit)
-    $dir=Join-Path $Config.InstallRoot "$Component\\repo";$svc=Get-DeployServiceName $Config $Component
+    $dir=Join-Path $Config.InstallRoot "backend\repo"
+    $backendSvc=Get-DeployServiceName $Config "backend"
+    $workerSvc=Get-DeployServiceName $Config "report-worker"
+    $logs=Join-Path $Config.InstallRoot "logs\backend-stack"
+    New-Item $logs -ItemType Directory -Force|Out-Null
+    $log=Join-Path $logs ("rollback_{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
     try{
         if(-not(Ensure-GitCommitAvailable $dir $Commit)){throw "Commit unavailable: $Commit"}
-        Stop-ServiceIfRunning $svc;git -C $dir reset --hard $Commit|Out-Null
-        $venv=Join-Path $dir "venv";Remove-Item $venv -Recurse -Force -ErrorAction SilentlyContinue
-        $creator=Get-PythonCreator;$args=@();$args+=$creator.Args;$args+=@("-m","venv","venv");Push-Location $dir;try{& $creator.File @args|Out-Null}finally{Pop-Location}
-        $python=Join-Path $venv "Scripts\\python.exe";& $python -m pip install --no-cache-dir -r (Join-Path $dir "requirements.txt")|Out-Null
-        Write-MoEnvFile $Config $Secrets $dir
-        Start-Service $svc -ErrorAction Stop
-        if($Component -eq "backend"){return (Test-Endpoint -Url "http://127.0.0.1:$($Config.BackendPort)$($Config.ApiPrefix)/health" -Name "Backend rollback")}
-        Start-Sleep -Seconds 2;$s=Get-Service $svc -ErrorAction SilentlyContinue;return [bool]($s -and $s.Status -eq 'Running')
-    }catch{Write-Err "$Component rollback failed: $_";return $false}
+        Stop-ServiceIfRunning $workerSvc
+        Stop-ServiceIfRunning $backendSvc
+        git -C $dir reset --hard $Commit 2>&1|Add-FileLog -Path $log
+        if($LASTEXITCODE -ne 0){throw "Backend stack git rollback failed."}
+        Initialize-BackendStackRuntime -Config $Config -Secrets $Secrets -LogPath $log
+        return $true
+    }catch{Write-Err "Backend and report-worker rollback failed: $_";return $false}
 }
 
 function Invoke-CaddyRollbackToCommit {
@@ -1124,10 +1213,13 @@ function Show-RollbackMenu {
     if(-not(Confirm-Step "Rollback $($current.versionName) -> $($target.versionName)?" -DefaultYes:$false)){return}
     $secrets=Get-SecretsOrInitialize;if(-not $secrets){return}
     $restored=@();$ok=$true
-    foreach($k in @("caddy","report-worker","backend","frontend")){
-        $commit="$($target.components.$k.current)".Trim();if([string]::IsNullOrWhiteSpace($commit)){continue}
-        if(Invoke-SelectedRollback $Config $secrets $k $commit){$restored+=$k}else{$ok=$false;break}
-    }
+    $caddyCommit="$($target.components.caddy.current)".Trim()
+    if(-not[string]::IsNullOrWhiteSpace($caddyCommit)){$ok=Invoke-SelectedRollback $Config $secrets "caddy" $caddyCommit;if($ok){$restored+="caddy"}}
+    $backendCommit="$($target.components.backend.current)".Trim()
+    if([string]::IsNullOrWhiteSpace($backendCommit)){$backendCommit="$($target.components.'report-worker'.current)".Trim()}
+    if($ok -and -not[string]::IsNullOrWhiteSpace($backendCommit)){$ok=Invoke-SelectedRollback $Config $secrets "backend" $backendCommit;if($ok){$restored+=@("backend","report-worker")}}
+    $frontendCommit="$($target.components.frontend.current)".Trim()
+    if($ok -and -not[string]::IsNullOrWhiteSpace($frontendCommit)){$ok=Invoke-SelectedRollback $Config $secrets "frontend" $frontendCommit;if($ok){$restored+="frontend"}}
     if(-not $ok){Write-Err "Rollback incomplete. deployment-state.json was not changed.";return}
     $state.deploymentVersions=@($target,$current);Save-DeploymentState $Config $state
     Write-Success "Rollback complete. Current: $($target.versionName)"
@@ -1139,10 +1231,13 @@ function Restore-DeploymentStateBeforeRun {
     $v=@($script:deploymentStateBeforeRun.deploymentVersions)[0];if(-not $v){return $false}
     Write-Step "RESTORING previous known-good deployment"
     $ok=$true
-    foreach($k in @("caddy","report-worker","backend","frontend")){
-        $commit="$($v.components.$k.current)".Trim();if([string]::IsNullOrWhiteSpace($commit)){continue}
-        if(-not(Invoke-SelectedRollback $Config $Secrets $k $commit)){$ok=$false}
-    }
+    $caddyCommit="$($v.components.caddy.current)".Trim()
+    if(-not[string]::IsNullOrWhiteSpace($caddyCommit)){$ok=Invoke-SelectedRollback $Config $Secrets "caddy" $caddyCommit}
+    $backendCommit="$($v.components.backend.current)".Trim()
+    if([string]::IsNullOrWhiteSpace($backendCommit)){$backendCommit="$($v.components.'report-worker'.current)".Trim()}
+    if($ok -and -not[string]::IsNullOrWhiteSpace($backendCommit)){$ok=Invoke-SelectedRollback $Config $Secrets "backend" $backendCommit}
+    $frontendCommit="$($v.components.frontend.current)".Trim()
+    if($ok -and -not[string]::IsNullOrWhiteSpace($frontendCommit)){$ok=Invoke-SelectedRollback $Config $Secrets "frontend" $frontendCommit}
     if($ok){Save-DeploymentState $Config $script:deploymentStateBeforeRun;Write-Success "Previous known-good deployment restored."}
     return $ok
 }
@@ -1215,7 +1310,11 @@ function Invoke-FullDeploy {
     }
 
     if(-not(Test-Prerequisites -CheckOnly)){Write-Err "Resolve missing prerequisites first.";$script:deploymentTransaction=$false;return}
-    $targets=if($script:headless -and $Components.Count -gt 0){$Components}else{Get-ComponentKeys}
+    $targets=if($script:headless -and $Components.Count -gt 0){@($Components)}else{@(Get-ComponentKeys)}
+    if(($targets -contains "backend") -or ($targets -contains "report-worker")){
+        $targets=@($targets+@("backend","report-worker")|Select-Object -Unique)
+        Write-Host "    Backend and report-worker update together from one shared source." -ForegroundColor Gray
+    }
     $secrets=$null
     if(($targets -contains "backend") -or ($targets -contains "report-worker")){
         $secrets=Get-SecretsOrInitialize;if(-not $secrets){$script:deploymentTransaction=$false;return}
@@ -1224,7 +1323,8 @@ function Invoke-FullDeploy {
     $ok=$true
     foreach($k in @("frontend","backend","report-worker","caddy")){
         if($targets -notcontains $k){continue}
-        switch($k){"frontend"{$r=Install-Frontend $Config};"backend"{$r=Install-Backend $Config $secrets};"report-worker"{$r=Install-ReportWorker $Config $secrets};"caddy"{$r=Install-Caddy $Config}}
+        if($k -eq "report-worker"){continue}
+        switch($k){"frontend"{$r=Install-Frontend $Config};"backend"{$r=Install-Backend $Config $secrets};"caddy"{$r=Install-Caddy $Config}}
         if(-not $r){$ok=$false;break}
     }
     if($ok){$ok=Verify-Health $Config}
