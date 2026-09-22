@@ -9,6 +9,8 @@
   "CaddyPort": 9089,
   "CaddyAdminPort": 2019,
   "ApiPrefix": "/api/v1",
+  "FrontendPublicUrl": null,
+  "MediaStoragePath": "E:\\ESS\\storage\\face-images",
   "MoReportWorkerPollSeconds": 5,
   "MoReportRetentionMinutes": 1,
   "MoReportSweepMinutes": 0.1
