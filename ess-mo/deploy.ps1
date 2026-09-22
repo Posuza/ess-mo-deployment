@@ -92,6 +92,8 @@ $script:deploymentTransaction = $false
 $script:deploymentCandidates = @{}
 $script:deploymentStateBeforeRun = $null
 $script:liveComponentsChanged = @()
+$script:spinnerPS = $null
+$script:spinnerAsync = $null
 
 # ===========================================================
 # NAMES / COMPONENTS
@@ -154,7 +156,7 @@ function Write-FileLog {
 
 filter Add-FileLog {
     param([string]$Path)
-    Write-Host "$_"
+    if($null -eq $script:spinnerPS){Write-Host "$_"}
     if ($null -ne $_ -and "$_" -ne '') { Write-FileLog -Path $Path -Text "$_" }
 }
 
@@ -162,6 +164,35 @@ function Write-Step    ($msg) { Write-Host "`n[*] $msg" -ForegroundColor Yellow;
 function Write-Success ($msg) { Write-Host "    $msg" -ForegroundColor Green; Write-Log "OK: $msg" }
 function Write-Err     ($msg) { Write-Host "    $msg" -ForegroundColor Red; Write-Log "ERROR: $msg" -Level "ERROR"; $script:hasErrors = $true }
 function Write-Warn    ($msg) { Write-Host "    $msg" -ForegroundColor DarkYellow; Write-Log "WARN: $msg" -Level "WARN" }
+
+function Start-Spinner {
+    param([string]$Message)
+    if($script:headless -or $script:dryRun -or [Console]::IsOutputRedirected){return}
+    Stop-Spinner
+    $script:spinnerPS=[PowerShell]::Create()
+    $null=$script:spinnerPS.AddScript({
+        param($Text)
+        $frames=@('|','/','-','\')
+        $index=0
+        try{
+            while($true){
+                [Console]::Write("`r    $($frames[$index % $frames.Count]) $Text")
+                Start-Sleep -Milliseconds 150
+                $index++
+            }
+        }catch{}
+    }).AddArgument($Message)
+    $script:spinnerAsync=$script:spinnerPS.BeginInvoke()
+}
+
+function Stop-Spinner {
+    if($null -eq $script:spinnerPS){return}
+    try{$script:spinnerPS.Stop()}catch{}
+    try{$script:spinnerPS.Dispose()}catch{}
+    [Console]::Write("`r"+(" "*90)+"`r")
+    $script:spinnerPS=$null
+    $script:spinnerAsync=$null
+}
 
 function Confirm-Step {
     param([string]$Message, [bool]$DefaultYes = $true)
@@ -1047,6 +1078,7 @@ function Install-Caddy {
             if($expectedHash -notmatch '^[a-f0-9]{64}$'){throw "Invalid Caddy Windows SHA256 checksum."}
             $downloadUrl="https://github.com/caddyserver/caddy/releases/download/v$version/caddy_${version}_windows_amd64.zip"
             $downloaded=$false
+            $releaseDownloadError=$null
 
             for($attempt=1;$attempt -le 3;$attempt++){
                 Remove-Item $zip -Force -ErrorAction SilentlyContinue
@@ -1070,14 +1102,54 @@ function Install-Caddy {
                     $downloaded=$true
                     break
                 }catch{
+                    $releaseDownloadError=$_.Exception.Message
                     Remove-Item $exe -Force -ErrorAction SilentlyContinue
-                    if($attempt -eq 3){throw "Caddy download failed after 3 attempts: $($_.Exception.Message)"}
-                    Write-Warn "Caddy download attempt $attempt failed: $($_.Exception.Message). Retrying..."
-                    Start-Sleep -Seconds (2*$attempt)
+                    if($attempt -lt 3){
+                        Write-Warn "Caddy release download attempt $attempt failed: $releaseDownloadError. Retrying..."
+                        Start-Sleep -Seconds (2*$attempt)
+                    }
                 }finally{
                     Remove-Item $zip -Force -ErrorAction SilentlyContinue
                     Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
                 }
+            }
+
+            # The official Caddy download API returns a Windows executable,
+            # not a ZIP archive. Use it directly if the verified release ZIP
+            # is unavailable through the current network/proxy.
+            if(-not $downloaded){
+                Write-Warn "Verified Caddy release archive was unavailable: $releaseDownloadError"
+                Write-Host "    Trying official Caddy direct download..." -ForegroundColor Gray
+                [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+                $directUrl="https://caddyserver.com/api/download?os=windows&arch=amd64"
+                $directExe=Join-Path $dir "caddy.download.exe"
+                $directDownloadError=$null
+                for($attempt=1;$attempt -le 3;$attempt++){
+                    Remove-Item $directExe -Force -ErrorAction SilentlyContinue
+                    try{
+                        Invoke-WebRequest -Uri $directUrl -OutFile $directExe -UseBasicParsing -ErrorAction Stop
+                        $exeInfo=Get-Item $directExe -ErrorAction Stop
+                        if($exeInfo.Length -lt 1MB){throw "Downloaded executable is unexpectedly small ($($exeInfo.Length) bytes)."}
+                        $stream=[System.IO.File]::OpenRead($directExe)
+                        try{$byte1=$stream.ReadByte();$byte2=$stream.ReadByte()}finally{$stream.Dispose()}
+                        if($byte1 -ne 0x4D -or $byte2 -ne 0x5A){throw "Downloaded file is not a Windows executable."}
+                        $directHash=(Get-FileHash -Path $directExe -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+                        Write-FileLog -Path $log -Text "Official Caddy direct-download SHA256: $directHash"
+                        Move-Item $directExe $exe -Force
+                        & $exe version 2>&1|Add-FileLog -Path $log
+                        if($LASTEXITCODE -ne 0){throw "Directly downloaded caddy.exe could not start."}
+                        $downloaded=$true
+                        break
+                    }catch{
+                        $directDownloadError=$_.Exception.Message
+                        Remove-Item $exe -Force -ErrorAction SilentlyContinue
+                        if($attempt -lt 3){
+                            Write-Warn "Caddy direct download attempt $attempt failed: $directDownloadError. Retrying..."
+                            Start-Sleep -Seconds (2*$attempt)
+                        }
+                    }finally{Remove-Item $directExe -Force -ErrorAction SilentlyContinue}
+                }
+                if(-not $downloaded){throw "Caddy download failed. Release archive: $releaseDownloadError. Direct download: $directDownloadError"}
             }
             if(-not $downloaded -or -not(Test-Path $exe)){throw "caddy.exe download failed."}
         }
@@ -1324,7 +1396,11 @@ function Invoke-FullDeploy {
     foreach($k in @("frontend","backend","report-worker","caddy")){
         if($targets -notcontains $k){continue}
         if($k -eq "report-worker"){continue}
-        switch($k){"frontend"{$r=Install-Frontend $Config};"backend"{$r=Install-Backend $Config $secrets};"caddy"{$r=Install-Caddy $Config}}
+        $spinnerLabel=switch($k){"frontend"{"Frontend deployment"};"backend"{"Backend and report-worker deployment"};"caddy"{"Caddy deployment"}}
+        Start-Spinner "$spinnerLabel ..."
+        try{
+            switch($k){"frontend"{$r=Install-Frontend $Config};"backend"{$r=Install-Backend $Config $secrets};"caddy"{$r=Install-Caddy $Config}}
+        }finally{Stop-Spinner}
         if(-not $r){$ok=$false;break}
     }
     if($ok){$ok=Verify-Health $Config}
