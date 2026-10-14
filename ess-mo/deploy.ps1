@@ -1,4 +1,4 @@
-# ===========================================================
+﻿# ===========================================================
 # ESS MO Full-Stack Deployment Manager
 # FACE-ESS style versioned deployment architecture
 #
@@ -810,6 +810,7 @@ function Install-Frontend {
 
         $runner=Join-Path $appDir "frontend-run.ps1"
         $runnerContent=@'
+# Keep fatal PowerShell errors distinct from ordinary native stderr messages.
 $ErrorActionPreference="Stop"
 $root=Split-Path -Parent $MyInvocation.MyCommand.Path
 $repo=Join-Path $root "repo"
@@ -817,9 +818,32 @@ $dist=Join-Path $repo "dist"
 $serve=Join-Path $repo "node_modules\serve\build\main.js"
 $logs=Join-Path (Split-Path $root -Parent) "logs\frontend"
 New-Item $logs -ItemType Directory -Force | Out-Null
-$log=Join-Path $logs ("frontend_service_{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
-function Log($m){"[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"),$m|Add-Content $log}
-try{$node=(Get-Command node.exe -ErrorAction Stop).Source;Log "Serving $dist";& $node $serve -s $dist -l "__PORT__" 2>&1|ForEach-Object{Log "$_"};exit $LASTEXITCODE}catch{Log "ERROR: $($_.Exception.Message)";exit 1}
+$ts=Get-Date -Format "yyyyMMdd-HHmmss"
+$log=Join-Path $logs "frontend_service_$ts.log"
+$out=Join-Path $logs "frontend_stdout_$ts.log"
+$err=Join-Path $logs "frontend_stderr_$ts.log"
+function Log([string]$Message){
+    "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"),$Message | Add-Content -Path $log -Encoding UTF8
+}
+try{
+    if(-not(Test-Path $dist)){throw "Frontend build missing: $dist"}
+    if(-not(Test-Path $serve)){throw "serve entry point missing: $serve"}
+    $node=(Get-Command node.exe -ErrorAction Stop).Source
+    Log "Starting Node.js serve on port __PORT__"
+    Log "Executable: $node"
+    Log "Static directory: $dist"
+    Log "Standard output: $out"
+    Log "Standard error: $err"
+    # Start-Process captures native stderr as text, not a PowerShell error record.
+    # -Wait keeps this runner alive for the lifetime of the server process.
+    $p=Start-Process -FilePath $node -ArgumentList @( "`"$serve`"", "-s", "`"$dist`"", "-l", "__PORT__" ) -WorkingDirectory $repo -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -Wait -PassThru -ErrorAction Stop
+    $code=[int]$p.ExitCode
+    Log "Node.js serve exited with code $code"
+    exit $code
+}catch{
+    Log "FATAL PowerShell runner error: $($_ | Out-String)"
+    exit 1
+}
 '@
         $runnerContent=$runnerContent.Replace('__PORT__',"$($Config.FrontendPort)")
         Set-Content $runner $runnerContent -Encoding UTF8 -Force
@@ -1241,26 +1265,36 @@ function Install-Caddy {
         Set-Content $caddyfile ($lines -join [Environment]::NewLine) -Encoding UTF8 -Force
         $runner=Join-Path $dir "caddy-run.ps1"
         $runnerContent=@'
+# Capture Caddy's normal stderr logs without converting them into PowerShell failures.
 $ErrorActionPreference="Stop"
 $dir=Split-Path -Parent $MyInvocation.MyCommand.Path
 $exe=Join-Path $dir "caddy.exe"
 $cfg=Join-Path $dir "Caddyfile"
 $ports=Join-Path $dir "caddy-ports.json"
-$logs=Join-Path (Join-Path (Split-Path $dir -Parent) "logs") "caddy"
-if(-not(Test-Path $logs)){New-Item $logs -ItemType Directory -Force|Out-Null}
-$runtimeLog=Join-Path $logs ("caddy_service_{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
-Remove-Item $ports -Force -ErrorAction SilentlyContinue
+$logs=Join-Path (Split-Path $dir -Parent) "logs\caddy"
+New-Item $logs -ItemType Directory -Force | Out-Null
+$ts=Get-Date -Format "yyyyMMdd-HHmmss"
+$runtimeLog=Join-Path $logs "caddy_service_$ts.log"
+$out=Join-Path $logs "caddy_stdout_$ts.log"
+$err=Join-Path $logs "caddy_stderr_$ts.log"
+function Log([string]$Message){
+    "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"),$Message | Add-Content -Path $runtimeLog -Encoding UTF8
+}
 try{
-    Set-Location $dir
-    "========== Caddy service started at $(Get-Date) =========="|Out-File $runtimeLog -Encoding UTF8
-    "Executable: $exe"|Out-File $runtimeLog -Append -Encoding UTF8
-    "Config: $cfg"|Out-File $runtimeLog -Append -Encoding UTF8
-    "Proxy port: __PROXY__; Admin port: __ADMIN__"|Out-File $runtimeLog -Append -Encoding UTF8
+    if(-not(Test-Path $exe)){throw "Caddy executable missing: $exe"}
+    if(-not(Test-Path $cfg)){throw "Caddy config missing: $cfg"}
+    Log "Caddy starting; proxy=__PROXY__; admin=__ADMIN__"
+    Log "Executable: $exe"
+    Log "Config: $cfg"
+    Log "Standard output: $out"
+    Log "Standard error: $err"
     @{proxy=__PROXY__;admin=__ADMIN__}|ConvertTo-Json|Set-Content $ports -Encoding UTF8 -Force
-    & $exe run --config $cfg --adapter caddyfile 2>&1|ForEach-Object{"$_"|Out-File $runtimeLog -Append -Encoding UTF8}
-    exit $LASTEXITCODE
+    $p=Start-Process -FilePath $exe -ArgumentList @( "run", "--config", "`"$cfg`"", "--adapter", "caddyfile" ) -WorkingDirectory $dir -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -Wait -PassThru -ErrorAction Stop
+    $code=[int]$p.ExitCode
+    Log "Caddy exited with code $code"
+    exit $code
 }catch{
-    "FATAL: $($_.Exception.Message)"|Out-File $runtimeLog -Append -Encoding UTF8
+    Log "FATAL PowerShell runner error: $($_ | Out-String)"
     exit 1
 }
 '@
