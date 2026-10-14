@@ -23,6 +23,7 @@ Created automatically on first run. Edit it to change:
 | `Environment` | `production` | Selects isolated install and service names | ✅ Use `production` or `development` |
 | `FrontendRepo` | `Posuza/ESS_MO_Fronend` | Git repo for the React frontend | ✅ Replace with your own repo URL |
 | `FrontendBranch` | `main` | Frontend Git branch to deploy | ✅ Use `ver1` for development |
+| `EssPublicKey` | `Tg2wbdIU3C0JRfSX` | Registered ESS browser SDK application identifier | ✅ Public identifier; keep in config, not secrets |
 | `BackendRepo` | `Posuza/ESS_MO_Backend` | Git repo for the FastAPI backend | ✅ Replace with your own repo URL |
 | `BackendBranch` | `main` | Backend Git branch to deploy | ✅ Use `ver1` for development |
 | `FrontendPort` | `3009` | Port the frontend serves on | ✅ Change if needed |

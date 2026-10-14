@@ -62,6 +62,7 @@ $DefaultConfig = [ordered]@{
 
     FrontendRepo = "https://github.com/Posuza/ESS_MO_Fronend.git"
     FrontendBranch = "main"
+    EssPublicKey = "Tg2wbdIU3C0JRfSX"
 
     BackendRepo = "https://github.com/Posuza/ESS_MO_Backend.git"
     BackendBranch = "main"
@@ -241,6 +242,10 @@ function Get-DeployConfig {
                 throw "Invalid FrontendPublicUrl '$publicUrl'. Use an absolute http:// or https:// URL, or null."
             }
             $cfg.FrontendPublicUrl = $publicUrl
+        }
+        $cfg.EssPublicKey = "$($cfg.EssPublicKey)".Trim()
+        if ($cfg.EssPublicKey -notmatch '^[A-Za-z0-9_-]+$') {
+            throw "Invalid EssPublicKey. Configure the registered ESS public key in deploy.config.json."
         }
         $mediaPath = "$($cfg.MediaStoragePath)".Trim().TrimEnd('\')
         if ($mediaPath -notmatch '^[A-Za-z]:\\.+') {
@@ -738,6 +743,48 @@ function Get-RemoteHead {
     return "$h".Trim()
 }
 
+function Get-TextSha256 {
+    param([Parameter(Mandatory=$true)][string]$Text)
+    $sha=[System.Security.Cryptography.SHA256]::Create()
+    try{
+        $bytes=[System.Text.Encoding]::UTF8.GetBytes($Text)
+        return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace("-","").ToLowerInvariant()
+    }finally{$sha.Dispose()}
+}
+
+function Get-FrontendDeploymentFingerprint {
+    param($Config)
+    $payload=[ordered]@{
+        repo="$($Config.FrontendRepo)"
+        branch="$($Config.FrontendBranch)"
+        frontendPort=[int]$Config.FrontendPort
+        apiPrefix="$($Config.ApiPrefix)"
+        essPublicKey="$($Config.EssPublicKey)"
+    }|ConvertTo-Json -Compress
+    return (Get-TextSha256 -Text $payload)
+}
+
+function Get-SavedFrontendDeploymentFingerprint {
+    param($Config)
+    $path=Join-Path (Join-Path $Config.InstallRoot "frontend") "deployment-config.sha256"
+    if(-not(Test-Path $path)){return $null}
+    return ("$(Get-Content $path -Raw -ErrorAction SilentlyContinue)").Trim()
+}
+
+function Save-FrontendDeploymentFingerprint {
+    param($Config,[string]$Fingerprint)
+    if($script:dryRun){return}
+    $dir=Join-Path $Config.InstallRoot "frontend"
+    New-Item $dir -ItemType Directory -Force|Out-Null
+    Set-Content (Join-Path $dir "deployment-config.sha256") $Fingerprint -Encoding ASCII -Force
+}
+
+function Set-FrontendBuildEnvironment {
+    param($Config)
+    $env:VITE_API_URL="$($Config.ApiPrefix)"
+    $env:VITE_ESS_PUBLIC_KEY="$($Config.EssPublicKey)"
+}
+
 # ===========================================================
 # FRONTEND
 # ===========================================================
@@ -753,6 +800,9 @@ function Install-Frontend {
     $wasInstalled=Test-ComponentInstalled -Config $Config -Component "frontend"
     $oldGood=Get-DeploymentComponentCurrent -Config $Config -Component "frontend"
     if([string]::IsNullOrWhiteSpace($oldGood)){$oldGood=Get-GitHead $repoDir}
+    $deploymentFingerprint=Get-FrontendDeploymentFingerprint -Config $Config
+    $savedFingerprint=Get-SavedFrontendDeploymentFingerprint -Config $Config
+    $configChanged=($deploymentFingerprint -ne $savedFingerprint)
     $liveChanged=$false
     Write-Step ($(if($wasInstalled){"Updating Frontend"}else{"Installing Frontend"}))
     if($script:dryRun){return $true}
@@ -762,7 +812,7 @@ function Install-Frontend {
         if(Test-Path (Join-Path $repoDir ".git")){
             $remote=Get-RemoteHead -RepoDir $repoDir -Branch $Config.FrontendBranch -LogPath $log
             $local=Get-GitHead $repoDir
-            if($wasInstalled -and $local -eq $remote){Write-Success "Frontend already current: $local";Register-SuccessfulComponentDeployment $Config "frontend" $local;return $true}
+            if($wasInstalled -and $local -eq $remote -and -not $configChanged){Write-Success "Frontend already current: $local";Register-SuccessfulComponentDeployment $Config "frontend" $local;return $true}
 
             if($wasInstalled){
                 $candidateDir=Join-Path $appDir "_candidate"
@@ -776,7 +826,7 @@ function Install-Frontend {
                     try{
                         npm install --legacy-peer-deps 2>&1 | Add-FileLog -Path $log
                         if($LASTEXITCODE -ne 0){throw "Candidate npm install failed."}
-                        $env:VITE_API_URL=$Config.ApiPrefix
+                        Set-FrontendBuildEnvironment -Config $Config
                         npm run build 2>&1 | Add-FileLog -Path $log
                         if($LASTEXITCODE -ne 0 -or -not(Test-Path (Join-Path $candidateDir "dist"))){throw "Candidate frontend build failed."}
                     }finally{Pop-Location}
@@ -802,7 +852,7 @@ function Install-Frontend {
             npm install --legacy-peer-deps 2>&1 | Add-FileLog -Path $log
             if($LASTEXITCODE -ne 0){throw "Frontend npm install failed."}
             if(-not(Test-Path (Join-Path $repoDir "node_modules\\serve\\build\\main.js"))){npm install --no-save serve --legacy-peer-deps 2>&1 | Add-FileLog -Path $log}
-            $env:VITE_API_URL=$Config.ApiPrefix
+            Set-FrontendBuildEnvironment -Config $Config
             npm run build 2>&1 | Add-FileLog -Path $log
             if($LASTEXITCODE -ne 0){throw "Frontend build failed."}
         }finally{Pop-Location}
@@ -853,6 +903,7 @@ try{
         if(-not(Test-Endpoint -Url "http://127.0.0.1:$($Config.FrontendPort)" -Name "Frontend")){throw "Frontend health failed."}
         $candidate=Get-GitHead $repoDir
         Register-SuccessfulComponentDeployment $Config "frontend" $candidate
+        Save-FrontendDeploymentFingerprint -Config $Config -Fingerprint $deploymentFingerprint
         return $true
     }catch{
         Write-Err "Frontend setup failed: $_"
@@ -860,7 +911,7 @@ try{
             Write-Warn "Restoring frontend known-good commit: $oldGood"
             Stop-ServiceIfRunning $svcName
             git -C $repoDir reset --hard $oldGood | Out-Null
-            Push-Location $repoDir;try{npm install --legacy-peer-deps|Out-Null;$env:VITE_API_URL=$Config.ApiPrefix;npm run build|Out-Null}finally{Pop-Location}
+            Push-Location $repoDir;try{npm install --legacy-peer-deps|Out-Null;Set-FrontendBuildEnvironment -Config $Config;npm run build|Out-Null}finally{Pop-Location}
             Start-Service $svcName -ErrorAction SilentlyContinue
         }
         return $false
@@ -1373,9 +1424,11 @@ function Invoke-FrontendRollbackToCommit {
     try{
         if(-not(Ensure-GitCommitAvailable $dir $Commit)){throw "Commit unavailable: $Commit"}
         Stop-ServiceIfRunning $svc;git -C $dir reset --hard $Commit|Out-Null
-        Push-Location $dir;try{npm install --legacy-peer-deps|Out-Null;$env:VITE_API_URL=$Config.ApiPrefix;npm run build|Out-Null}finally{Pop-Location}
+        Push-Location $dir;try{npm install --legacy-peer-deps|Out-Null;Set-FrontendBuildEnvironment -Config $Config;npm run build|Out-Null}finally{Pop-Location}
         Start-Service $svc -ErrorAction Stop
-        return (Test-Endpoint -Url "http://127.0.0.1:$($Config.FrontendPort)" -Name "Frontend rollback")
+        $ok=Test-Endpoint -Url "http://127.0.0.1:$($Config.FrontendPort)" -Name "Frontend rollback"
+        if($ok){Save-FrontendDeploymentFingerprint -Config $Config -Fingerprint (Get-FrontendDeploymentFingerprint -Config $Config)}
+        return $ok
     }catch{Write-Err "Frontend rollback failed: $_";return $false}
 }
 

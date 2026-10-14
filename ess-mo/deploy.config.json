@@ -2,6 +2,7 @@
   "Environment": "production",
   "FrontendRepo": "https://github.com/Posuza/ESS_MO_Fronend.git",
   "FrontendBranch": "main",
+  "EssPublicKey": "Tg2wbdIU3C0JRfSX",
   "BackendRepo": "https://github.com/Posuza/ESS_MO_Backend.git",
   "BackendBranch": "main",
   "FrontendPort": 3009,
