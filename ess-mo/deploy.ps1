@@ -19,15 +19,16 @@
 #   .\deploy.ps1 -DryRun
 #
 # Local files next to this script:
-#   deploy.config.json
-#   deploy.secrets.json
-#   deploy.secrets.example.json
+#   deploy.config.json          -> active non-secret settings
+#   deploy.secrets.json         -> active local credentials (gitignored)
+#   deploy.secrets.example.json -> copyable template (never read at runtime)
 #
 # Runtime state:
 #   <InstallRoot>\deployment-state.json
 # Keeps the current and previous complete known-good deployments.
 # ===========================================================
 
+#Requires -Version 5.1
 #Requires -RunAsAdministrator
 
 param(
@@ -54,7 +55,6 @@ if ($effectivePolicy -in @('Restricted', 'AllSigned')) {
 $ScriptRoot = $PSScriptRoot
 $ConfigPath = Join-Path $ScriptRoot "deploy.config.json"
 $SecretsPath = Join-Path $ScriptRoot "deploy.secrets.json"
-$SecretsExamplePath = Join-Path $ScriptRoot "deploy.secrets.example.json"
 
 # ---------- DEFAULT CONFIG ----------
 $DefaultConfig = [ordered]@{
@@ -62,8 +62,8 @@ $DefaultConfig = [ordered]@{
 
     FrontendRepo = "https://github.com/Posuza/ESS_MO_Fronend.git"
     FrontendBranch = "main"
-    EssPublicKey = "Tg2wbdIU3C0JRfSX"
-    EssSdkOrigin = "https://ess-faceregister.esscentor.com"
+    EssPublicKey = "ZjO4FYk9acszpjuo"
+    EssSdkOrigin = "http://183.90.173.206:9091"
 
     BackendRepo = "https://github.com/Posuza/ESS_MO_Backend.git"
     BackendBranch = "main"
@@ -72,17 +72,14 @@ $DefaultConfig = [ordered]@{
     BackendPort = 8009
     CaddyPort = 9089
     CaddyAdminPort = 2019
-    CaddyVersion = "2.11.4"
-    CaddyWindowsAmd64Sha256 = "1708333f79e274c7697285afe6d592ab39314e0b131e9ec6bea08ad27df62ebf"
     ApiPrefix = "/api/v1"
-    FrontendPublicUrl = $null
     MediaStoragePath = "E:\ESS\storage\face-images"
 
     MoReportWorkerPollSeconds = 5
     MoReportRetentionMinutes = 60
     MoReportSweepMinutes = 5
 
-    InstallRoot = "C:\\ESS\\Ess_MO"
+    InstallRoot = "C:\ESS\Ess_MO"
 }
 
 # ---------- GLOBAL STATE ----------
@@ -208,14 +205,14 @@ function Confirm-Step {
 
 function Initialize-Logger {
     param($Config)
+    $script:startTime = Get-Date
+    if ($script:dryRun) { $script:logFile = $null; return }
     $logsDir = Join-Path $Config.InstallRoot "logs"
     New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
-    $script:startTime = Get-Date
     $script:logFile = Join-Path $logsDir ("deploy-{0}.log" -f $script:startTime.ToString("yyyyMMdd-HHmmss"))
     Write-Log "=== ESS MO deployment started ===" -Level "START"
     Write-Log "Environment: $(Get-DeployEnvironment -Config $Config)"
     Write-Log "Install root: $($Config.InstallRoot)"
-    if ($script:dryRun) { Write-Log "DRY RUN MODE" -Level "WARN" }
 }
 
 # ===========================================================
@@ -238,21 +235,19 @@ function Get-DeployConfig {
         if ($cfg.ApiPrefix -ne "/api/v1") {
             throw "Invalid ApiPrefix '$($cfg.ApiPrefix)'. This backend is mounted at /api/v1."
         }
-        if (-not [string]::IsNullOrWhiteSpace("$($cfg.FrontendPublicUrl)")) {
-            $publicUrl = "$($cfg.FrontendPublicUrl)".Trim().TrimEnd('/')
-            if ($publicUrl -notmatch '^https?://[^\s]+$') {
-                throw "Invalid FrontendPublicUrl '$publicUrl'. Use an absolute http:// or https:// URL, or null."
-            }
-            $cfg.FrontendPublicUrl = $publicUrl
+        $publicKey = "$($cfg.EssPublicKey)".Trim()
+        $sdkOrigin = "$($cfg.EssSdkOrigin)".Trim().TrimEnd('/')
+        if ([string]::IsNullOrWhiteSpace($publicKey) -xor [string]::IsNullOrWhiteSpace($sdkOrigin)) {
+            throw "EssPublicKey and EssSdkOrigin must both be set, or both be null."
         }
-        $cfg.EssPublicKey = "$($cfg.EssPublicKey)".Trim()
-        if ($cfg.EssPublicKey -notmatch '^[A-Za-z0-9_-]+$') {
+        if ($publicKey -and $publicKey -notmatch '^[A-Za-z0-9_-]+$') {
             throw "Invalid EssPublicKey. Configure the registered ESS public key in deploy.config.json."
         }
-        $cfg.EssSdkOrigin = "$($cfg.EssSdkOrigin)".Trim().TrimEnd('/')
-        if ($cfg.EssSdkOrigin -notmatch '^https?://[^/\s?#]+$') {
+        if ($sdkOrigin -and $sdkOrigin -notmatch '^https?://[^/\s?#]+$') {
             throw "Invalid EssSdkOrigin. Configure an HTTP(S) origin without a path in deploy.config.json."
         }
+        $cfg.EssPublicKey = if ($publicKey) { $publicKey } else { $null }
+        $cfg.EssSdkOrigin = if ($sdkOrigin) { $sdkOrigin } else { $null }
         $mediaPath = "$($cfg.MediaStoragePath)".Trim().TrimEnd('\')
         if ($mediaPath -notmatch '^[A-Za-z]:\\.+') {
             throw "Invalid MediaStoragePath '$mediaPath'. Use an absolute Windows path below a drive root."
@@ -262,19 +257,20 @@ function Get-DeployConfig {
     }
 
     $cfg = [PSCustomObject]$DefaultConfig
-    $cfg | ConvertTo-Json -Depth 5 | Set-Content $ConfigPath -Encoding UTF8
+    if (-not $script:dryRun) { $cfg | ConvertTo-Json -Depth 5 | Set-Content $ConfigPath -Encoding UTF8 }
     return $cfg
 }
 
 function Save-DeployConfig {
     param($Config)
+    if ($script:dryRun) { return }
     $Config | ConvertTo-Json -Depth 8 | Set-Content $ConfigPath -Encoding UTF8
 }
 
 function Select-InstallDrive {
     param($Config)
     $avail = @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^[A-Z]$' -and (Test-Path "$($_.Name):\\") } |
+        Where-Object { $_.Name -match '^[A-Z]$' -and (Test-Path "$($_.Name):\") } |
         ForEach-Object { $_.Name.ToUpper() } | Sort-Object)
 
     if ($avail.Count -eq 0) { Write-Err "No valid drive found."; return $null }
@@ -282,20 +278,20 @@ function Select-InstallDrive {
     $folder = Get-InstallFolderName -Config $Config
     if ($script:headless) {
         $root = [System.IO.Path]::GetPathRoot("$($Config.InstallRoot)")
-        $letter = $root.TrimEnd('\\').TrimEnd(':')
+        $letter = $root.TrimEnd('\').TrimEnd(':')
         if ($letter -notin $avail) { Write-Err "Configured drive $root does not exist."; return $null }
-        $Config.InstallRoot = "$letter`:\\ESS\\$folder"
+        $Config.InstallRoot = "$letter`:\ESS\$folder"
         Save-DeployConfig -Config $Config
         return $Config.InstallRoot
     }
 
     Write-Host "`nAvailable drives: $($avail -join ', ')" -ForegroundColor Gray
-    $current = [System.IO.Path]::GetPathRoot("$($Config.InstallRoot)").TrimEnd('\\').TrimEnd(':')
+    $current = [System.IO.Path]::GetPathRoot("$($Config.InstallRoot)").TrimEnd('\').TrimEnd(':')
     $choice = Read-Host "Install drive [$current]"
     if ([string]::IsNullOrWhiteSpace($choice)) { $choice = $current }
-    $choice = $choice.ToUpper().TrimEnd('\\').TrimEnd(':')
+    $choice = $choice.ToUpper().TrimEnd('\').TrimEnd(':')
     if ($choice -notin $avail) { Write-Err "Invalid drive. Available: $($avail -join ', ')"; return $null }
-    $Config.InstallRoot = "$choice`:\\ESS\\$folder"
+    $Config.InstallRoot = "$choice`:\ESS\$folder"
     Save-DeployConfig -Config $Config
     Write-Success "Install path: $($Config.InstallRoot)"
     return $Config.InstallRoot
@@ -304,9 +300,21 @@ function Select-InstallDrive {
 function Initialize-InstallRoot {
     param($Config)
     if ($script:dryRun) { return }
-    New-Item -Path $Config.InstallRoot -ItemType Directory -Force | Out-Null
-    New-Item -Path (Join-Path $Config.InstallRoot "logs") -ItemType Directory -Force | Out-Null
-    New-Item -Path (Join-Path $Config.InstallRoot "exports") -ItemType Directory -Force | Out-Null
+    New-Item -Path $Config.InstallRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null
+    New-Item -Path (Join-Path $Config.InstallRoot "logs") -ItemType Directory -Force -ErrorAction Stop | Out-Null
+    $exportsDir = Join-Path $Config.InstallRoot "exports"
+    New-Item -Path $exportsDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+    if (-not (Test-Path -LiteralPath $exportsDir -PathType Container)) {
+        throw "PDF export path is not a directory: $exportsDir"
+    }
+    $probe = Join-Path $exportsDir (".deploy-write-test-" + [guid]::NewGuid().ToString("N"))
+    try {
+        [System.IO.File]::WriteAllText($probe, "ok")
+    } catch {
+        throw "PDF export directory is not writable: $exportsDir. $_"
+    } finally {
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Test-AppInstallRoot {
@@ -333,24 +341,7 @@ function New-DefaultSecrets {
     return [PSCustomObject]@{
         db = [PSCustomObject]@{ host = "192.168.1.172"; port = 3306; name = "ess"; user = "root"; password = "" }
         smtp = [PSCustomObject]@{ host = "smtp.gmail.com"; port = 587; user = ""; pass = ""; from = "" }
-        app = [PSCustomObject]@{ secret_key = "" }
     }
-}
-
-function Ensure-AppSecretKey {
-    param($Secrets)
-    if (-not ($Secrets | Get-Member -Name "app" -ErrorAction SilentlyContinue) -or -not $Secrets.app) {
-        Add-Member -InputObject $Secrets -NotePropertyName app -NotePropertyValue ([PSCustomObject]@{ secret_key = "" }) -Force
-    }
-    if (-not ($Secrets.app | Get-Member -Name "secret_key" -ErrorAction SilentlyContinue)) {
-        Add-Member -InputObject $Secrets.app -NotePropertyName secret_key -NotePropertyValue "" -Force
-    }
-    if ([string]::IsNullOrWhiteSpace("$($Secrets.app.secret_key)")) {
-        $Secrets.app.secret_key = [System.Guid]::NewGuid().ToString("N") + [System.Guid]::NewGuid().ToString("N")
-        $Secrets | ConvertTo-Json -Depth 6 | Set-Content $SecretsPath -Encoding UTF8
-        Write-Log "Generated persistent application SECRET_KEY"
-    }
-    return $Secrets
 }
 
 function Get-SecretsOrInitialize {
@@ -378,15 +369,29 @@ function Get-SecretsOrInitialize {
     if (-not ($s | Get-Member -Name smtp -ErrorAction SilentlyContinue)) {
         Add-Member -InputObject $s -NotePropertyName smtp -NotePropertyValue ([PSCustomObject]@{ host="smtp.gmail.com";port=587;user="";pass="";from="" }) -Force
     }
-    $s = Ensure-AppSecretKey -Secrets $s
-
     $placeholderPattern = 'REPLACE_WITH_|YOUR_|CHANGE_THIS|PLACEHOLDER'
     $invalid = @()
+    if (-not $s.db) { $invalid += 'db section' }
+    if (-not $s.smtp) { $invalid += 'smtp section' }
+    if ($invalid.Count -gt 0) {
+        Write-Warn "Secrets incomplete: $($invalid -join ', ')"
+        Write-Host " Edit: $SecretsPath" -ForegroundColor Cyan
+        return $null
+    }
     foreach ($pair in @(
         @{ n='db.host'; v="$($s.db.host)" }, @{ n='db.name'; v="$($s.db.name)" },
-        @{ n='db.user'; v="$($s.db.user)" }, @{ n='db.password'; v="$($s.db.password)" }
+        @{ n='db.user'; v="$($s.db.user)" }, @{ n='db.password'; v="$($s.db.password)" },
+        @{ n='smtp.host'; v="$($s.smtp.host)" }, @{ n='smtp.user'; v="$($s.smtp.user)" },
+        @{ n='smtp.pass'; v="$($s.smtp.pass)" }, @{ n='smtp.from'; v="$($s.smtp.from)" }
     )) {
         if ([string]::IsNullOrWhiteSpace($pair.v) -or $pair.v -match $placeholderPattern) { $invalid += $pair.n }
+    }
+    foreach ($section in @('db', 'smtp')) {
+        $port = 0
+        $portText = if ($section -eq 'db') { "$($s.db.port)" } else { "$($s.smtp.port)" }
+        if (-not [int]::TryParse($portText, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+            $invalid += "$section.port"
+        }
     }
     if ($invalid.Count -gt 0) {
         Write-Warn "Secrets incomplete: $($invalid -join ', ')"
@@ -404,7 +409,6 @@ function Confirm-DeploymentCredentials {
     Write-Host "============================================" -ForegroundColor Cyan
     Write-Host " DB configuration : configured" -ForegroundColor Green
     Write-Host (" SMTP             : " + $(if (-not [string]::IsNullOrWhiteSpace("$($Secrets.smtp.user)")) { "configured" } else { "not configured" })) -ForegroundColor Gray
-    Write-Host " SECRET_KEY        : persistent / configured" -ForegroundColor Green
     Write-Host " Source            : $SecretsPath" -ForegroundColor Gray
     return (Confirm-Step "Continue deployment?" -DefaultYes:$true)
 }
@@ -427,12 +431,6 @@ function Write-MoEnvFile {
     $smtpUser = Convert-ToEnvValue $Secrets.smtp.user
     $smtpPass = Convert-ToEnvValue $Secrets.smtp.pass
     $smtpFrom = Convert-ToEnvValue $Secrets.smtp.from
-    $secretKey = Convert-ToEnvValue $Secrets.app.secret_key
-    $frontendUrl = if ([string]::IsNullOrWhiteSpace("$($Config.FrontendPublicUrl)")) {
-        "http://localhost:$($Config.CaddyPort)"
-    } else {
-        "$($Config.FrontendPublicUrl)".Trim().TrimEnd('/')
-    }
     $mediaStoragePath = "$($Config.MediaStoragePath)"
     $reportExportRoot = Join-Path $Config.InstallRoot "exports"
 
@@ -444,16 +442,11 @@ DB_USER="$dbUser"
 DB_PASSWORD="$dbPass"
 DB_NAME=$dbName
 
-SECRET_KEY=$secretKey
-ALGORITHM=HS256
-ACCESS_TOKEN_EXPIRE_MINUTES=30
-
 SMTP_HOST=$smtpHost
 SMTP_PORT=$smtpPort
 SMTP_USER="$smtpUser"
 SMTP_PASS="$smtpPass"
 EMAIL_FROM="$smtpFrom"
-FRONTEND_URL=$frontendUrl
 
 MEDIA_STORAGE_PATH=$mediaStoragePath
 
@@ -495,7 +488,7 @@ function Test-Prerequisites {
         else { Write-Host "    $($t.Name): MISSING" -ForegroundColor Red; $missing += $t }
     }
     if ($missing.Count -eq 0) { return $true }
-    if ($CheckOnly -or $script:headless) { return $false }
+    if ($CheckOnly -or $script:headless -or $script:dryRun) { return $false }
     if (-not (Confirm-Step "Install missing prerequisites?" -DefaultYes:$true)) { return $false }
     foreach ($t in $missing) {
         if ($t.WingetId -and (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -648,8 +641,8 @@ function Test-ComponentInstalled {
     $svc=Get-Service -Name (Get-DeployServiceName -Config $Config -Component $Component) -ErrorAction SilentlyContinue
     $base=Join-Path $Config.InstallRoot $Component
     switch ($Component) {
-        "frontend"      { return [bool]($svc -and (Test-Path (Join-Path $base "repo\\.git"))) }
-        "backend"       { return [bool]($svc -and (Test-Path (Join-Path $base "repo\\.git"))) }
+        "frontend"      { return [bool]($svc -and (Test-Path (Join-Path $base "repo\.git"))) }
+        "backend"       { return [bool]($svc -and (Test-Path (Join-Path $base "repo\.git"))) }
         "report-worker" {
             $workerRepo=Join-Path $base "repo\.git"
             $workerPython=Join-Path $base "repo\venv\Scripts\python.exe"
@@ -745,7 +738,7 @@ function Install-OrKeepService {
     param([string]$ServiceName,[string]$RunnerScript,[string]$LogPath)
     $svc=Get-Service $ServiceName -ErrorAction SilentlyContinue
     if($svc){Write-Success "$ServiceName service registration kept";return}
-    $powershellExe="C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+    $powershellExe="C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
     $paramStr="-ExecutionPolicy Bypass -File `"$RunnerScript`""
     servy-cli install --name="$ServiceName" --path="$powershellExe" --params="$paramStr" 2>&1 | Add-FileLog -Path $LogPath
     if(-not(Get-Service $ServiceName -ErrorAction SilentlyContinue)){throw "Service '$ServiceName' was not created."}
@@ -792,6 +785,14 @@ function Get-FrontendDeploymentFingerprint {
     return (Get-TextSha256 -Text $payload)
 }
 
+function Assert-EssSdkConfiguration {
+    param($Config)
+    if ([string]::IsNullOrWhiteSpace("$($Config.EssPublicKey)") -or
+        [string]::IsNullOrWhiteSpace("$($Config.EssSdkOrigin)")) {
+        throw "Set both EssPublicKey and EssSdkOrigin in deploy.config.json before deploying the frontend."
+    }
+}
+
 function Get-SavedFrontendDeploymentFingerprint {
     param($Config)
     $path=Join-Path (Join-Path $Config.InstallRoot "frontend") "deployment-config.sha256"
@@ -819,10 +820,11 @@ function Set-FrontendBuildEnvironment {
 # ===========================================================
 function Install-Frontend {
     param($Config)
+    if(-not $script:dryRun){Assert-EssSdkConfiguration -Config $Config}
     Initialize-InstallRoot -Config $Config
     $appDir=Join-Path $Config.InstallRoot "frontend"
     $repoDir=Join-Path $appDir "repo"
-    $logsDir=Join-Path $Config.InstallRoot "logs\\frontend"
+    $logsDir=Join-Path $Config.InstallRoot "logs\frontend"
     New-Item $logsDir -ItemType Directory -Force | Out-Null
     $log=Join-Path $logsDir ("frontend_{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
     $svcName=Get-DeployServiceName -Config $Config -Component "frontend"
@@ -880,7 +882,7 @@ function Install-Frontend {
         try{
             npm install --legacy-peer-deps 2>&1 | Add-FileLog -Path $log
             if($LASTEXITCODE -ne 0){throw "Frontend npm install failed."}
-            if(-not(Test-Path (Join-Path $repoDir "node_modules\\serve\\build\\main.js"))){npm install --no-save serve --legacy-peer-deps 2>&1 | Add-FileLog -Path $log}
+            if(-not(Test-Path (Join-Path $repoDir "node_modules\serve\build\main.js"))){npm install --no-save serve --legacy-peer-deps 2>&1 | Add-FileLog -Path $log}
             Set-FrontendBuildEnvironment -Config $Config
             npm run build 2>&1 | Add-FileLog -Path $log
             if($LASTEXITCODE -ne 0){throw "Frontend build failed."}
@@ -986,6 +988,7 @@ function Get-WorkerRequirementsPath {
 
 function Initialize-BackendRuntime {
     param($Config,$Secrets,[string]$LogPath)
+    Initialize-InstallRoot -Config $Config
     $appDir=Join-Path $Config.InstallRoot "backend"
     $repoDir=Join-Path $appDir "repo"
     $venv=Join-Path $repoDir "venv"
@@ -1029,6 +1032,7 @@ exit $p.ExitCode
 
 function Initialize-ReportWorkerRuntime {
     param($Config,$Secrets,[string]$LogPath)
+    Initialize-InstallRoot -Config $Config
     $appDir=Join-Path $Config.InstallRoot "report-worker"
     $repoDir=Join-Path $appDir "repo"
     $venv=Join-Path $repoDir "venv"
@@ -1202,10 +1206,25 @@ function Commit-CaddyLocalVersion {
     return (Get-GitHead $dir)
 }
 
+function Get-CaddyRunnerPorts {
+    param($Config)
+    $runner=Join-Path (Join-Path $Config.InstallRoot "caddy") "caddy-run.ps1"
+    if(-not(Test-Path $runner)){throw "Caddy runner is missing: $runner"}
+    $content=Get-Content -Path $runner -Raw -ErrorAction Stop
+    $match=[regex]::Match($content,'@\{proxy=(\d+);admin=(\d+)\}')
+    if(-not $match.Success){throw "Caddy runner does not record its proxy and admin ports: $runner"}
+    $proxy=[int]$match.Groups[1].Value
+    $admin=[int]$match.Groups[2].Value
+    if($proxy -lt 1 -or $proxy -gt 65535 -or $admin -lt 1 -or $admin -gt 65535 -or $proxy -eq $admin){
+        throw "Caddy runner has invalid proxy/admin ports: $proxy/$admin"
+    }
+    return @{proxy=$proxy;admin=$admin}
+}
+
 function Install-Caddy {
     param($Config)
     Initialize-InstallRoot $Config
-    $dir=Join-Path $Config.InstallRoot "caddy";$logs=Join-Path $Config.InstallRoot "logs\\caddy";New-Item $logs -ItemType Directory -Force|Out-Null
+    $dir=Join-Path $Config.InstallRoot "caddy";$logs=Join-Path $Config.InstallRoot "logs\caddy";New-Item $logs -ItemType Directory -Force|Out-Null
     $log=Join-Path $logs ("caddy_{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"));$svcName=Get-DeployServiceName $Config "caddy"
     $oldGood=Get-DeploymentComponentCurrent $Config "caddy";$wasInstalled=Test-ComponentInstalled $Config "caddy"
     Write-Step ($(if($wasInstalled){"Updating Caddy"}else{"Installing Caddy"}))
@@ -1226,26 +1245,39 @@ function Install-Caddy {
         }
         if(-not(Test-Path $exe)){
             $zip=Join-Path $dir "caddy.zip"
+            $checksums=Join-Path $dir "caddy.checksums.txt"
             $extractDir=Join-Path $dir "_caddy_extract"
-            $version="$($Config.CaddyVersion)".Trim().TrimStart('v')
-            $expectedHash="$($Config.CaddyWindowsAmd64Sha256)".Trim().ToLowerInvariant()
-            if($version -notmatch '^\d+\.\d+\.\d+$'){throw "Invalid CaddyVersion '$version'."}
-            if($expectedHash -notmatch '^[a-f0-9]{64}$'){throw "Invalid Caddy Windows SHA256 checksum."}
-            $downloadUrl="https://github.com/caddyserver/caddy/releases/download/v$version/caddy_${version}_windows_amd64.zip"
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            $latestRelease=Invoke-RestMethod -Uri "https://api.github.com/repos/caddyserver/caddy/releases/latest" -UseBasicParsing -ErrorAction Stop
+            $version="$($latestRelease.tag_name)".Trim().TrimStart('v')
+            if($version -notmatch '^\d+\.\d+\.\d+$'){throw "Could not resolve a stable Caddy release version."}
+            $archiveName="caddy_${version}_windows_amd64.zip"
+            $releaseUrl="https://github.com/caddyserver/caddy/releases/download/v$version"
+            $downloadUrl="$releaseUrl/$archiveName"
+            $checksumsUrl="$releaseUrl/caddy_${version}_checksums.txt"
             $downloaded=$false
             $releaseDownloadError=$null
 
             for($attempt=1;$attempt -le 3;$attempt++){
                 Remove-Item $zip -Force -ErrorAction SilentlyContinue
+                Remove-Item $checksums -Force -ErrorAction SilentlyContinue
                 Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
                 try{
-                    Write-Host "    Downloading Caddy v$version (attempt $attempt/3)..." -ForegroundColor Gray
+                    Write-Host "    Downloading Caddy v$version and release checksums (attempt $attempt/3)..." -ForegroundColor Gray
+                    Invoke-WebRequest -Uri $checksumsUrl -OutFile $checksums -UseBasicParsing -ErrorAction Stop
+                    $checksumsText=Get-Content -Path $checksums -Raw -ErrorAction Stop
+                    $checksumPattern='(?m)^\s*([a-fA-F0-9]{128}|[a-fA-F0-9]{64})\s+\*?'+[regex]::Escape($archiveName)+'\s*$'
+                    $checksumMatch=[regex]::Match($checksumsText,$checksumPattern)
+                    if(-not $checksumMatch.Success){throw "The Caddy release checksums do not list $archiveName."}
+                    $expectedHash=$checksumMatch.Groups[1].Value.ToLowerInvariant()
+                    $hashAlgorithm=if($expectedHash.Length -eq 128){"SHA512"}else{"SHA256"}
                     Invoke-WebRequest -Uri $downloadUrl -OutFile $zip -UseBasicParsing -ErrorAction Stop
                     $zipInfo=Get-Item $zip -ErrorAction Stop
                     if($zipInfo.Length -lt 1MB){throw "Downloaded archive is unexpectedly small ($($zipInfo.Length) bytes)."}
 
-                    $actualHash=(Get-FileHash -Path $zip -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+                    $actualHash=(Get-FileHash -Path $zip -Algorithm $hashAlgorithm -ErrorAction Stop).Hash.ToLowerInvariant()
                     if($actualHash -ne $expectedHash){throw "Caddy archive checksum mismatch."}
+                    Write-FileLog -Path $log -Text "Caddy v$version archive verified against published $hashAlgorithm checksum."
 
                     New-Item $extractDir -ItemType Directory -Force|Out-Null
                     Expand-Archive -Path $zip -DestinationPath $extractDir -Force -ErrorAction Stop
@@ -1265,47 +1297,11 @@ function Install-Caddy {
                     }
                 }finally{
                     Remove-Item $zip -Force -ErrorAction SilentlyContinue
+                    Remove-Item $checksums -Force -ErrorAction SilentlyContinue
                     Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
                 }
             }
-
-            # The official Caddy download API returns a Windows executable,
-            # not a ZIP archive. Use it directly if the verified release ZIP
-            # is unavailable through the current network/proxy.
-            if(-not $downloaded){
-                Write-Warn "Verified Caddy release archive was unavailable: $releaseDownloadError"
-                Write-Host "    Trying official Caddy direct download..." -ForegroundColor Gray
-                [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
-                $directUrl="https://caddyserver.com/api/download?os=windows&arch=amd64"
-                $directExe=Join-Path $dir "caddy.download.exe"
-                $directDownloadError=$null
-                for($attempt=1;$attempt -le 3;$attempt++){
-                    Remove-Item $directExe -Force -ErrorAction SilentlyContinue
-                    try{
-                        Invoke-WebRequest -Uri $directUrl -OutFile $directExe -UseBasicParsing -ErrorAction Stop
-                        $exeInfo=Get-Item $directExe -ErrorAction Stop
-                        if($exeInfo.Length -lt 1MB){throw "Downloaded executable is unexpectedly small ($($exeInfo.Length) bytes)."}
-                        $stream=[System.IO.File]::OpenRead($directExe)
-                        try{$byte1=$stream.ReadByte();$byte2=$stream.ReadByte()}finally{$stream.Dispose()}
-                        if($byte1 -ne 0x4D -or $byte2 -ne 0x5A){throw "Downloaded file is not a Windows executable."}
-                        $directHash=(Get-FileHash -Path $directExe -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
-                        Write-FileLog -Path $log -Text "Official Caddy direct-download SHA256: $directHash"
-                        Move-Item $directExe $exe -Force
-                        & $exe version 2>&1|Add-FileLog -Path $log
-                        if($LASTEXITCODE -ne 0){throw "Directly downloaded caddy.exe could not start."}
-                        $downloaded=$true
-                        break
-                    }catch{
-                        $directDownloadError=$_.Exception.Message
-                        Remove-Item $exe -Force -ErrorAction SilentlyContinue
-                        if($attempt -lt 3){
-                            Write-Warn "Caddy direct download attempt $attempt failed: $directDownloadError. Retrying..."
-                            Start-Sleep -Seconds (2*$attempt)
-                        }
-                    }finally{Remove-Item $directExe -Force -ErrorAction SilentlyContinue}
-                }
-                if(-not $downloaded){throw "Caddy download failed. Release archive: $releaseDownloadError. Direct download: $directDownloadError"}
-            }
+            if(-not $downloaded){throw "Verified Caddy release download failed: $releaseDownloadError"}
             if(-not $downloaded -or -not(Test-Path $exe)){throw "caddy.exe download failed."}
         }
 
@@ -1349,7 +1345,8 @@ function Install-Caddy {
         $lines.Add('        Referrer-Policy "strict-origin-when-cross-origin"')
         $lines.Add("    }")
         $lines.Add("}")
-        Set-Content $caddyfile ($lines -join [Environment]::NewLine) -Encoding UTF8 -Force
+        $utf8NoBom=[System.Text.UTF8Encoding]::new($false)
+        [System.IO.File]::WriteAllText($caddyfile, ($lines -join [Environment]::NewLine)+[Environment]::NewLine, $utf8NoBom)
         $runner=Join-Path $dir "caddy-run.ps1"
         $runnerContent=@'
 # Capture Caddy's normal stderr logs without converting them into PowerShell failures.
@@ -1438,10 +1435,7 @@ try{
         }
         if(-not[string]::IsNullOrWhiteSpace($oldGood) -and (Test-Path (Join-Path $dir ".git")) -and (Ensure-GitCommitAvailable $dir $oldGood)){
             Write-Warn "Restoring Caddy known-good commit: $oldGood"
-            Stop-ServiceIfRunning $svcName
-            git -C $dir reset --hard $oldGood|Out-Null
-            Start-Service $svcName -ErrorAction SilentlyContinue
-            if(Test-Endpoint -Url "http://127.0.0.1:$($Config.CaddyPort)$($Config.ApiPrefix)/health" -Name "Restored Caddy proxy" -Retries 5){
+            if(Invoke-CaddyRollbackToCommit $Config $oldGood){
                 Write-Success "Caddy restored to known-good commit: $oldGood"
             }else{
                 Write-Err "Restored Caddy did not pass its health check."
@@ -1456,7 +1450,7 @@ try{
 # ===========================================================
 function Invoke-FrontendRollbackToCommit {
     param($Config,[string]$Commit)
-    $dir=Join-Path $Config.InstallRoot "frontend\\repo";$svc=Get-DeployServiceName $Config "frontend"
+    $dir=Join-Path $Config.InstallRoot "frontend\repo";$svc=Get-DeployServiceName $Config "frontend"
     try{
         if(-not(Ensure-GitCommitAvailable $dir $Commit)){throw "Commit unavailable: $Commit"}
         Stop-ServiceIfRunning $svc;git -C $dir reset --hard $Commit|Out-Null
@@ -1498,13 +1492,35 @@ function Invoke-CaddyRollbackToCommit {
         git -C $dir reset --hard $Commit|Out-Null
         if($LASTEXITCODE -ne 0){throw "Caddy Git rollback failed."}
 
+        $targetPorts=Get-CaddyRunnerPorts $Config
         $exe=Join-Path $dir "caddy.exe";$caddyfile=Join-Path $dir "Caddyfile"
         $validationOutput=@(& $exe validate --config $caddyfile --adapter caddyfile 2>&1)
         if($LASTEXITCODE -ne 0){throw "Rolled-back Caddyfile is invalid: $(($validationOutput|Select-Object -Last 10)-join ' | ')"}
 
+        $portsFile=Join-Path $dir "caddy-ports.json"
+        Remove-Item $portsFile -Force -ErrorAction SilentlyContinue
         Start-Service $svc -ErrorAction Stop
-        if(-not(Test-Endpoint -Url "http://127.0.0.1:$($Config.CaddyPort)$($Config.ApiPrefix)/health" -Name "Caddy rollback")){throw "Rolled-back Caddy proxy did not pass its health check."}
-        if(-not(Test-PortInUse ([int]$Config.CaddyAdminPort))){throw "Rolled-back Caddy admin port is not listening."}
+        $pollAttempts=0
+        while($pollAttempts -lt 5 -and -not(Test-Path $portsFile)){Start-Sleep -Seconds 2;$pollAttempts++}
+        if(-not(Test-Path $portsFile)){throw "Rolled-back Caddy did not report its ports."}
+        $reportedPorts=Get-Content $portsFile -Raw -ErrorAction Stop|ConvertFrom-Json
+        if([int]$reportedPorts.proxy -ne $targetPorts.proxy -or [int]$reportedPorts.admin -ne $targetPorts.admin){
+            throw "Rolled-back Caddy reported unexpected ports: proxy=$($reportedPorts.proxy), admin=$($reportedPorts.admin)"
+        }
+        $portsReady=$false
+        for($i=0;$i -lt 10;$i++){
+            if((Test-PortInUse ([int]$targetPorts.proxy)) -and (Test-PortInUse ([int]$targetPorts.admin))){$portsReady=$true;break}
+            Start-Sleep -Seconds 1
+        }
+        if(-not $portsReady){throw "Rolled-back Caddy proxy/admin ports are not both listening."}
+        $runningService=Get-Service $svc -ErrorAction SilentlyContinue
+        if(-not $runningService -or $runningService.Status -ne 'Running'){throw "Rolled-back Caddy service is not running."}
+        if([int]$Config.CaddyPort -ne $targetPorts.proxy -or [int]$Config.CaddyAdminPort -ne $targetPorts.admin){
+            $Config.CaddyPort=$targetPorts.proxy
+            $Config.CaddyAdminPort=$targetPorts.admin
+            Save-DeployConfig $Config
+            Write-Success "Caddy ports restored: proxy=$($targetPorts.proxy), admin=$($targetPorts.admin)"
+        }
         return $true
     }catch{
         Write-Err "Caddy rollback failed: $_"
@@ -1548,6 +1564,7 @@ function Show-RollbackMenu {
     }
 
     $versions=@($state.deploymentVersions);$current=$versions[0];$target=$versions[1]
+    if($script:dryRun){Write-Warn "[DRY-RUN] Would roll back $($current.versionName) to $($target.versionName).";return}
     Write-Host "`n============================================" -ForegroundColor Cyan
     Write-Host " Rollback Complete Deployment" -ForegroundColor Cyan
     Write-Host "============================================" -ForegroundColor Cyan
@@ -1569,15 +1586,16 @@ function Show-RollbackMenu {
 
     $secrets=Get-SecretsOrInitialize;if(-not $secrets){return}
     $restored=@();$ok=$true
-    foreach($k in @("caddy","report-worker","backend","frontend")){
+    foreach($k in @("caddy","backend","report-worker","frontend")){
         $commit="$($target.components.$k.current)".Trim()
         if([string]::IsNullOrWhiteSpace($commit)){continue}
         if(Invoke-SelectedRollback $Config $secrets $k $commit){$restored += $k}else{$ok=$false;break}
     }
+    if($ok -and -not(Verify-Health $Config)){$ok=$false}
 
     if(-not $ok){
         Write-Warn "Rollback did not complete. Restoring the original current deployment where possible..."
-        foreach($k in @("caddy","report-worker","backend","frontend")){
+        foreach($k in @("caddy","backend","report-worker","frontend")){
             if($restored -notcontains $k){continue}
             $commit="$($current.components.$k.current)".Trim()
             if(-not[string]::IsNullOrWhiteSpace($commit)){Invoke-SelectedRollback $Config $secrets $k $commit|Out-Null}
@@ -1597,11 +1615,13 @@ function Restore-DeploymentStateBeforeRun {
     $v=@($script:deploymentStateBeforeRun.deploymentVersions)[0];if(-not $v){return $false}
     Write-Step "RESTORING previous known-good deployment"
     $ok=$true
-    foreach($k in @("caddy","report-worker","backend","frontend")){
+    foreach($k in @("caddy","backend","report-worker","frontend")){
+        if($script:liveComponentsChanged -notcontains $k){continue}
         $commit="$($v.components.$k.current)".Trim()
         if([string]::IsNullOrWhiteSpace($commit)){continue}
         if(-not(Invoke-SelectedRollback $Config $Secrets $k $commit)){$ok=$false;break}
     }
+    if($ok -and -not(Verify-Health $Config)){$ok=$false}
     if($ok){Save-DeploymentState $Config $script:deploymentStateBeforeRun;Write-Success "Previous known-good deployment restored."}
     return $ok
 }
@@ -1659,6 +1679,17 @@ function Invoke-FullDeploy {
     param($Config)
     $script:deploymentTransaction=$true;$script:deploymentCandidates=@{};$script:liveComponentsChanged=@();$script:deploymentStateBeforeRun=Copy-ObjectDeep (Get-DeploymentState $Config)
     Initialize-Logger $Config
+    $targets=if($script:headless -and $Components.Count -gt 0){@($Components)}else{@(Get-ComponentKeys)}
+    if($script:dryRun){
+        Write-Step "DRY RUN - planned deployment"
+        foreach($key in $targets){Write-Host "    Would install/update $key under $($Config.InstallRoot)" -ForegroundColor Gray}
+        $script:deploymentTransaction=$false
+        return
+    }
+    if($targets -contains "frontend"){
+        try{Assert-EssSdkConfiguration -Config $Config}
+        catch{Write-Err "Frontend configuration incomplete: $_";$script:deploymentTransaction=$false;return}
+    }
 
     Write-Step "Checking network access"
     try {
@@ -1674,7 +1705,6 @@ function Invoke-FullDeploy {
     }
 
     if(-not(Test-Prerequisites -CheckOnly)){Write-Err "Resolve missing prerequisites first.";$script:deploymentTransaction=$false;return}
-    $targets=if($script:headless -and $Components.Count -gt 0){@($Components)}else{@(Get-ComponentKeys)}
     $secrets=$null
     if(($targets -contains "backend") -or ($targets -contains "report-worker")){
         $secrets=Get-SecretsOrInitialize;if(-not $secrets){$script:deploymentTransaction=$false;return}
@@ -1685,8 +1715,11 @@ function Invoke-FullDeploy {
         if($targets -notcontains $k){continue}
         $spinnerLabel=switch($k){"frontend"{"Frontend deployment"};"backend"{"Backend deployment"};"report-worker"{"Report worker deployment"};"caddy"{"Caddy deployment"}}
         Start-Spinner "$spinnerLabel ..."
+        $r=$false
         try{
             switch($k){"frontend"{$r=Install-Frontend $Config};"backend"{$r=Install-Backend $Config $secrets};"report-worker"{$r=Install-ReportWorker $Config $secrets};"caddy"{$r=Install-Caddy $Config}}
+        }catch{
+            Write-Err "$k deployment failed: $_"
         }finally{Stop-Spinner}
         if(-not $r){$ok=$false;break}
     }
@@ -1694,7 +1727,9 @@ function Invoke-FullDeploy {
     if($ok){Complete-FullDeploymentState $Config;Write-Success "Complete deployment successful."}
     else{
         Write-Err "Deployment failed. Restoring previous known-good deployment."
-        if($script:deploymentStateBeforeRun){Restore-DeploymentStateBeforeRun $Config $secrets|Out-Null}
+        if($script:deploymentStateBeforeRun -and @($script:liveComponentsChanged).Count -gt 0){
+            Restore-DeploymentStateBeforeRun $Config $secrets|Out-Null
+        }else{Write-Warn "No live component was changed; no rollback is required."}
     }
     $script:deploymentTransaction=$false
 }
@@ -1839,7 +1874,8 @@ function Show-CaddyConfig {
 
         if($changed -and (Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue)){
             if(Confirm-Step "Regenerate Caddyfile and restart Caddy?" -DefaultYes:$true){
-                if(Install-Caddy -Config $Config){Write-Success "Caddy configuration applied."}
+                if($script:dryRun){Write-Warn "[DRY-RUN] Would regenerate Caddyfile and restart Caddy."}
+                elseif(Install-Caddy -Config $Config){Write-Success "Caddy configuration applied."}
                 else{Write-Err "Caddy configuration could not be applied."}
             }
         }
@@ -1879,7 +1915,8 @@ function Stop-AllServices {
 # ===========================================================
 try {
     $Config=Get-DeployConfig
-    if(-not $Config.InstallRoot){Select-InstallDrive $Config|Out-Null}
+    $installRoot=Select-InstallDrive -Config $Config
+    if(-not $installRoot){throw "A valid install drive is required."}
     Initialize-InstallRoot $Config
 
     if($Force -or $Components.Count -gt 0){Invoke-FullDeploy $Config;exit $(if($script:hasErrors){1}else{0})}
@@ -1901,6 +1938,7 @@ try {
                 Invoke-FullDeploy -Config $Config
             }
             '^3$' {
+                if($script:dryRun){Write-Warn "[DRY-RUN] Would uninstall the complete deployment.";break}
                 $compList=Get-Components -Config $Config
                 Write-Host ""
                 Write-Host "============================================" -ForegroundColor Cyan

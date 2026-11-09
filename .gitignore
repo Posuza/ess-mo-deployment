@@ -3,6 +3,7 @@
 !ess-mo/**
 !.gitattributes
 !.gitignore
+ess-mo/deploy.secrets.json
 *.zip
 .DS_Store
 ess-mo/.DS_Store

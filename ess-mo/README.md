@@ -1,5 +1,3 @@
-# udpte version-2
-
 # Servy Full-Stack Deployment Manager
 
 Automates installing the **ESS MO** app (React frontend + FastAPI backend + MO report worker + Caddy reverse proxy) as Windows services via [Servy](https://github.com/servy-community/servy).
@@ -8,42 +6,57 @@ Automates installing the **ESS MO** app (React frontend + FastAPI backend + MO r
 
 ## 📋 Before you begin — config files
 
-Edit these **before** your first deploy if your setup differs from the defaults.
+The script reads two files in this folder: `deploy.config.json` for settings
+and `deploy.secrets.json` for credentials. `deploy.secrets.example.json` is a
+template only; deployment never reads it.
 
-### `deploy.config.json` — settings (ports, paths, repos)
+### `deploy.config.json` — active settings (ports, paths, repos)
 
-### `deploy.secrtes.json` — settings (credentials)
+Edit these settings before deployment if needed:
 
-Created automatically on first run. Edit it to change:
+Check that the configured frontend, backend, Caddy proxy, and Caddy admin ports are available on the deployment machine.
 
-> ⚠️ **Do not use ports** `80`, `443`, `8080`, `3000`, `8000`, `5000` — these are typically taken by other services (IIS, web servers, dev tools). Pick free ports instead. The defaults (`3009`, `8009`, `8089`,....) any of such this never conflict.
-
-| Field | Default | What it does | Can be changed? |
+| Field | Active value | What it does | Can be changed? |
 |---|---|---|---|
 | `Environment` | `production` | Selects isolated install and service names | ✅ Use `production` or `development` |
 | `FrontendRepo` | `Posuza/ESS_MO_Fronend` | Git repo for the React frontend | ✅ Replace with your own repo URL |
 | `FrontendBranch` | `main` | Frontend Git branch to deploy | ✅ Use `ver1` for development |
-| `EssPublicKey` | `Tg2wbdIU3C0JRfSX` | Registered ESS browser SDK application identifier | ✅ Public identifier; keep in config, not secrets |
-| `EssSdkOrigin` | `https://ess-faceregister.esscentor.com` | SDK origin; frontend appends `/sdk/v1/index.js` | ✅ Change in `deploy.config.json`; deployment rebuilds the frontend |
+| `EssPublicKey` | `ZjO4FYk9acszpjuo` | Browser SDK public application key built into the frontend | Use the key registered for the ESS-MO frontend |
+| `EssSdkOrigin` | `http://183.90.173.206:9091` | Face SDK host; frontend loads `/sdk/v1/index.js` from it | Use the reachable SDK host |
 | `BackendRepo` | `Posuza/ESS_MO_Backend` | Git repo for the FastAPI backend | ✅ Replace with your own repo URL |
 | `BackendBranch` | `main` | Backend Git branch to deploy | ✅ Use `ver1` for development |
 | `FrontendPort` | `3009` | Port the frontend serves on | ✅ Change if needed |
 | `BackendPort` | `8009` | Port the backend API runs on | ✅ Change if needed |
 | `CaddyPort` | `9089` | Port the reverse proxy listens on | ✅ Change if needed |
 | `ApiPrefix` | `/api/v1` | API path used by the frontend, Caddy, and backend health checks | Keep `/api/v1` for this backend |
-| `FrontendPublicUrl` | `null` | Public frontend URL written as `FRONTEND_URL`; `null` uses `http://localhost:<CaddyPort>` | ✅ Set to the externally reachable URL when available |
 | `MediaStoragePath` | `E:\ESS\storage\face-images` | Existing face-image directory read by the backend | ✅ Use an absolute Windows path below a drive root |
 | `MoReportWorkerPollSeconds` | `5` | How often the worker checks for queued reports | ✅ Change if needed |
 | `MoReportRetentionMinutes` | `60` | How long completed report PDFs remain downloadable | ✅ Set the required number of minutes |
 | `MoReportSweepMinutes` | `5` | How often expired report files are removed | ✅ Change if needed |
-| `InstallRoot` | *(set at startup)* | Derived from the selected drive and environment | ✅ `Ess_Mo` for production, `Ess_MO_dev` for development |
+| `InstallRoot` | `C:\ESS\Ess_MO` | Deployment folder for production; development uses `Ess_MO_dev` | ✅ Set the install drive in config or at startup |
+
+`EssPublicKey` is the key supplied for ESS-MO. Confirm that its registration
+allows the ESS-MO public origin before production use. `EssSdkOrigin` points to
+the Face SDK on port `9091`. MO itself is served by Caddy on port `9089`.
+Both SDK values are built into the frontend.
+
+When Caddy is missing, deployment resolves the latest stable release from
+GitHub, downloads the Windows archive, and verifies its published checksum.
+An existing working `caddy.exe` is reused.
+
+In ESS Auth, register the frontend origin that the user's browser opens. For
+local Vite development, that is `http://127.0.0.1:4101`. For Windows deployment,
+use the ESS-MO public host and Caddy port (currently `9089`). Register the exact
+scheme, host, and port. `EssSdkOrigin` is the host serving the SDK script; it is
+not the frontend callback origin.
 
 The deployment only passes `MediaStoragePath` to the backend `.env`. It does
 not create, modify, or delete this directory. Ensure the folder already exists
 and the backend Windows service account has permission to read it.
 
-PDF exports use `<InstallRoot>\exports`. Deployment creates this shared folder
-for the backend API and report worker. The worker creates dated subfolders as
+PDF exports use `<InstallRoot>\exports`. Deployment creates or reuses this
+shared folder and checks that it is writable. Updates and rollback keep existing
+PDF files. The worker creates dated subfolders as
 needed. A completed PDF remains downloadable for 60 minutes; the worker then
 removes expired files on its five-minute sweep. The frontend downloads through
 the backend API and does not need a PDF folder of its own.
@@ -53,25 +66,26 @@ Production services use the `ess-mo-*` prefix. Development services use
 `ess-mo-dev-*`, allowing both environments to run on the same machine when
 their configured ports are different.
 
-Ready-to-use profiles are provided in `deploy.production.config.json` and
-`deploy.development.config.json`. Copy the required profile over
-`deploy.config.json` before running the deployment script.
+The current `deploy.config.json` is the active profile.
 
 ### `deploy.secrets.json` — credentials (DB, SMTP)
 
-Auto-gitignored. Copy `deploy.secrets.example.json` → `deploy.secrets.json` to pre-fill, or enter them when the script prompts you.
+Auto-gitignored. Copy `deploy.secrets.example.json` to `deploy.secrets.json`,
+then replace every placeholder with real DB and SMTP values. The script blocks
+backend and worker deployment while any required value is blank or a placeholder.
+
 Save this JSON file as UTF-8, including when credentials contain Vietnamese
 characters. The deployment reads it as UTF-8 and writes the backend and worker
 `.env` files as UTF-8 without a BOM.
 
-```json
-{
-  "db":   { "host": "192.168.1.140", "port": "3306", "name": "ess", "user": "root", "password": "..." },
-  "smtp": { "host": "smtp.gmail.com", "port": "587", "user": "...", "pass": "...", "from": "..." }
-}
-```
+Use `deploy.secrets.example.json` for the field names and example structure.
 
-> If you skip pre-filling, the script will ask for these interactively.
+The template and active secrets file contain only DB and SMTP settings.
+This ESS-MO deployment does not create an `app.secret_key`; the current
+login and forgot-password flows do not use one.
+
+If `deploy.secrets.json` is missing, the script creates it with empty credential
+fields and opens it in Notepad in interactive mode. Fill it in, then rerun.
 
 ---
 
@@ -83,9 +97,9 @@ Before running the script, make sure your DB and SMTP credentials are ready.
 You can either:
 
 - **Pre-fill** `deploy.secrets.json` with your real values (copy from `deploy.secrets.example.json`)
-- **Or let the script prompt you** — it will ask for credentials at the start of the deployment
+- **Or run once without the file**: the script creates it and opens Notepad; fill it in and rerun.
 
-> The script never blocks — if you skip entering credentials, it uses defaults that you can update later.
+The backend and report worker require complete DB and SMTP credentials.
 
 ### 2. Run the script
 
@@ -131,7 +145,7 @@ Press **`2`** then **`A`** to install all components (or pick individually by nu
 
 The script will:
 1. Check prerequisites (Git, Node.js, Python) — installs missing ones
-2. Ask for DB/SMTP credentials (if not pre-filled)
+2. Check `deploy.secrets.json` for complete DB/SMTP credentials
 3. Install each component:
    - **Frontend** — clones repo, `npm install`, builds, registers as Windows service
    - **Backend + report worker** — uses one backend clone, creates separate API and worker venvs, generates one shared `.env`, and registers both Windows services. Updating either component updates both to the same commit.
@@ -225,4 +239,4 @@ Use **option 7** to manage which services Caddy proxies to:
 | `deploy.ps1` | Main deployment script | ✅ |
 | `deploy.config.json` | Ports, paths, repos, routes | ✅ |
 | `deploy.secrets.example.json` | Credentials template | ✅ |
-| `deploy.secrets.json` | Your real DB/SMTP credentials | ❌ (gitignored) |
+| `deploy.secrets.json` | Active DB/SMTP credentials | ❌ (gitignored) |
