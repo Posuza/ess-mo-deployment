@@ -3,6 +3,7 @@
   "FrontendRepo": "https://github.com/Posuza/ESS_MO_Fronend.git",
   "FrontendBranch": "main",
   "EssPublicKey": "Tg2wbdIU3C0JRfSX",
+  "EssSdkOrigin": "https://ess-faceregister.esscentor.com",
   "BackendRepo": "https://github.com/Posuza/ESS_MO_Backend.git",
   "BackendBranch": "main",
   "FrontendPort": 3009,
@@ -14,6 +15,6 @@
   "ApiPrefix": "/api/v1",
   "MediaStoragePath": "E:\\ESS\\storage\\face-images",
   "MoReportWorkerPollSeconds": 5,
-  "MoReportRetentionMinutes": 1,
-  "MoReportSweepMinutes": 0.1
+  "MoReportRetentionMinutes": 60,
+  "MoReportSweepMinutes": 5
 }

@@ -63,6 +63,7 @@ $DefaultConfig = [ordered]@{
     FrontendRepo = "https://github.com/Posuza/ESS_MO_Fronend.git"
     FrontendBranch = "main"
     EssPublicKey = "Tg2wbdIU3C0JRfSX"
+    EssSdkOrigin = "https://ess-faceregister.esscentor.com"
 
     BackendRepo = "https://github.com/Posuza/ESS_MO_Backend.git"
     BackendBranch = "main"
@@ -78,8 +79,8 @@ $DefaultConfig = [ordered]@{
     MediaStoragePath = "E:\ESS\storage\face-images"
 
     MoReportWorkerPollSeconds = 5
-    MoReportRetentionMinutes = 1
-    MoReportSweepMinutes = 0.1
+    MoReportRetentionMinutes = 60
+    MoReportSweepMinutes = 5
 
     InstallRoot = "C:\\ESS\\Ess_MO"
 }
@@ -222,7 +223,8 @@ function Initialize-Logger {
 # ===========================================================
 function Get-DeployConfig {
     if (Test-Path $ConfigPath) {
-        $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+        $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+        $cfg = [System.IO.File]::ReadAllText($ConfigPath, $utf8) | ConvertFrom-Json
         foreach ($key in $DefaultConfig.Keys) {
             if (-not ($cfg | Get-Member -Name $key -ErrorAction SilentlyContinue)) {
                 Add-Member -InputObject $cfg -NotePropertyName $key -NotePropertyValue $DefaultConfig[$key]
@@ -246,6 +248,10 @@ function Get-DeployConfig {
         $cfg.EssPublicKey = "$($cfg.EssPublicKey)".Trim()
         if ($cfg.EssPublicKey -notmatch '^[A-Za-z0-9_-]+$') {
             throw "Invalid EssPublicKey. Configure the registered ESS public key in deploy.config.json."
+        }
+        $cfg.EssSdkOrigin = "$($cfg.EssSdkOrigin)".Trim().TrimEnd('/')
+        if ($cfg.EssSdkOrigin -notmatch '^https?://[^/\s?#]+$') {
+            throw "Invalid EssSdkOrigin. Configure an HTTP(S) origin without a path in deploy.config.json."
         }
         $mediaPath = "$($cfg.MediaStoragePath)".Trim().TrimEnd('\')
         if ($mediaPath -notmatch '^[A-Za-z]:\\.+') {
@@ -300,6 +306,7 @@ function Initialize-InstallRoot {
     if ($script:dryRun) { return }
     New-Item -Path $Config.InstallRoot -ItemType Directory -Force | Out-Null
     New-Item -Path (Join-Path $Config.InstallRoot "logs") -ItemType Directory -Force | Out-Null
+    New-Item -Path (Join-Path $Config.InstallRoot "exports") -ItemType Directory -Force | Out-Null
 }
 
 function Test-AppInstallRoot {
@@ -350,7 +357,14 @@ function Get-SecretsOrInitialize {
     Protect-SecretsFile
     $s = $null
     if (Test-Path $SecretsPath) {
-        try { $s = Get-Content $SecretsPath -Raw | ConvertFrom-Json } catch { $s = $null }
+        try {
+            $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+            $s = [System.IO.File]::ReadAllText($SecretsPath, $utf8) | ConvertFrom-Json
+        }
+        catch { throw "Could not read deploy.secrets.json as UTF-8 JSON. Fix the file before deployment; it was not replaced." }
+    }
+    if (-not $s -and (Test-Path $SecretsPath)) {
+        throw "deploy.secrets.json must contain a JSON object; it was not replaced."
     }
     if (-not $s) {
         $s = New-DefaultSecrets
@@ -398,7 +412,7 @@ function Confirm-DeploymentCredentials {
 function Convert-ToEnvValue {
     param([AllowNull()][object]$Value)
     $s = "$Value"
-    return $s.Replace('\\','\\\\').Replace('"','\\"')
+    return $s.Replace('\','\\').Replace('"','\"')
 }
 
 function Write-MoEnvFile {
@@ -420,6 +434,7 @@ function Write-MoEnvFile {
         "$($Config.FrontendPublicUrl)".Trim().TrimEnd('/')
     }
     $mediaStoragePath = "$($Config.MediaStoragePath)"
+    $reportExportRoot = Join-Path $Config.InstallRoot "exports"
 
     $envContent = @"
 DB_ENGINE=mysql
@@ -442,12 +457,24 @@ FRONTEND_URL=$frontendUrl
 
 MEDIA_STORAGE_PATH=$mediaStoragePath
 
+REPORT_EXPORT_ROOT=$reportExportRoot
 MO_REPORT_EXPORT_WORKER_POLL_SECONDS=$($Config.MoReportWorkerPollSeconds)
 MO_REPORT_EXPORT_RETENTION_MINUTES=$($Config.MoReportRetentionMinutes)
 MO_REPORT_EXPORT_SWEEP_INTERVAL_MINUTES=$($Config.MoReportSweepMinutes)
 MO_REPORT_EXPORT_WORKER_LOG_LEVEL=INFO
 "@
-    Set-Content -Path (Join-Path $RepoDir ".env") -Value $envContent -Encoding UTF8 -Force
+    $envPath = Join-Path $RepoDir ".env"
+    $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    $existingContent = $null
+    $hasBom = $false
+    if (Test-Path $envPath) {
+        $existingBytes = [System.IO.File]::ReadAllBytes($envPath)
+        $hasBom = $existingBytes.Length -ge 3 -and $existingBytes[0] -eq 0xEF -and $existingBytes[1] -eq 0xBB -and $existingBytes[2] -eq 0xBF
+        $existingContent = ([System.IO.File]::ReadAllText($envPath, $utf8)).TrimEnd("`r", "`n")
+    }
+    if (-not $hasBom -and $existingContent -ceq $envContent.TrimEnd("`r", "`n")) { return $false }
+    [System.IO.File]::WriteAllText($envPath, $envContent + [Environment]::NewLine, $utf8)
+    return $true
 }
 
 # ===========================================================
@@ -760,6 +787,7 @@ function Get-FrontendDeploymentFingerprint {
         frontendPort=[int]$Config.FrontendPort
         apiPrefix="$($Config.ApiPrefix)"
         essPublicKey="$($Config.EssPublicKey)"
+        essSdkOrigin="$($Config.EssSdkOrigin)"
     }|ConvertTo-Json -Compress
     return (Get-TextSha256 -Text $payload)
 }
@@ -783,6 +811,7 @@ function Set-FrontendBuildEnvironment {
     param($Config)
     $env:VITE_API_URL="$($Config.ApiPrefix)"
     $env:VITE_ESS_PUBLIC_KEY="$($Config.EssPublicKey)"
+    $env:VITE_ESS_SDK_ORIGIN="$($Config.EssSdkOrigin)"
 }
 
 # ===========================================================
@@ -964,7 +993,7 @@ function Initialize-BackendRuntime {
 
     $python=New-StackVenv -Path $venv -LogPath $LogPath
     Install-StackRequirements -Config $Config -Python $python -Requirements (Join-Path $repoDir "requirements.txt") -LogPath $LogPath -Label "Backend"
-    Write-MoEnvFile -Config $Config -Secrets $Secrets -RepoDir $repoDir
+    [void](Write-MoEnvFile -Config $Config -Secrets $Secrets -RepoDir $repoDir)
 
     Push-Location $repoDir
     try{
@@ -1007,7 +1036,7 @@ function Initialize-ReportWorkerRuntime {
 
     $python=New-StackVenv -Path $venv -LogPath $LogPath
     Install-StackRequirements -Config $Config -Python $python -Requirements (Get-WorkerRequirementsPath $repoDir) -LogPath $LogPath -Label "Report worker"
-    Write-MoEnvFile -Config $Config -Secrets $Secrets -RepoDir $repoDir
+    [void](Write-MoEnvFile -Config $Config -Secrets $Secrets -RepoDir $repoDir)
 
     Push-Location $repoDir
     try{
@@ -1086,9 +1115,16 @@ function Install-PythonComponent {
             $local=Get-GitHead $repoDir
             if($wasInstalled -and $local -eq $remote){
                 $svc=Get-Service $svcName -ErrorAction SilentlyContinue
-                if($svc -and $svc.Status -ne 'Running'){Start-Service $svcName -ErrorAction Stop}
+                $envChanged=Write-MoEnvFile -Config $Config -Secrets $Secrets -RepoDir $repoDir
+                if($svc -and $envChanged){
+                    Stop-ServiceIfRunning $svcName
+                    Start-Service $svcName -ErrorAction Stop
+                }elseif($svc -and $svc.Status -ne 'Running'){
+                    Start-Service $svcName -ErrorAction Stop
+                }
                 Register-SuccessfulComponentDeployment $Config $Component $local
-                Write-Success "$label already current: $local"
+                if($envChanged){Write-Success "$label configuration updated: $local"}
+                else{Write-Success "$label already current: $local"}
                 return $true
             }
 

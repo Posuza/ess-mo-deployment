@@ -24,6 +24,7 @@ Created automatically on first run. Edit it to change:
 | `FrontendRepo` | `Posuza/ESS_MO_Fronend` | Git repo for the React frontend | ✅ Replace with your own repo URL |
 | `FrontendBranch` | `main` | Frontend Git branch to deploy | ✅ Use `ver1` for development |
 | `EssPublicKey` | `Tg2wbdIU3C0JRfSX` | Registered ESS browser SDK application identifier | ✅ Public identifier; keep in config, not secrets |
+| `EssSdkOrigin` | `https://ess-faceregister.esscentor.com` | SDK origin; frontend appends `/sdk/v1/index.js` | ✅ Change in `deploy.config.json`; deployment rebuilds the frontend |
 | `BackendRepo` | `Posuza/ESS_MO_Backend` | Git repo for the FastAPI backend | ✅ Replace with your own repo URL |
 | `BackendBranch` | `main` | Backend Git branch to deploy | ✅ Use `ver1` for development |
 | `FrontendPort` | `3009` | Port the frontend serves on | ✅ Change if needed |
@@ -33,13 +34,20 @@ Created automatically on first run. Edit it to change:
 | `FrontendPublicUrl` | `null` | Public frontend URL written as `FRONTEND_URL`; `null` uses `http://localhost:<CaddyPort>` | ✅ Set to the externally reachable URL when available |
 | `MediaStoragePath` | `E:\ESS\storage\face-images` | Existing face-image directory read by the backend | ✅ Use an absolute Windows path below a drive root |
 | `MoReportWorkerPollSeconds` | `5` | How often the worker checks for queued reports | ✅ Change if needed |
-| `MoReportRetentionMinutes` | `1` | How long completed report PDFs remain downloadable | ✅ Set the required number of minutes |
-| `MoReportSweepMinutes` | `0.1` | How often expired report files are removed (`0.1` = 6 seconds) | ✅ Change if needed |
+| `MoReportRetentionMinutes` | `60` | How long completed report PDFs remain downloadable | ✅ Set the required number of minutes |
+| `MoReportSweepMinutes` | `5` | How often expired report files are removed | ✅ Change if needed |
 | `InstallRoot` | *(set at startup)* | Derived from the selected drive and environment | ✅ `Ess_Mo` for production, `Ess_MO_dev` for development |
 
 The deployment only passes `MediaStoragePath` to the backend `.env`. It does
 not create, modify, or delete this directory. Ensure the folder already exists
 and the backend Windows service account has permission to read it.
+
+PDF exports use `<InstallRoot>\exports`. Deployment creates this shared folder
+for the backend API and report worker. The worker creates dated subfolders as
+needed. A completed PDF remains downloadable for 60 minutes; the worker then
+removes expired files on its five-minute sweep. The frontend downloads through
+the backend API and does not need a PDF folder of its own.
+Deploy the report-worker component after changing retention or sweep settings.
 
 Production services use the `ess-mo-*` prefix. Development services use
 `ess-mo-dev-*`, allowing both environments to run on the same machine when
@@ -52,6 +60,9 @@ Ready-to-use profiles are provided in `deploy.production.config.json` and
 ### `deploy.secrets.json` — credentials (DB, SMTP)
 
 Auto-gitignored. Copy `deploy.secrets.example.json` → `deploy.secrets.json` to pre-fill, or enter them when the script prompts you.
+Save this JSON file as UTF-8, including when credentials contain Vietnamese
+characters. The deployment reads it as UTF-8 and writes the backend and worker
+`.env` files as UTF-8 without a BOM.
 
 ```json
 {
