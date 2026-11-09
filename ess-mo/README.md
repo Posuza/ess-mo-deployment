@@ -121,36 +121,37 @@ powershell -ExecutionPolicy Bypass -File "filepath\deploy.ps1"
 
 ### 3. Set install location (first run only)
 
-You'll be asked to pick a **drive** (e.g. `C:`, `D:`). The script creates `Ess_Mo` folder there (`C:\Ess_Mo`).
+You'll be asked to pick a **drive** (e.g. `C:`, `D:`). Production installs under `<drive>:\ESS\Ess_MO`.
 
 ### 4. Use the main menu
 
 ```
  1) Check prerequisites
- 2) Install components
- 3) Uninstall components
+ 2) Install or update complete deployment
+ 3) Uninstall complete deployment
  4) Service status / health check
  5) Start services
  6) Stop services
  7) Caddy network config
  8) Open logs folder
+ 9) Rollback deployment
  Q) Quit
 ```
 
 ---
 
-### 4. Install everything
+### 5. Install everything
 
-Press **`2`** then **`A`** to install all components (or pick individually by number).
+Press **`2`** to install or update all four components. There is no additional `A` prompt.
 
 The script will:
-1. Check prerequisites (Git, Node.js, Python) — installs missing ones
+1. Check Git, Node.js 22+, Python 3.11–3.13 x64, and Servy CLI. In interactive mode, the script offers to install missing tools with WinGet.
 2. Check `deploy.secrets.json` for complete DB/SMTP credentials
 3. Install each component:
    - **Frontend** — clones repo, `npm install`, builds, registers as Windows service
-   - **Backend + report worker** — uses one backend clone, creates separate API and worker venvs, generates one shared `.env`, and registers both Windows services. Updating either component updates both to the same commit.
+   - **Backend + report worker** — each has its own Git checkout, Python venv, `.env`, and Windows service.
    - **Caddy** — downloads Caddy, creates `Caddyfile`, registers as service
-4. Optionally start all services and verify health
+4. Start each service and verify health before saving the deployment version
 
 ---
 ## 🔧 Caddy network config (option 7)
@@ -158,7 +159,7 @@ The script will:
 Use **option 7** to manage which services Caddy proxies to:
 
 ```
- Caddy listener : 127.0.0.1:8089
+ Caddy listener : :9089
 
  Available targets:
    (all targets already registered)
@@ -183,14 +184,15 @@ Use **option 7** to manage which services Caddy proxies to:
 
 | Option | What it does |
 |--------|-------------|
-| **1** | Check & install prerequisites (Git, Node.js, Python) |
-| **2** | Install components — pick **A** (all), **1** (Frontend), **2** (Backend), **3** (Caddy), or **B** (back) |
-| **3** | Uninstall components — same submenu, with status indicators |
+| **1** | Check and install Git, Node.js 22+, Python 3.11–3.13 x64, and Servy CLI |
+| **2** | Install or update the complete deployment |
+| **3** | Uninstall the complete deployment |
 | **4** | Show service status table + run health checks |
 | **5** | Start services — **A** (all), **1-4** (including MO Report Worker), **B** (back) |
-| **6** | Stop services — same submenu; the worker is service **4** |
+| **6** | Stop services — the report worker is service **3** |
 | **7** | Caddy proxy config — add/remove routes, change port |
 | **8** | Open logs folder in File Explorer |
+| **9** | Roll back to the previous complete deployment, when available |
 | **Q** | Quit |
 
 ---

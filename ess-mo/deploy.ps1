@@ -473,6 +473,23 @@ MO_REPORT_EXPORT_WORKER_LOG_LEVEL=INFO
 # ===========================================================
 # PREREQUISITES / PORT / HEALTH
 # ===========================================================
+function Test-DeployPrerequisite {
+    param([string]$Command)
+    switch ($Command) {
+        "__compatible_python__" {
+            try { $null = Get-PythonCreator; return $true } catch { return $false }
+        }
+        "node" {
+            $node = Get-Command node -ErrorAction SilentlyContinue
+            if (-not $node) { return $false }
+            $version = & $node.Source --version 2>$null
+            if ($LASTEXITCODE -ne 0 -or "$version" -notmatch '^v?(\d+)\.') { return $false }
+            return ([int]$Matches[1] -ge 22)
+        }
+        default { return [bool](Get-Command $Command -ErrorAction SilentlyContinue) }
+    }
+}
+
 function Test-Prerequisites {
     param([switch]$CheckOnly)
     Write-Step "Checking prerequisites"
@@ -481,38 +498,39 @@ function Test-Prerequisites {
         @{ Cmd="git"; Name="Git"; WingetId="Git.Git"; Url="https://git-scm.com" },
         @{ Cmd="node"; Name="Node.js 22+"; WingetId="OpenJS.NodeJS.LTS"; Url="https://nodejs.org" },
         @{ Cmd="__compatible_python__"; Name="Python 3.11-3.13 x64"; WingetId="Python.Python.3.13"; Url="https://python.org" },
-        @{ Cmd="servy-cli"; Name="Servy CLI"; WingetId="servy"; Url="https://github.com/servy-community/servy" }
+        @{ Cmd="servy-cli"; Name="Servy CLI"; WingetId="aelassas.Servy"; Url="https://github.com/aelassas/servy" }
     )
     foreach ($t in $tools) {
-        $available = if ($t.Cmd -eq "__compatible_python__") {
-            try { $null = Get-PythonCreator; $true } catch { $false }
-        } else {
-            [bool](Get-Command $t.Cmd -ErrorAction SilentlyContinue)
-        }
+        $available = Test-DeployPrerequisite -Command $t.Cmd
         if ($available) { Write-Host "    $($t.Name): OK" -ForegroundColor Green }
         else { Write-Host "    $($t.Name): MISSING" -ForegroundColor Red; $missing += $t }
     }
     if ($missing.Count -eq 0) { return $true }
-    if ($CheckOnly -or $script:headless -or $script:dryRun) { return $false }
+    if ($CheckOnly -or $script:headless -or $script:dryRun) {
+        Write-Warn "Missing prerequisites: $(($missing | ForEach-Object { $_.Name }) -join ', ')"
+        return $false
+    }
     if (-not (Confirm-Step "Install missing prerequisites?" -DefaultYes:$true)) { return $false }
-    foreach ($t in $missing) {
-        if ($t.WingetId -and (Get-Command winget -ErrorAction SilentlyContinue)) {
-            winget install $t.WingetId --accept-package-agreements --accept-source-agreements --silent | Out-Null
-        }
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Err "WinGet is unavailable. Install the missing tools manually, then run prerequisite check again."
+        foreach ($t in $missing) { Write-Host "    $($t.Name): $($t.Url)" -ForegroundColor Gray }
+        return $false
     }
-    $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
+    $allSucceeded = $true
     foreach ($t in $missing) {
-        $available = if ($t.Cmd -eq "__compatible_python__") {
-            try { $null = Get-PythonCreator; $true } catch { $false }
+        Write-Host "    Installing $($t.Name)..." -ForegroundColor Gray
+        & winget install --id $t.WingetId --exact --silent --accept-package-agreements --accept-source-agreements 2>&1 |
+            ForEach-Object { Write-Host "    $_" }
+        $installExit = $LASTEXITCODE
+        $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
+        if (Test-DeployPrerequisite -Command $t.Cmd) {
+            Write-Success "$($t.Name): installed"
         } else {
-            [bool](Get-Command $t.Cmd -ErrorAction SilentlyContinue)
-        }
-        if (-not $available) {
-            Write-Err "$($t.Name) still missing. Install manually: $($t.Url)"
-            return $false
+            Write-Err "$($t.Name) is still unavailable (WinGet exit code $installExit). Install manually: $($t.Url)"
+            $allSucceeded = $false
         }
     }
-    return $true
+    return $allSucceeded
 }
 
 function Test-PortInUse {
@@ -1722,7 +1740,7 @@ function Invoke-FullDeploy {
         }
     }
 
-    if(-not(Test-Prerequisites -CheckOnly)){Write-Err "Resolve missing prerequisites first.";$script:deploymentTransaction=$false;return}
+    if(-not(Test-Prerequisites)){Write-Err "Resolve missing prerequisites first.";$script:deploymentTransaction=$false;return}
     $secrets=$null
     if(($targets -contains "backend") -or ($targets -contains "report-worker")){
         $secrets=Get-SecretsOrInitialize;if(-not $secrets){$script:deploymentTransaction=$false;return}
