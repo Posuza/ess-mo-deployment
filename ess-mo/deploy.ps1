@@ -480,11 +480,16 @@ function Test-Prerequisites {
     $tools = @(
         @{ Cmd="git"; Name="Git"; WingetId="Git.Git"; Url="https://git-scm.com" },
         @{ Cmd="node"; Name="Node.js 22+"; WingetId="OpenJS.NodeJS.LTS"; Url="https://nodejs.org" },
-        @{ Cmd="python"; Name="Python 3.11+"; WingetId="Python.Python.3.13"; Url="https://python.org" },
+        @{ Cmd="__compatible_python__"; Name="Python 3.11-3.13 x64"; WingetId="Python.Python.3.13"; Url="https://python.org" },
         @{ Cmd="servy-cli"; Name="Servy CLI"; WingetId="servy"; Url="https://github.com/servy-community/servy" }
     )
     foreach ($t in $tools) {
-        if (Get-Command $t.Cmd -ErrorAction SilentlyContinue) { Write-Host "    $($t.Name): OK" -ForegroundColor Green }
+        $available = if ($t.Cmd -eq "__compatible_python__") {
+            try { $null = Get-PythonCreator; $true } catch { $false }
+        } else {
+            [bool](Get-Command $t.Cmd -ErrorAction SilentlyContinue)
+        }
+        if ($available) { Write-Host "    $($t.Name): OK" -ForegroundColor Green }
         else { Write-Host "    $($t.Name): MISSING" -ForegroundColor Red; $missing += $t }
     }
     if ($missing.Count -eq 0) { return $true }
@@ -497,7 +502,12 @@ function Test-Prerequisites {
     }
     $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
     foreach ($t in $missing) {
-        if (-not (Get-Command $t.Cmd -ErrorAction SilentlyContinue)) {
+        $available = if ($t.Cmd -eq "__compatible_python__") {
+            try { $null = Get-PythonCreator; $true } catch { $false }
+        } else {
+            [bool](Get-Command $t.Cmd -ErrorAction SilentlyContinue)
+        }
+        if (-not $available) {
             Write-Err "$($t.Name) still missing. Install manually: $($t.Url)"
             return $false
         }
@@ -728,10 +738,18 @@ function Complete-FullDeploymentState {
 # ===========================================================
 function Get-PythonCreator {
     $py=Get-Command py -ErrorAction SilentlyContinue
-    if($py){& py -3.11 -c "import sys" 2>$null;if($LASTEXITCODE -eq 0){return @{File="py";Args=@("-3.11")}};& py -3 -c "import sys" 2>$null;if($LASTEXITCODE -eq 0){return @{File="py";Args=@("-3")}}}
+    if($py){
+        foreach($version in @("3.13","3.12","3.11")){
+            & $py.Source "-$version" -c "import sys; sys.exit(0 if sys.version_info[:2] == ($($version.Replace('.',','))) and sys.maxsize > 2**32 else 1)" 2>$null | Out-Null
+            if($LASTEXITCODE -eq 0){return @{File=$py.Source;Args=@("-$version")}}
+        }
+    }
     $python=Get-Command python -ErrorAction SilentlyContinue
-    if($python){return @{File=$python.Source;Args=@()}}
-    throw "No usable Python found."
+    if($python){
+        & $python.Source -c "import sys; sys.exit(0 if sys.version_info[:2] in ((3,11),(3,12),(3,13)) and sys.maxsize > 2**32 else 1)" 2>$null | Out-Null
+        if($LASTEXITCODE -eq 0){return @{File=$python.Source;Args=@()}}
+    }
+    throw "Python 3.13, 3.12, or 3.11 x64 is required. Python 3.15 is not supported for this deployment. Install Python 3.13 and rerun prerequisite check."
 }
 
 function Install-OrKeepService {
